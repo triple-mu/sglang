@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
     USPAttention,
+    USPAttentionFused,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -318,7 +319,7 @@ class WanTransformerBlock(nn.Module):
                 },
             )
         else:
-            self.attn1 = USPAttention(
+            self.attn1 = USPAttentionFused(
                 num_heads=self.local_num_heads,
                 head_size=dim // num_heads,
                 causal=False,
@@ -424,38 +425,51 @@ class WanTransformerBlock(nn.Module):
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
 
-        if self.norm_q is not None:
-            if self.tp_rmsnorm:
-                query = tensor_parallel_rms_norm(query, self.norm_q)
-            else:
-                query = self.norm_q(query)
-        if self.norm_k is not None:
-            if self.tp_rmsnorm:
-                key = tensor_parallel_rms_norm(key, self.norm_k)
-            else:
-                key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
+        if isinstance(self.attn1, USPAttentionFused):
+            cos, sin = freqs_cis
+            attn_output = self.attn1(
+                query,
+                key,
+                value,
+                self.norm_q,
+                self.norm_k,
+                cos,
+                sin,
+                self.dim_head,
             )
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output = self.attn1(query, key, value)
+            if self.norm_q is not None:
+                if self.tp_rmsnorm:
+                    query = tensor_parallel_rms_norm(query, self.norm_q)
+                else:
+                    query = self.norm_q(query)
+            if self.norm_k is not None:
+                if self.tp_rmsnorm:
+                    key = tensor_parallel_rms_norm(key, self.norm_k)
+                else:
+                    key = self.norm_k(key)
+            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+
+            # Apply rotary embeddings
+            cos, sin = freqs_cis
+            if _is_cuda and query.shape == key.shape:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
+                query, key = apply_flashinfer_rope_qk_inplace(
+                    query, key, cos_sin_cache, is_neox=False
+                )
+            else:
+                query, key = _apply_rotary_emb(
+                    query, cos, sin, is_neox_style=False
+                ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)

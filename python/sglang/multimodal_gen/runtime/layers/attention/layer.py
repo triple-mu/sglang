@@ -21,7 +21,13 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.fp8_many_fuse import (
+    dequant_permute,
+    rms_norm_rope_quant_permute,
+)
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_all_to_all_single,
     _usp_input_all_to_all,
     _usp_output_all_to_all,
     ring_attn,
@@ -390,4 +396,51 @@ class USPAttention(nn.Module):
             # -> [B, S_local, H, D]
             out = _usp_output_all_to_all(out, head_dim=2)
 
+        return out
+
+
+class USPAttentionFused(USPAttention):
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        norm_q: RMSNorm,
+        norm_k: RMSNorm,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        head_dim: int,
+    ) -> torch.Tensor:
+        sp_size = get_ulysses_parallel_world_size()
+        assert (
+            sp_size > 1
+        ), f"USPAttentionFused only support sp_size > 1, but got {sp_size}"
+        forward_context: ForwardContext = get_forward_context()
+        ctx_attn_metadata = forward_context.attn_metadata
+
+        if cos.ndim == sin.ndim == 2:
+            cos = cos[None, :, None, :]
+            sin = sin[None, :, None, :]
+
+        q, k, v = rms_norm_rope_quant_permute(
+            q.unflatten(2, (sp_size, -1, head_dim)),
+            k.unflatten(2, (sp_size, -1, head_dim)),
+            v.unflatten(2, (sp_size, -1, head_dim)),
+            norm_q.weight,
+            norm_k.weight,
+            cos,
+            sin,
+        )
+
+        q = _usp_all_to_all_single(q)
+        k = _usp_all_to_all_single(k)
+        v = _usp_all_to_all_single(v)
+
+        q = dequant_permute(q.flatten(0, 1))
+        k = dequant_permute(k.flatten(0, 1))
+        v = dequant_permute(v.flatten(0, 1))
+
+        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        out = _usp_output_all_to_all(out, head_dim=2)
         return out
