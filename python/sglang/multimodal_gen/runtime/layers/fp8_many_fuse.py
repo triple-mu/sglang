@@ -1,3 +1,4 @@
+import itertools
 from typing import Tuple
 
 import torch
@@ -5,6 +6,13 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps, num_stages in itertools.product([2, 4, 8, 16], [2, 3, 4, 5])
+    ],
+    key=["world_size", "num_heads", "half_head_dim", "head_dim"],
+)
 @triton.jit
 def _rmsnorm_rope_quant_permute(
     q_out_ptr,
@@ -285,6 +293,10 @@ def rms_norm_rope_quant_permute(
     return q_out, k_out, v_out
 
 
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [2, 4, 8, 16]],
+    key=["num_heads", "head_dim"],
+)
 @triton.jit
 def _dequant_permute(
     x_ptr,
