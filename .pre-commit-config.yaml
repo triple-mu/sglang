@@ -24,6 +24,7 @@ repos:
     rev: 7.0.0
     hooks:
       - id: isort
+        language_version: python3.10
         exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.1

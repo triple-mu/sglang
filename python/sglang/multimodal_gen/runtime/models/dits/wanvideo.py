@@ -301,7 +301,13 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = LayerNormScaleShift(
+        # self.norm1 = LayerNormScaleShift(
+        #     dim,
+        #     eps=eps,
+        #     elementwise_affine=False,
+        #     dtype=torch.float32,
+        # )
+        self.norm1 = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
@@ -408,7 +414,9 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+        prev_hidden_states: torch.Tensor | None = None,
+        prev_c_gate_msa: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -435,7 +443,37 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        # norm1(hidden_states)  * (1 + scale_msa) + shift_msa
+        # merge prev
+        # ff_output * c_gate_msa + hidden_states
+        # norm1(ff_output * c_gate_msa + hidden_states) * (1 + scale_msa) + shift_msa
+        """
+        # hidden_states = hidden_states + attn_output * gate_msa
+        # norm_hidden_states = norm3(hidden_states)
+        # norm_hidden_states = norm_hidden_states * (1 + null_shift(0.0)) + null_scale(0.0)
+        """
+        # norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        """
+
+        # hidden_states = hidden_states + attn_output * gate_msa
+        # norm_hidden_states = norm3(hidden_states)
+        # norm_hidden_states = norm_hidden_states * (1 + null_shift(0.0)) + null_scale(0.0)
+        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
+            hidden_states, attn_output, gate_msa, null_shift, null_scale
+        )
+
+        """
+        if prev_hidden_states is None:
+            prev_hidden_states = torch.zeros_like(hidden_states)
+        if prev_c_gate_msa is None:
+            prev_c_gate_msa = torch.ones_like(c_gate_msa)
+        norm_hidden_states, hidden_states = self.norm1(
+            prev_hidden_states,
+            hidden_states,
+            prev_c_gate_msa,
+            shift_msa,
+            scale_msa,
+        )
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -479,6 +517,12 @@ class WanTransformerBlock(nn.Module):
         null_shift = null_scale = torch.zeros(
             (1,), device=hidden_states.device, dtype=hidden_states.dtype
         )
+        identity_gate = torch.ones(
+            (1,), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        # hidden_states = hidden_states + attn_output * gate_msa
+        # norm_hidden_states = norm3(hidden_states)
+        # norm_hidden_states = norm_hidden_states * (1 + null_shift(0.0)) + null_scale(0.0)
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
@@ -490,8 +534,11 @@ class WanTransformerBlock(nn.Module):
         attn_output = self.attn2(
             norm_hidden_states, context=encoder_hidden_states, context_lens=None
         )
+        # hidden_states = hidden_states + attn_output * gate_msa(1.0)
+        # norm_hidden_states = norm2(hidden_states)
+        # norm_hidden_states = norm_hidden_states * (1 + c_scale_msa) * c_shift_msa
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
-            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
+            hidden_states, attn_output, identity_gate, c_shift_msa, c_scale_msa
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -499,10 +546,14 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
-        hidden_states = hidden_states.to(orig_dtype)
+        return ff_output, hidden_states, c_gate_msa
 
-        return hidden_states
+        # ff_output * c_gate_msa + hidden_states
+        # hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
+
+        # hidden_states = hidden_states.to(orig_dtype)
+
+        # return hidden_states
 
 
 class WanTransformerBlock_VSA(nn.Module):
@@ -950,11 +1001,21 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
-
+            prev_hidden_states = None
+            prev_c_gate_msa = None
+            dtype = hidden_states.dtype
             for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                hidden_states, prev_hidden_states, prev_c_gate_msa = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    freqs_cis,
+                    prev_hidden_states=prev_hidden_states,
+                    prev_c_gate_msa=prev_c_gate_msa,
                 )
+            hidden_states = MulAdd()(hidden_states, prev_c_gate_msa, prev_hidden_states)
+            hidden_states = hidden_states.to(dtype=dtype)
+
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
