@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.fused import qk_rms_norm_rope_triton
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -423,6 +424,8 @@ class WanTransformerBlock(nn.Module):
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.register_buffer("null_shift", None, persistent=False)
+        self.register_buffer("null_scale", None, persistent=False)
 
     def forward(
         self,
@@ -462,47 +465,70 @@ class WanTransformerBlock(nn.Module):
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
 
-        if self.norm_q is not None:
-            if self.tp_rmsnorm:
-                query = tensor_parallel_rms_norm(query, self.norm_q)
-            else:
-                query = self.norm_q(query)
-        if self.norm_k is not None:
-            if self.tp_rmsnorm:
-                key = tensor_parallel_rms_norm(key, self.norm_k)
-            else:
-                key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        if False:
+            if self.norm_q is not None:
+                if self.tp_rmsnorm:
+                    query = tensor_parallel_rms_norm(query, self.norm_q)
+                else:
+                    query = self.norm_q(query)
+            if self.norm_k is not None:
+                if self.tp_rmsnorm:
+                    key = tensor_parallel_rms_norm(key, self.norm_k)
+                else:
+                    key = self.norm_k(key)
+            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
+            # Apply rotary embeddings
+            cos, sin = freqs_cis
+            if _is_cuda and query.shape == key.shape:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
+                query, key = apply_flashinfer_rope_qk_inplace(
+                    query, key, cos_sin_cache, is_neox=False
+                )
+            else:
+                query, key = _apply_rotary_emb(
+                    query, cos, sin, is_neox_style=False
+                ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query = query.unflatten(2, (self.local_num_heads, self.dim_head))
+            key = key.unflatten(2, (self.local_num_heads, self.dim_head))
+            value = value.unflatten(2, (self.local_num_heads, self.dim_head))
+            cos, sin = freqs_cis
+
+            (
+                query,
+                key,
+            ) = qk_rms_norm_rope_triton(
+                q=query,
+                k=key,
+                qw=self.norm_q.weight,
+                kw=self.norm_k.weight,
+                cos=cos,
+                sin=sin,
+                eps=self.norm_q.variance_epsilon,
+                interleave=True,
+            )
+
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        if self.null_shift is None or self.null_scale is None:
+            self.null_shift = self.null_scale = torch.zeros(
+                1, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, self.null_shift, self.null_scale
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
