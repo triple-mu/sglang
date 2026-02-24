@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention_VSA,
     USPAttention,
 )
-from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
@@ -51,7 +50,11 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.fused import qk_rms_norm_rope_triton
+from sglang.multimodal_gen.runtime.models.dits.fused import (
+    ScaleResidualNormScaleShift,
+    qk_rms_norm_rope_triton,
+    scale_shift,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -320,11 +323,18 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = LayerNormScaleShift(
+        # self.norm1 = LayerNormScaleShift(
+        #     dim,
+        #     eps=eps,
+        #     elementwise_affine=False,
+        #     dtype=torch.float32,
+        # )
+        self.norm1 = ScaleResidualNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            norm_type="layer",
         )
         self.to_q = ColumnParallelLinear(
             dim, dim, bias=True, gather_output=False, quant_config=quant_config
@@ -379,11 +389,18 @@ class WanTransformerBlock(nn.Module):
         assert cross_attn_norm is True
         self.qk_norm = qk_norm
         self.tp_rmsnorm = qk_norm == "rms_norm_across_heads" and tp_size > 1
-        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        # self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        #     dim,
+        #     eps=eps,
+        #     elementwise_affine=True,
+        #     dtype=torch.float32,
+        # )
+        self.self_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
+            norm_type="layer",
         )
 
         # 2. Cross-attention
@@ -410,30 +427,40 @@ class WanTransformerBlock(nn.Module):
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
-        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        # self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        #     dim,
+        #     eps=eps,
+        #     elementwise_affine=False,
+        #     dtype=torch.float32,
+        # )
+        self.cross_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            norm_type="layer",
         )
 
         # 3. Feed-forward
         self.ffn = MLP(
             dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
         )
-        self.mlp_residual = MulAdd()
+        # self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.register_buffer("null_gate", None, persistent=False)
         self.register_buffer("null_shift", None, persistent=False)
         self.register_buffer("null_scale", None, persistent=False)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        ff_output: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        c_gate_msa_in: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -460,7 +487,9 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        norm_hidden_states, hidden_states = self.norm1(
+            hidden_states, ff_output, c_gate_msa_in, shift_msa, scale_msa
+        )
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -509,8 +538,8 @@ class WanTransformerBlock(nn.Module):
             ) = qk_rms_norm_rope_triton(
                 q=query,
                 k=key,
-                qw=self.norm_q.weight,
-                kw=self.norm_k.weight,
+                qw=getattr(self.norm_q, "weight"),
+                kw=getattr(self.norm_k, "weight"),
                 cos=cos,
                 sin=sin,
                 eps=self.norm_q.variance_epsilon,
@@ -522,8 +551,11 @@ class WanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        if self.null_shift is None or self.null_scale is None:
+        if self.null_shift is None or self.null_scale is None or self.null_gate is None:
             self.null_shift = self.null_scale = torch.zeros(
+                1, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            self.null_gate = torch.ones(
                 1, dtype=hidden_states.dtype, device=hidden_states.device
             )
 
@@ -539,7 +571,7 @@ class WanTransformerBlock(nn.Module):
             norm_hidden_states, context=encoder_hidden_states, context_lens=None
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
-            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
+            hidden_states, attn_output, self.null_gate, c_shift_msa, c_scale_msa
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -547,10 +579,10 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
-        hidden_states = hidden_states.to(orig_dtype)
+        # hidden_states = self.mlp_residual(ff_output, c_gate_msa_in, hidden_states)
+        # hidden_states = hidden_states.to(orig_dtype)
 
-        return hidden_states
+        return hidden_states, ff_output, c_gate_msa
 
 
 class WanTransformerBlock_VSA(nn.Module):
@@ -656,7 +688,7 @@ class WanTransformerBlock_VSA(nn.Module):
         self.ffn = MLP(
             dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
         )
-        self.mlp_residual = MulAdd()
+        # self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -1020,10 +1052,20 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            c_gate_msa_in = torch.ones(
+                1, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            ff_output = torch.zeros_like(hidden_states)
             for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                hidden_states, ff_output, c_gate_msa_in = block(
+                    hidden_states,
+                    ff_output,
+                    encoder_hidden_states,
+                    c_gate_msa_in,
+                    timestep_proj,
+                    freqs_cis,
                 )
+            hidden_states = scale_shift(ff_output, c_gate_msa_in, hidden_states)
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
