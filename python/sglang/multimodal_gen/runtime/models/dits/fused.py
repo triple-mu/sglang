@@ -13,7 +13,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import FP32LayerNorm, RMSNor
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=6),
         triton.Config({}, num_warps=8),
         triton.Config({}, num_warps=16),
     ],
@@ -312,7 +311,6 @@ def broadcast_tensor_for_bsh(tensor, B: int, S: int, H: int):
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=6),
         triton.Config({}, num_warps=8),
         triton.Config({}, num_warps=16),
     ],
@@ -406,7 +404,6 @@ def scale_shift(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=6),
         triton.Config({}, num_warps=8),
         triton.Config({}, num_warps=16),
     ],
