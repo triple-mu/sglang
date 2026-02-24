@@ -335,14 +335,12 @@ def _scale_shift(
     h_offset = tl.arange(0, BLOCK_SIZE)
     h_mask = h_offset < h
 
-    x = tl.load(x_ptr + h_offset * x_stride_h, mask=h_mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr + h_offset * scale_stride_h, mask=h_mask, other=0.0).to(
-        tl.float32
-    )
-    shift = tl.load(shift_ptr + h_offset * shift_stride_h, mask=h_mask, other=0.0).to(
-        tl.float32
-    )
-    x = x * scale + shift
+    x = tl.load(x_ptr + h_offset * x_stride_h, mask=h_mask, other=0.0)
+    scale = tl.load(scale_ptr + h_offset * scale_stride_h, mask=h_mask, other=0.0)
+    shift = tl.load(shift_ptr + h_offset * shift_stride_h, mask=h_mask, other=0.0)
+
+    # x = x * scale + shift
+    x = tl.fma(x, scale, shift)
 
     tl.store(x_out_ptr + h_offset * x_stride_h, x, mask=h_mask)
 
@@ -442,15 +440,13 @@ def _scale_residual_norm_scale_shift(
     h_offset = tl.arange(0, BLOCK_SIZE)
     h_mask = h_offset < h
 
-    x = tl.load(x_ptr + h_offset * x_stride_h, mask=h_mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + h_offset * x_stride_h, mask=h_mask, other=0.0)
+    gate = tl.load(gate_ptr + h_offset * gate_stride_h, mask=h_mask, other=0.0)
+    resi = tl.load(resi_ptr + h_offset * res_stride_h, mask=h_mask, other=0.0)
 
-    gate = tl.load(gate_ptr + h_offset * gate_stride_h, mask=h_mask, other=0.0).to(
-        tl.float32
-    )
-    resi = tl.load(resi_ptr + h_offset * res_stride_h, mask=h_mask, other=0.0).to(
-        tl.float32
-    )
-    x = resi + gate * x
+    # x = resi + gate * x
+    x = tl.fma(x, gate, resi)
+
     tl.store(resi_out_ptr + h_offset * res_stride_h, x, mask=h_mask)
 
     if WITH_WEIGHT:
@@ -478,13 +474,11 @@ def _scale_residual_norm_scale_shift(
         tl.static_assert(f"{NORM_TYPE=} is not supported!")
         norm_x = 0.0
 
-    scale = tl.load(scale_ptr + h_offset * scale_stride_h, mask=h_mask, other=0.0).to(
-        tl.float32
-    )
-    shift = tl.load(shift_ptr + h_offset * shift_stride_h, mask=h_mask, other=0.0).to(
-        tl.float32
-    )
-    norm_x = norm_x * (1 + scale) + shift
+    scale = tl.load(scale_ptr + h_offset * scale_stride_h, mask=h_mask, other=0.0)
+    shift = tl.load(shift_ptr + h_offset * shift_stride_h, mask=h_mask, other=0.0)
+
+    # norm_x = norm_x * (1 + scale) + shift
+    norm_x = tl.fma(norm_x, 1 + scale, shift)
 
     tl.store(x_out_ptr + h_offset * x_stride_h, norm_x, mask=h_mask)
 
