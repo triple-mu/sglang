@@ -10,6 +10,15 @@ import triton.language as tl
 from sglang.multimodal_gen.runtime.layers.layernorm import FP32LayerNorm, RMSNorm
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=6),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+    ],
+    key=["num_heads", "head_dim", "half_head_dim"],
+)
 @triton.jit
 def _qk_rms_norm_rope_inplace(
     q_ptr,  # [b, s, n, d]
@@ -236,7 +245,6 @@ def qk_rms_norm_rope_triton(
             BLOCK_SIZE_HALF_D=BLOCK_SIZE_HALF_D,
             INTERLEAVE=interleave,
             WITH_WEIGHT=WITH_WEIGHT,
-            num_warps=8,
         )
 
     return q, k
@@ -301,6 +309,15 @@ def broadcast_tensor_for_bsh(tensor, B: int, S: int, H: int):
     raise ValueError(f"BSH broadcast: unsupported tensor ndim: {tensor.ndim}.")
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=6),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+    ],
+    key=["h"],
+)
 @triton.jit
 def _scale_shift(
     x_out_ptr,  # [b, s, h]
@@ -382,11 +399,19 @@ def scale_shift(
             shift.stride(2),
             h,
             BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=8,
         )
     return y
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=6),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+    ],
+    key=["h"],
+)
 @triton.jit
 def _scale_residual_norm_scale_shift(
     resi_out_ptr,  # [b, s, h]
@@ -555,7 +580,6 @@ def scale_residual_norm_scale_shift(
             WITH_BIAS=WITH_BIAS,
             NORM_TYPE=norm_type,
             BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=8,
         )
     return y, residual_out
 
