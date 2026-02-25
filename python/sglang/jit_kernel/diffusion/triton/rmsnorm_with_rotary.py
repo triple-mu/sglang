@@ -166,6 +166,11 @@ def _qk_rms_norm_cross_head_with_rope_inplace(
         tl.store(k2_block_ptr, ko2, mask=nd_half_mask)
 
 
+@torch.library.custom_op(
+    "sglang::qk_rms_norm_cross_head_with_rope",
+    mutates_args=("q", "k"),
+    device_types="cuda",
+)
 def qk_rms_norm_cross_head_with_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -175,7 +180,7 @@ def qk_rms_norm_cross_head_with_rope(
     sin: torch.Tensor,
     eps: float = 1e-6,
     interleave: bool = True,
-):
+) -> None:
     assert (
         q.is_contiguous()
         and k.is_contiguous()
@@ -227,3 +232,17 @@ def qk_rms_norm_cross_head_with_rope(
             WITH_WEIGHT=WITH_WEIGHT,
             num_warps=8,
         )
+
+
+@qk_rms_norm_cross_head_with_rope.register_fake
+def _qk_rms_norm_cross_head_with_rope_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    qw: torch.Tensor | None,
+    kw: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    eps: float = 1e-6,
+    interleave: bool = True,
+) -> None:
+    return
