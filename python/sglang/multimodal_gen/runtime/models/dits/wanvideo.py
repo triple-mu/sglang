@@ -499,10 +499,10 @@ class WanTransformerBlock(nn.Module):
 
         if self.null_shift is None or self.null_scale is None or self.null_gate is None:
             self.null_shift = self.null_scale = torch.zeros(
-                1, dtype=hidden_states.dtype, device=hidden_states.device
+                1, dtype=torch.float32, device=hidden_states.device
             )
             self.null_gate = torch.ones(
-                1, dtype=hidden_states.dtype, device=hidden_states.device
+                1, dtype=torch.float32, device=hidden_states.device
             )
 
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
@@ -1018,9 +1018,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 original_hidden_states = hidden_states.clone()
             ff_output = hidden_states
             hidden_states = torch.zeros_like(hidden_states)
-            c_gate_msa = torch.ones(
-                1, dtype=hidden_states.dtype, device=hidden_states.device
-            )
+            c_gate_msa = torch.ones(1, dtype=torch.float32, device=hidden_states.device)
             for block in self.blocks:
                 hidden_states, ff_output, c_gate_msa = block(
                     hidden_states,
