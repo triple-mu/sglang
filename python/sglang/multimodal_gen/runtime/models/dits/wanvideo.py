@@ -9,6 +9,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.jit_kernel.diffusion.triton.rmsnorm_with_rotary import (
+    qk_rms_norm_cross_head_with_rope,
+)
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import (
@@ -51,7 +54,6 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.fused import qk_rms_norm_rope_triton
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -322,7 +324,7 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = LayerNormScaleShift(
+        self.norm1 = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
@@ -434,10 +436,12 @@ class WanTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        ff_output: torch.Tensor,
+        c_gate_msa_in: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -464,62 +468,29 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        norm_hidden_states, hidden_states = self.norm1(
+            hidden_states, ff_output, c_gate_msa_in, shift_msa, scale_msa
+        )
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
 
-        if False:
-            if self.norm_q is not None:
-                if self.tp_rmsnorm:
-                    query = tensor_parallel_rms_norm(query, self.norm_q)
-                else:
-                    query = self.norm_q(query)
-            if self.norm_k is not None:
-                if self.tp_rmsnorm:
-                    key = tensor_parallel_rms_norm(key, self.norm_k)
-                else:
-                    key = self.norm_k(key)
-            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        assert not self.tp_rmsnorm, f"tensor parallel is not support now!"
+        query = query.unflatten(2, (self.local_num_heads, self.dim_head))
+        key = key.unflatten(2, (self.local_num_heads, self.dim_head))
+        value = value.unflatten(2, (self.local_num_heads, self.dim_head))
+        cos, sin = freqs_cis
 
-            # Apply rotary embeddings
-            cos, sin = freqs_cis
-            if _is_cuda and query.shape == key.shape:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-                query, key = apply_flashinfer_rope_qk_inplace(
-                    query, key, cos_sin_cache, is_neox=False
-                )
-            else:
-                query, key = _apply_rotary_emb(
-                    query, cos, sin, is_neox_style=False
-                ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        else:
-            query = query.unflatten(2, (self.local_num_heads, self.dim_head))
-            key = key.unflatten(2, (self.local_num_heads, self.dim_head))
-            value = value.unflatten(2, (self.local_num_heads, self.dim_head))
-            cos, sin = freqs_cis
-
-            (
-                query,
-                key,
-            ) = qk_rms_norm_rope_triton(
-                q=query,
-                k=key,
-                qw=getattr(self.norm_q, "weight"),
-                kw=getattr(self.norm_k, "weight"),
-                cos=cos,
-                sin=sin,
-                eps=self.norm_q.variance_epsilon,
-                interleave=True,
-            )
+        qk_rms_norm_cross_head_with_rope(
+            q=query,
+            k=key,
+            qw=getattr(self.norm_q, "weight"),
+            kw=getattr(self.norm_k, "weight"),
+            cos=cos,
+            sin=sin,
+            eps=self.norm_q.variance_epsilon,
+            interleave=True,
+        )
 
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
@@ -554,10 +525,7 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
-        hidden_states = hidden_states.to(orig_dtype)
-
-        return hidden_states
+        return hidden_states, ff_output, c_gate_msa
 
 
 class WanTransformerBlock_VSA(nn.Module):
@@ -1048,11 +1016,22 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
-
+            ff_output = hidden_states
+            hidden_states = torch.zeros_like(hidden_states)
+            c_gate_msa = torch.ones(
+                1, dtype=hidden_states.dtype, device=hidden_states.device
+            )
             for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                hidden_states, ff_output, c_gate_msa = block(
+                    hidden_states,
+                    ff_output,
+                    c_gate_msa,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    freqs_cis,
                 )
+            hidden_states = MulAdd()(ff_output, c_gate_msa, hidden_states)
+
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
