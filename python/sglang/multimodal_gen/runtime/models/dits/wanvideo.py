@@ -692,7 +692,7 @@ class WanTransformerBlock_VSA(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(
+        norm_hidden_states, hidden_states = self.norm1(
             residual, hidden_states, c_gate_msa, shift_msa, scale_msa
         )
         query, _ = self.to_q(norm_hidden_states)
