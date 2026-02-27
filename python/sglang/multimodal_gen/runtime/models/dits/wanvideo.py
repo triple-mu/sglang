@@ -675,8 +675,8 @@ class WanTransformerBlock_VSA(nn.Module):
         self,
         residual: torch.Tensor,
         hidden_states: torch.Tensor,
-        c_gate_msa: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        c_gate_msa: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
