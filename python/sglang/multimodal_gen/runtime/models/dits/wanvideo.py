@@ -6,12 +6,10 @@ import math
 from functools import lru_cache
 from typing import Any
 
+import cplusplus
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.diffusion.triton.rmsnorm_with_rotary import (
-    qk_rms_norm_cross_head_with_rope,
-)
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import (
@@ -481,11 +479,22 @@ class WanTransformerBlock(nn.Module):
         value = value.unflatten(2, (self.local_num_heads, self.dim_head))
         cos, sin = freqs_cis
 
-        qk_rms_norm_cross_head_with_rope(
+        # qk_rms_norm_cross_head_with_rope(
+        #     q=query,
+        #     k=key,
+        #     qw=getattr(self.norm_q, "weight"),
+        #     kw=getattr(self.norm_k, "weight"),
+        #     cos=cos,
+        #     sin=sin,
+        #     eps=self.norm_q.variance_epsilon,
+        #     interleave=True,
+        # )
+
+        cplusplus.fused_qk_norm_rotary_emb_inplace(
             q=query,
             k=key,
-            qw=getattr(self.norm_q, "weight"),
-            kw=getattr(self.norm_k, "weight"),
+            q_weight=self.norm_q.weight,
+            k_weight=self.norm_k.weight,
             cos=cos,
             sin=sin,
             eps=self.norm_q.variance_epsilon,
