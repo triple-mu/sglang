@@ -9,9 +9,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.diffusion.triton.rmsnorm_with_rotary import (
-    qk_rms_norm_cross_head_with_rope,
-)
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
