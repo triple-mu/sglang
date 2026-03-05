@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_all_to_all_nvshmem,
     _usp_input_all_to_all,
     _usp_output_all_to_all,
     ring_attn,
@@ -386,9 +387,10 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            q = _usp_all_to_all_nvshmem(q, head_dim=2, mode=0, tag="q")
+            k = _usp_all_to_all_nvshmem(k, head_dim=2, mode=0, tag="k")
+            v = _usp_all_to_all_nvshmem(v, head_dim=2, mode=0, tag="v")
+            # q, k, v = _usp_qkv_all_to_all_nvshmem(q, k, v, head_dim=2, mode=0)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -407,7 +409,7 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All to restore original sharding
         if sp_size > 1:
             # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            out = _usp_all_to_all_nvshmem(out, head_dim=2, mode=1, tag="o")
 
         return out
 

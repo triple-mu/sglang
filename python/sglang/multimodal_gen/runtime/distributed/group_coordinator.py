@@ -11,8 +11,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
+import nvshmem.core as nvshmem
 import torch
 import torch.distributed
+import triton
+import triton.language as tl
+from cuda.core.experimental import Device
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
 
@@ -1216,7 +1221,717 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
 
+        # Global process space (torch.distributed default world).
+        self.global_rank = torch.distributed.get_rank()
+        self.global_world_size = torch.distributed.get_world_size()
+        # Ulysses sub-groups inside SP.
         self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+
+        self.nvshmem_dev: Optional[Device] = None
+        self.nvshmem_team: Optional[nvshmem.Teams] = None
+        self.nvshmem_world_peers: Optional[List[int]] = None
+        self._init_nvshmem_ulysess_context()
+        self._nvshmem_workspaces: dict[
+            Tuple[Tuple[int, ...], torch.dtype], Tuple[torch.Tensor, List[torch.Tensor]]
+        ] = {}
+
+    def _init_nvshmem_ulysess_context(self) -> None:
+        status = int(nvshmem.init_status())
+        if status >= int(nvshmem.InitStatus.STATUS_IS_INITIALIZED):
+            return
+
+        self.nvshmem_dev = Device(torch.cuda.current_device())
+        self.nvshmem_dev.set_current()
+
+        if self.global_rank == 0:
+            uid = nvshmem.get_unique_id()
+        else:
+            uid = nvshmem.get_unique_id(empty=True)
+
+        uid_bytes = torch.tensor(
+            uid._data.view(np.uint8), dtype=torch.uint8, device=self.device
+        )
+        torch.distributed.broadcast(
+            uid_bytes, src=0, group=torch.distributed.group.WORLD
+        )
+        if self.global_rank != 0:
+            uid._data[...] = uid_bytes.cpu().numpy().view(uid._data.dtype)
+
+        nvshmem.init(
+            device=self.nvshmem_dev,
+            uid=uid,
+            rank=self.global_rank,
+            nranks=self.global_world_size,
+            initializer_method="uid",
+        )
+
+        my_rank = torch.full(
+            (1,), fill_value=self.global_rank, dtype=torch.int64, device=self.device
+        )
+        gathered = [torch.empty_like(my_rank) for _ in range(self.ulysses_world_size)]
+        torch.distributed.all_gather(gathered, my_rank, group=self.ulysses_group)
+
+        self.nvshmem_team = nvshmem.Teams.TEAM_WORLD
+        self.nvshmem_world_peers = [t.item() for t in gathered]
+
+    def all_to_all_4d_nvshmem(
+        self, x: torch.Tensor, mode: int = 0, tag: str = ""
+    ) -> torch.Tensor:
+        return self.all_to_all_4d_nvshmem_sd(x, mode=mode, tag=tag)
+
+    def all_to_all_4d_nvshmem_nd(self, x: torch.Tensor, mode: int = 0) -> torch.Tensor:
+        assert self.nvshmem_team is not None
+
+        if x.ndim != 4:
+            raise ValueError(f"x must have 4 dimensions, got {x.ndim}")
+        if x.device.type != "cuda":
+            raise TypeError(f"x must be a CUDA tensor, got {x.device}")
+        if mode not in (0, 1):
+            raise ValueError(f"mode must be 0 or 1, got {mode}")
+        if x.device.index != torch.cuda.current_device():
+            torch.cuda.set_device(x.device)
+
+        x = x.contiguous()
+        ulysses_group_rank = self.ulysses_rank
+        ulysses_group_size = self.ulysses_world_size
+        if ulysses_group_size > 8:
+            raise ValueError(
+                f"ulysses_world_size ({ulysses_group_size}) must be <= 8 for this kernel"
+            )
+
+        if mode == 0:
+            b, s_local, n_global, d = x.shape
+            if n_global % ulysses_group_size != 0:
+                raise ValueError(
+                    f"n_global ({n_global}) must be divisible by world_size ({ulysses_group_size})"
+                )
+            n_local = n_global // ulysses_group_size
+            s_global = s_local * ulysses_group_size
+            out_shape = (b, s_global, n_local, d)
+        else:
+            b, s_global, n_local, d = x.shape
+            if s_global % ulysses_group_size != 0:
+                raise ValueError(
+                    f"s_global ({s_global}) must be divisible by world_size ({ulysses_group_size})"
+                )
+            s_local = s_global // ulysses_group_size
+            n_global = n_local * ulysses_group_size
+            out_shape = (b, s_local, n_global, d)
+
+        sym, peer_views = self._get_nvshmem_workspace(out_shape, x.dtype, tag="x")
+        if len(peer_views) != ulysses_group_size:
+            raise RuntimeError(
+                f"peer_views ({len(peer_views)}) must equal world_size ({ulysses_group_size})"
+            )
+
+        kernel_args = list(peer_views)
+        while len(kernel_args) < 8:
+            kernel_args.append(peer_views[0])
+
+        block_d = 128 if d >= 128 else 64
+        if n_local >= 16:
+            block_n = 16
+            num_warps = 8
+        elif n_local >= 8:
+            block_n = 8
+            num_warps = 8
+        elif n_local >= 4:
+            block_n = 4
+            num_warps = 4
+        else:
+            block_n = 2
+            num_warps = 4
+
+        d_tiles = triton.cdiv(d, block_d)
+        n_tiles = triton.cdiv(n_local, block_n)
+        grid = (ulysses_group_size * b * s_local, n_tiles, d_tiles)
+
+        with torch.cuda.device(x.device):
+            _fused_alltoall_kernel_nd[grid](
+                x,
+                kernel_args[0],
+                kernel_args[1],
+                kernel_args[2],
+                kernel_args[3],
+                kernel_args[4],
+                kernel_args[5],
+                kernel_args[6],
+                kernel_args[7],
+                b,
+                s_local,
+                s_global,
+                n_local,
+                n_global,
+                d,
+                ulysses_group_rank,
+                BLOCK_D=block_d,
+                BLOCK_N=block_n,
+                MODE=mode,
+                num_warps=num_warps,
+            )
+
+        nv_stream = nvshmem.NvshmemStream(torch.cuda.current_stream(x.device))
+        nvshmem.barrier(self.nvshmem_team, stream=nv_stream)
+        return sym.clone()
+
+    def all_to_all_4d_nvshmem_sd(
+        self, x: torch.Tensor, mode: int = 0, tag: str = ""
+    ) -> torch.Tensor:
+        assert self.nvshmem_team is not None
+
+        if x.ndim != 4:
+            raise ValueError(f"x must have 4 dimensions, got {x.ndim}")
+        if x.device.type != "cuda":
+            raise TypeError(f"x must be a CUDA tensor, got {x.device}")
+        if mode not in (0, 1):
+            raise ValueError(f"mode must be 0 or 1, got {mode}")
+        if x.device.index != torch.cuda.current_device():
+            torch.cuda.set_device(x.device)
+
+        x = x.contiguous()
+        ulysses_group_rank = self.ulysses_rank
+        ulysses_group_size = self.ulysses_world_size
+        if ulysses_group_size > 8:
+            raise ValueError(
+                f"ulysses_world_size ({ulysses_group_size}) must be <= 8 for this kernel"
+            )
+
+        if mode == 0:
+            b, s_local, n_global, d = x.shape
+            if n_global % ulysses_group_size != 0:
+                raise ValueError(
+                    f"n_global ({n_global}) must be divisible by world_size ({ulysses_group_size})"
+                )
+            n_local = n_global // ulysses_group_size
+            s_global = s_local * ulysses_group_size
+            out_shape = (b, s_global, n_local, d)
+        else:
+            b, s_global, n_local, d = x.shape
+            if s_global % ulysses_group_size != 0:
+                raise ValueError(
+                    f"s_global ({s_global}) must be divisible by world_size ({ulysses_group_size})"
+                )
+            s_local = s_global // ulysses_group_size
+            n_global = n_local * ulysses_group_size
+            out_shape = (b, s_local, n_global, d)
+
+        sym, peer_views = self._get_nvshmem_workspace(out_shape, x.dtype, tag=tag)
+        if len(peer_views) != ulysses_group_size:
+            raise RuntimeError(
+                f"peer_views ({len(peer_views)}) must equal world_size ({ulysses_group_size})"
+            )
+
+        kernel_args = list(peer_views)
+        while len(kernel_args) < 8:
+            kernel_args.append(peer_views[0])
+
+        block_d = 128 if d >= 128 else 64 if d >= 64 else 32
+        if s_local >= 128:
+            block_s = 128
+            num_warps = 16
+        elif s_local >= 64:
+            block_s = 64
+            num_warps = 16 if block_d >= 128 else 8
+        elif s_local >= 32:
+            block_s = 32
+            num_warps = 8
+        elif s_local >= 16:
+            block_s = 16
+            num_warps = 8 if block_d >= 128 else 4
+        elif s_local >= 8:
+            block_s = 8
+            num_warps = 4
+        elif s_local >= 4:
+            block_s = 4
+            num_warps = 4
+        else:
+            block_s = 2 if s_local > 1 else 1
+            num_warps = 2
+
+        d_tiles = triton.cdiv(d, block_d)
+        s_tiles = triton.cdiv(s_local, block_s)
+        grid = (ulysses_group_size * b * n_local, s_tiles, d_tiles)
+
+        with torch.cuda.device(x.device):
+            _fused_alltoall_kernel_sd[grid](
+                x,
+                kernel_args[0],
+                kernel_args[1],
+                kernel_args[2],
+                kernel_args[3],
+                kernel_args[4],
+                kernel_args[5],
+                kernel_args[6],
+                kernel_args[7],
+                b,
+                s_local,
+                s_global,
+                n_local,
+                n_global,
+                d,
+                ulysses_group_rank,
+                BLOCK_D=block_d,
+                BLOCK_S=block_s,
+                MODE=mode,
+                num_warps=num_warps,
+            )
+
+        stream = torch.cuda.current_stream(x.device)
+        nv_stream = nvshmem.NvshmemStream(stream)
+        nvshmem.barrier(self.nvshmem_team, stream=nv_stream)
+
+        return sym.clone()
+
+    def all_to_all_4d_nvshmem_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mode: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.nvshmem_team is not None
+
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError(
+                f"q/k/v must have 4 dimensions, got {q.ndim} {k.ndim} {v.ndim}"
+            )
+        if q.shape != k.shape != v.shape:
+            raise ValueError(
+                f"q/k/v must have the same shape as k and v, got {q.shape} {k.shape} {v.shape}"
+            )
+        if (
+            q.device.type != "cuda"
+            or k.device.type != "cuda"
+            or v.device.type != "cuda"
+        ):
+            raise TypeError(
+                f"q/k/v must be a CUDA tensor, got {q.device} {k.device} {v.device}"
+            )
+        if mode != 0:
+            raise ValueError(f"mode must be 0, got {mode}")
+        if q.device.index != torch.cuda.current_device():
+            torch.cuda.set_device(q.device)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        ulysses_group_rank = self.ulysses_rank
+        ulysses_group_size = self.ulysses_world_size
+        if ulysses_group_size > 8:
+            raise ValueError(
+                f"ulysses_world_size ({ulysses_group_size}) must be <= 8 for this kernel"
+            )
+
+        b, s_local, n_global, d = q.shape
+        if n_global % ulysses_group_size != 0:
+            raise ValueError(
+                f"n_global ({n_global}) must be divisible by world_size ({ulysses_group_size})"
+            )
+        n_local = n_global // ulysses_group_size
+        s_global = s_local * ulysses_group_size
+        out_shape = (b, s_global, n_local, d)
+
+        q_sym, q_peer_views = self._get_nvshmem_workspace(out_shape, q.dtype, "q")
+        k_sym, k_peer_views = self._get_nvshmem_workspace(out_shape, k.dtype, "k")
+        v_sym, v_peer_views = self._get_nvshmem_workspace(out_shape, v.dtype, "v")
+
+        if (
+            len(q_peer_views)
+            != len(k_peer_views)
+            != len(v_peer_views)
+            != ulysses_group_size
+        ):
+            raise RuntimeError(
+                f"q/k/v peer_views ({len(q_peer_views)}, {len(k_peer_views)}, {len(v_peer_views)}) must equal world_size ({ulysses_group_size})"
+            )
+
+        q_kernel_args = list(q_peer_views)
+        while len(q_kernel_args) < 8:
+            q_kernel_args.append(q_peer_views[0])
+
+        k_kernel_args = list(k_peer_views)
+        while len(k_kernel_args) < 8:
+            k_kernel_args.append(k_peer_views[0])
+
+        v_kernel_args = list(v_peer_views)
+        while len(v_kernel_args) < 8:
+            v_kernel_args.append(v_peer_views[0])
+
+        block_d = 128 if d >= 128 else 64 if d >= 64 else 32
+        if s_local >= 128:
+            block_s = 128
+            num_warps = 16
+        elif s_local >= 64:
+            block_s = 64
+            num_warps = 16 if block_d >= 128 else 8
+        elif s_local >= 32:
+            block_s = 32
+            num_warps = 8
+        elif s_local >= 16:
+            block_s = 16
+            num_warps = 8 if block_d >= 128 else 4
+        elif s_local >= 8:
+            block_s = 8
+            num_warps = 4
+        elif s_local >= 4:
+            block_s = 4
+            num_warps = 4
+        else:
+            block_s = 2 if s_local > 1 else 1
+            num_warps = 2
+
+        d_tiles = triton.cdiv(d, block_d)
+        s_tiles = triton.cdiv(s_local, block_s)
+        grid = (ulysses_group_size * b * n_local, s_tiles, d_tiles)
+
+        with torch.cuda.device(q.device):
+            _fused_qkv_alltoall_kernel[grid](
+                q,
+                k,
+                v,
+                q_kernel_args[0],
+                q_kernel_args[1],
+                q_kernel_args[2],
+                q_kernel_args[3],
+                q_kernel_args[4],
+                q_kernel_args[5],
+                q_kernel_args[6],
+                q_kernel_args[7],
+                k_kernel_args[0],
+                k_kernel_args[1],
+                k_kernel_args[2],
+                k_kernel_args[3],
+                k_kernel_args[4],
+                k_kernel_args[5],
+                k_kernel_args[6],
+                k_kernel_args[7],
+                v_kernel_args[0],
+                v_kernel_args[1],
+                v_kernel_args[2],
+                v_kernel_args[3],
+                v_kernel_args[4],
+                v_kernel_args[5],
+                v_kernel_args[6],
+                v_kernel_args[7],
+                b,
+                s_local,
+                s_global,
+                n_local,
+                n_global,
+                d,
+                ulysses_group_rank,
+                BLOCK_D=block_d,
+                BLOCK_S=block_s,
+                MODE=mode,
+                num_warps=num_warps,
+            )
+
+        stream = torch.cuda.current_stream(q.device)
+        nv_stream = nvshmem.NvshmemStream(stream)
+        nvshmem.barrier(self.nvshmem_team, stream=nv_stream)
+
+        return q_sym.clone(), k_sym.clone(), v_sym.clone()
+
+    def _free_workspace(
+        self, sym: torch.Tensor, peer_views: list[torch.Tensor]
+    ) -> None:
+        try:
+            for p in peer_views:
+                if p.data_ptr() != sym.data_ptr():
+                    nvshmem.free_tensor(p)
+        except Exception:
+            pass
+        try:
+            nvshmem.free_tensor(sym)
+        except Exception:
+            pass
+
+    def _get_nvshmem_workspace(
+        self, shape: Tuple[int, ...], dtype: torch.dtype, tag: str = ""
+    ) -> Tuple[torch.Tensor, list[torch.Tensor]]:
+        shape = tuple(shape)
+        key = (shape, dtype, tag)
+        cached = self._nvshmem_workspaces.get(key)
+        if cached is not None:
+            return cached
+
+        sym = nvshmem.tensor(shape, dtype=dtype)
+        peer_views: List[torch.Tensor] = [
+            nvshmem.get_peer_tensor(sym, world_peer)
+            for world_peer in self.nvshmem_world_peers
+        ]
+        self._nvshmem_workspaces[key] = (sym, peer_views)
+        return sym, peer_views
+
+    def release_nvshmem_resources(self) -> None:
+        torch.distributed.barrier(group=self.ulysses_group)
+        torch.cuda.synchronize(self.device)
+
+        for sym, peer_views in self._nvshmem_workspaces.values():
+            self._free_workspace(sym, peer_views)
+        self._nvshmem_workspaces.clear()
+        self.nvshmem_team = None
+        self.nvshmem_world_peers.clear()
+
+        if int(nvshmem.init_status()) >= int(nvshmem.InitStatus.STATUS_IS_INITIALIZED):
+            nvshmem.finalize()
+
+    def destroy(self) -> None:
+        self.release_nvshmem_resources()
+        super().destroy()
+
+
+@triton.jit
+def _fused_alltoall_kernel_nd(
+    x_ptr,
+    p0,
+    p1,
+    p2,
+    p3,
+    p4,
+    p5,
+    p6,
+    p7,
+    b,
+    s_local,
+    s_global,
+    n_local,
+    n_global,
+    d,
+    rank,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MODE: tl.constexpr,  # 0: seq gather, head scatter; 1: seq scatter, head gather
+):
+    pid0 = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    pid_d = tl.program_id(axis=2)
+    pid_bs = pid0 % (b * s_local)
+    peer = pid0 // (b * s_local)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_d = offs_d < d
+    mask_n = offs_n < n_local
+    mask = mask_n[:, None] & mask_d[None, :]
+
+    dst_ptr = p0
+    if peer == 1:
+        dst_ptr = p1
+    elif peer == 2:
+        dst_ptr = p2
+    elif peer == 3:
+        dst_ptr = p3
+    elif peer == 4:
+        dst_ptr = p4
+    elif peer == 5:
+        dst_ptr = p5
+    elif peer == 6:
+        dst_ptr = p6
+    elif peer == 7:
+        dst_ptr = p7
+
+    b_idx = pid_bs // s_local
+    s_local_idx = pid_bs % s_local
+
+    if MODE == 0:
+        # [b, s_local, n_global, d] -> remote [b, s_global, n_local, d]
+        src_n = peer * n_local + offs_n
+        src_base = (((b_idx * s_local + s_local_idx) * n_global + src_n) * d)[:, None]
+        dst_s = rank * s_local + s_local_idx
+        dst_base = (((b_idx * s_global + dst_s) * n_local + offs_n) * d)[:, None]
+    else:
+        # [b, s_global, n_local, d] -> remote [b, s_local, n_global, d]
+        src_s = peer * s_local + s_local_idx
+        src_base = (((b_idx * s_global + src_s) * n_local + offs_n) * d)[:, None]
+        dst_n = rank * n_local + offs_n
+        dst_base = (((b_idx * s_local + s_local_idx) * n_global + dst_n) * d)[:, None]
+
+    vals = tl.load(x_ptr + src_base + offs_d[None, :], mask=mask, other=0)
+    tl.store(dst_ptr + dst_base + offs_d[None, :], vals, mask=mask)
+
+
+@triton.jit
+def _fused_alltoall_kernel_sd(
+    x_ptr,
+    p0,
+    p1,
+    p2,
+    p3,
+    p4,
+    p5,
+    p6,
+    p7,
+    b,
+    s_local,
+    s_global,
+    n_local,
+    n_global,
+    d,
+    rank,
+    BLOCK_D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    MODE: tl.constexpr,  # 0: seq gather, head scatter; 1: seq scatter, head gather
+):
+    pid0 = tl.program_id(axis=0)
+    pid_s = tl.program_id(axis=1)
+    pid_d = tl.program_id(axis=2)
+    pid_bn = pid0 % (b * n_local)
+    peer = pid0 // (b * n_local)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+
+    mask_d = offs_d < d
+    mask_s = offs_s < s_local
+    mask = mask_s[:, None] & mask_d[None, :]
+
+    dst_ptr = p0
+    if peer == 1:
+        dst_ptr = p1
+    elif peer == 2:
+        dst_ptr = p2
+    elif peer == 3:
+        dst_ptr = p3
+    elif peer == 4:
+        dst_ptr = p4
+    elif peer == 5:
+        dst_ptr = p5
+    elif peer == 6:
+        dst_ptr = p6
+    elif peer == 7:
+        dst_ptr = p7
+
+    b_idx = pid_bn // n_local
+    n_local_idx = pid_bn % n_local
+
+    if MODE == 0:
+        # [b, s_local, n_global, d] -> remote [b, s_global, n_local, d]
+        src_n = peer * n_local + n_local_idx
+        src_base = (((b_idx * s_local + offs_s) * n_global + src_n) * d)[:, None]
+        dst_s = rank * s_local + offs_s
+        dst_base = (((b_idx * s_global + dst_s) * n_local + n_local_idx) * d)[:, None]
+    else:
+        # [b, s_global, n_local, d] -> remote [b, s_local, n_global, d]
+        src_s = peer * s_local + offs_s
+        src_base = (((b_idx * s_global + src_s) * n_local + n_local_idx) * d)[:, None]
+        dst_n = rank * n_local + n_local_idx
+        dst_base = (((b_idx * s_local + offs_s) * n_global + dst_n) * d)[:, None]
+
+    vals = tl.load(x_ptr + src_base + offs_d[None, :], mask=mask, other=0.0)
+    tl.store(dst_ptr + dst_base + offs_d[None, :], vals, mask=mask)
+
+
+@triton.jit
+def _fused_qkv_alltoall_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_p0,
+    q_p1,
+    q_p2,
+    q_p3,
+    q_p4,
+    q_p5,
+    q_p6,
+    q_p7,
+    k_p0,
+    k_p1,
+    k_p2,
+    k_p3,
+    k_p4,
+    k_p5,
+    k_p6,
+    k_p7,
+    v_p0,
+    v_p1,
+    v_p2,
+    v_p3,
+    v_p4,
+    v_p5,
+    v_p6,
+    v_p7,
+    b,
+    s_local,
+    s_global,
+    n_local,
+    n_global,
+    d,
+    rank,
+    BLOCK_D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    MODE: tl.constexpr,  # 0: seq gather, head scatter; 1: seq scatter, head gather
+):
+    pid0 = tl.program_id(axis=0)
+    pid_s = tl.program_id(axis=1)
+    pid_d = tl.program_id(axis=2)
+    pid_bn = pid0 % (b * n_local)
+    peer = pid0 // (b * n_local)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+
+    mask_d = offs_d < d
+    mask_s = offs_s < s_local
+    mask = mask_s[:, None] & mask_d[None, :]
+
+    q_dst_ptr = q_p0
+    k_dst_ptr = k_p0
+    v_dst_ptr = v_p0
+    if peer == 1:
+        q_dst_ptr = q_p1
+        k_dst_ptr = k_p1
+        v_dst_ptr = v_p1
+    elif peer == 2:
+        q_dst_ptr = q_p2
+        k_dst_ptr = k_p2
+        v_dst_ptr = v_p2
+    elif peer == 3:
+        q_dst_ptr = q_p3
+        k_dst_ptr = k_p3
+        v_dst_ptr = v_p3
+    elif peer == 4:
+        q_dst_ptr = q_p4
+        k_dst_ptr = k_p4
+        v_dst_ptr = v_p4
+    elif peer == 5:
+        q_dst_ptr = q_p5
+        k_dst_ptr = k_p5
+        v_dst_ptr = v_p5
+    elif peer == 6:
+        q_dst_ptr = q_p6
+        k_dst_ptr = k_p6
+        v_dst_ptr = v_p6
+    elif peer == 7:
+        q_dst_ptr = q_p7
+        k_dst_ptr = k_p7
+        v_dst_ptr = v_p7
+
+    b_idx = pid_bn // n_local
+    n_local_idx = pid_bn % n_local
+
+    if MODE == 0:
+        # [b, s_local, n_global, d] -> remote [b, s_global, n_local, d]
+        src_n = peer * n_local + n_local_idx
+        src_base = (((b_idx * s_local + offs_s) * n_global + src_n) * d)[:, None]
+        dst_s = rank * s_local + offs_s
+        dst_base = (((b_idx * s_global + dst_s) * n_local + n_local_idx) * d)[:, None]
+    else:
+        # [b, s_global, n_local, d] -> remote [b, s_local, n_global, d]
+        src_s = peer * s_local + offs_s
+        src_base = (((b_idx * s_global + src_s) * n_local + n_local_idx) * d)[:, None]
+        dst_n = rank * n_local + n_local_idx
+        dst_base = (((b_idx * s_local + offs_s) * n_global + dst_n) * d)[:, None]
+
+    q_vals = tl.load(q_ptr + src_base + offs_d[None, :], mask=mask, other=0.0)
+    tl.store(q_dst_ptr + dst_base + offs_d[None, :], q_vals, mask=mask)
+
+    k_vals = tl.load(k_ptr + src_base + offs_d[None, :], mask=mask, other=0.0)
+    tl.store(k_dst_ptr + dst_base + offs_d[None, :], k_vals, mask=mask)
+
+    v_vals = tl.load(v_ptr + src_base + offs_d[None, :], mask=mask, other=0.0)
+    tl.store(v_dst_ptr + dst_base + offs_d[None, :], v_vals, mask=mask)

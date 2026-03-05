@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.distributed._functional_collectives as ft_c
@@ -156,6 +156,59 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
 
     return x
+
+
+def _usp_all_to_all_nvshmem(
+    x: torch.Tensor, head_dim: int = 1, mode: int = 0, tag: str = ""
+) -> torch.Tensor:
+    """Ulysses all-to-all using NVSHMEM.
+
+    Args:
+        x: A 4D tensor with layout [b, s, n, d].
+        head_dim: Which dimension index corresponds to heads.
+        mode:
+            - 0: input all-to-all  ([..., h_global, s_local, ...] -> [..., h_local, s_global, ...])
+            - 1: output all-to-all ([..., h_local, s_global, ...] -> [..., h_global, s_local, ...])
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim == 2, f"head_dim must be 2, got {head_dim}"
+    assert mode in (0, 1), f"mode must be 0 or 1, got {mode}"
+
+    sp_group = get_sp_group()
+    x = sp_group.all_to_all_4d_nvshmem(x, mode=mode, tag=tag)
+    return x
+
+
+def _usp_qkv_all_to_all_nvshmem(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, head_dim: int = 1, mode: int = 0
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ulysses all-to-all using NVSHMEM.
+
+    Args:
+        q: A 4D tensor with layout [b, s, n, d].
+        k: A 4D tensor with layout [b, s, n, d].
+        v: A 4D tensor with layout [b, s, n, d].
+        head_dim: Which dimension index corresponds to heads.
+        mode:
+            - 0: input all-to-all  ([..., h_global, s_local, ...] -> [..., h_local, s_global, ...])
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+
+    assert (
+        q.ndim == k.ndim == v.ndim == 4
+    ), f"q/k/v must have 4 dimensions, got {q.ndim} {k.ndim} {v.ndim}"
+    assert head_dim == 2, f"head_dim must be 2, got {head_dim}"
+    assert mode == 0, f"mode must be 0, got {mode}"
+
+    sp_group = get_sp_group()
+    q, k, v = sp_group.all_to_all_4d_nvshmem_qkv(q, k, v, mode=mode)
+    return q, k, v
 
 
 def ring_attn(
