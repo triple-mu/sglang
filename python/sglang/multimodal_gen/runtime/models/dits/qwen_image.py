@@ -15,6 +15,9 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.jit_kernel.diffusion.triton.rmsnorm_with_rotary import (
+    qk_rmsnorm_with_rotary,
+)
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
@@ -30,7 +33,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -637,25 +639,45 @@ class QwenImageCrossAttention(nn.Module):
             img_cache, txt_cache = image_rotary_emb
 
         if self.qk_norm:
-            img_query, img_key = apply_qk_norm_with_optional_rope(
+            # img_query, img_key = apply_qk_norm_with_optional_rope(
+            #     q=img_query,
+            #     k=img_key,
+            #     q_norm=self.norm_q,
+            #     k_norm=self.norm_k,
+            #     head_dim=img_query.shape[-1],
+            #     cos_sin_cache=img_cache,
+            #     is_neox=False,
+            #     allow_inplace=True,
+            # )
+            # txt_query, txt_key = apply_qk_norm_with_optional_rope(
+            #     q=txt_query,
+            #     k=txt_key,
+            #     q_norm=self.norm_added_q,
+            #     k_norm=self.norm_added_k,
+            #     head_dim=txt_query.shape[-1],
+            #     cos_sin_cache=txt_cache,
+            #     is_neox=False,
+            #     allow_inplace=True,
+            # )
+            qk_rmsnorm_with_rotary(
                 q=img_query,
                 k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
+                qw=self.norm_q.weight,
+                kw=self.norm_k.weight,
                 cos_sin_cache=img_cache,
-                is_neox=False,
-                allow_inplace=True,
+                position_offset=0,
+                eps=self.norm_q.variance_epsilon,
+                interleave=True,
             )
-            txt_query, txt_key = apply_qk_norm_with_optional_rope(
+            qk_rmsnorm_with_rotary(
                 q=txt_query,
                 k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
+                qw=self.norm_added_q.weight,
+                kw=self.norm_added_k.weight,
                 cos_sin_cache=txt_cache,
-                is_neox=False,
-                allow_inplace=True,
+                position_offset=0,
+                eps=self.norm_added_q.variance_epsilon,
+                interleave=True,
             )
         elif img_cache is not None and txt_cache is not None:
             img_query, img_key = apply_flashinfer_rope_qk_inplace(
