@@ -354,6 +354,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
+        self._decode_step_cnt = 0  # 独立计数，用于 SHAPE DECODE 日志
+        self._extend_step_cnt = 0  # 独立计数，用于 SHAPE EXTEND 日志
+
+        # ── 三桶 nsys profiling（batch_size=64 时按 avg_seq_len 触发）──
+        # ── 单桶 nsys profiling，由环境变量 PROF_BUCKET 决定抓哪个桶 ───────
+        # 可选值：short / medium / long，不设则不抓
+        # 抓完 steps 步后调 os._exit(0) 退出，nsys 自然写文件，无需 flush 等待
+        _all_buckets = {
+            "short": {"lo": 20000, "hi": 35000, "steps": 10},
+            "medium": {"lo": 45000, "hi": 50000, "steps": 10},
+            "long": {"lo": 55000, "hi": 60000, "steps": 10},
+        }
+        _target = os.environ.get("PROF_BUCKET", "").strip().lower()
+        if _target in _all_buckets:
+            cfg = _all_buckets[_target]
+            self._prof_buckets = {
+                _target: {
+                    "lo": cfg["lo"],
+                    "hi": cfg["hi"],
+                    "steps": cfg["steps"],
+                    "done": False,
+                    "active": False,
+                    "cnt": 0,
+                },
+            }
+            logging.info(
+                f"[PROF] 目标桶={_target}  avg_seq_len 范围=[{cfg['lo']}, {cfg['hi']})"
+            )
+        else:
+            self._prof_buckets = {}  # 未设置或非法值 → 不采集
+            if _target:
+                logging.warning(
+                    f"[PROF] PROF_BUCKET={_target!r} 不合法，跳过 profiling"
+                )
+
+        # ── SIZE_DIST 统计 ──────────────────────────────────────────────────
+        self._STATS_WARMUP = 50
+        self._STATS_LOG_INTERVAL = 200
+        self._size_stats: dict = {}
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
 
@@ -2903,6 +2942,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        _bs = forward_batch.batch_size
+        _mode = forward_batch.forward_mode
+        _seq_sum = int(forward_batch.seq_lens_sum) if _bs > 0 else 0
+        _avg_seq = _seq_sum // _bs if _bs > 0 else 0
+        torch.cuda.nvtx.range_push(
+            f"forward pass={self.forward_pass_id}"
+            f" mode={_mode}"
+            f" bs={_bs}"
+            f" avg_seq={_avg_seq}"
+            f" sum_seq={_seq_sum}"
+        )
+
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
             if torch.autograd._profiler_enabled()
@@ -2959,6 +3010,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if dumper.may_enable:
             dumper.step()
 
+        torch.cuda.nvtx.range_pop()
         return output
 
     def _forward_raw(
@@ -2985,6 +3037,90 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and forward_batch.forward_mode.is_decode()
         ):
             self.hisparse_coordinator.wait_for_pending_backup()
+
+        # ── decode/extend shape 日志 + 三桶 profiling ────────────────────────
+        if forward_batch.batch_size > 0:
+            if forward_batch.forward_mode.is_decode():
+                self._decode_step_cnt += 1
+                bs = forward_batch.batch_size
+                seq_lens_sum = int(forward_batch.seq_lens_sum)
+                avg_seq_len = seq_lens_sum // bs
+
+                # ── 单桶 nsys profiling（由 PROF_BUCKET 环境变量决定）────────
+                for bname, bcfg in self._prof_buckets.items():
+                    if bcfg["done"]:
+                        continue
+                    if bcfg["active"]:
+                        bcfg["cnt"] += 1
+                        if bcfg["cnt"] >= bcfg["steps"]:
+                            torch.cuda.cudart().cudaProfilerStop()
+                            bcfg["done"] = True
+                            logging.info(
+                                f"[PROF] STOP  bucket={bname}"
+                                f"  decode_step={self._decode_step_cnt}"
+                                f"  captured_steps={bcfg['cnt']}"
+                                f"  → os._exit(0)"
+                            )
+                            # 采集完成，直接退出进程，nsys 收到退出信号后写出文件
+                            os._exit(0)
+                    elif bs == 64 and bcfg["lo"] <= avg_seq_len < bcfg["hi"]:
+                        bcfg["active"] = True
+                        bcfg["cnt"] = 1
+                        torch.cuda.cudart().cudaProfilerStart()
+                        logging.info(
+                            f"[PROF] START bucket={bname}"
+                            f"  decode_step={self._decode_step_cnt}"
+                            f"  avg_seq_len={avg_seq_len}"
+                        )
+
+                if self._decode_step_cnt % 20 == 0:
+                    seq_lens_cpu = forward_batch.seq_lens.cpu().tolist()
+                    logging.info(
+                        f"[SHAPE][DECODE] decode_step={self._decode_step_cnt}"
+                        f"  input_ids.shape=[{bs}]"
+                        f"  batch_size={bs}"
+                        f"  avg_seq_len={avg_seq_len}"
+                        f"  seq_len min={min(seq_lens_cpu)} max={max(seq_lens_cpu)}"
+                    )
+
+                # SIZE_DIST 统计
+                if self.forward_pass_id > self._STATS_WARMUP:
+                    self._size_stats.setdefault("decode", []).append(seq_lens_sum)
+                    if self.forward_pass_id % self._STATS_LOG_INTERVAL == 0:
+                        for mk, vals in self._size_stats.items():
+                            if not vals:
+                                continue
+                            sv = sorted(vals)
+                            n = len(sv)
+                            logging.info(
+                                f"[SIZE_DIST] pass={self.forward_pass_id} mode={mk} n={n} "
+                                f"min={sv[0]} p25={sv[n*25//100]} p50={sv[n*50//100]} "
+                                f"p75={sv[n*75//100]} p90={sv[n*90//100]} "
+                                f"p99={sv[min(n*99//100,n-1)]} max={sv[-1]}"
+                            )
+
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                self._extend_step_cnt += 1
+                if self._extend_step_cnt % 2 == 0:
+                    total_tokens = int(forward_batch.input_ids.shape[0])
+                    bs = forward_batch.batch_size
+                    seq_lens_sum = int(forward_batch.seq_lens_sum)
+                    avg_seq_len = seq_lens_sum // bs
+                    seq_lens_cpu = forward_batch.seq_lens.cpu().tolist()
+                    logging.info(
+                        f"[SHAPE][EXTEND] extend_step={self._extend_step_cnt}"
+                        f"  input_ids.shape=[{total_tokens}]"
+                        f"  batch_size={bs}"
+                        f"  avg_seq_len={avg_seq_len}"
+                        f"  seq_len min={min(seq_lens_cpu)} max={max(seq_lens_cpu)}"
+                    )
+
+                if self.forward_pass_id > self._STATS_WARMUP:
+                    seq_lens_sum = int(forward_batch.seq_lens_sum)
+                    self._size_stats.setdefault("extend_prefill", []).append(
+                        seq_lens_sum
+                    )
+        # ─────────────────────────────────────────────────────────────────────
 
         if can_run_graph:
             ret = self.graph_runner.replay(
