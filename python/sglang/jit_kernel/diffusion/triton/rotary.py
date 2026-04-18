@@ -193,13 +193,45 @@ def ernie_image_rope_qk_inplace(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    assert q.shape == k.shape and cos.shape == sin.shape
-    assert (
-        cos.ndim == 3
-        and sin.ndim == 3
-        and cos.size(0) == q.size(0)
-        and cos.size(1) == q.size(1)
-    )
+    """Apply ErnieImage-style rotary embedding to Q and K tensors **in-place**.
+
+    The rotation convention is ``[-x2, x1]`` (half-split, not interleaved),
+    matching the original ErnieImage ``_apply_rotary_bshd`` implementation.
+
+    Args:
+        q: Query tensor of shape ``(B, S, num_heads, head_dim)``.
+        k: Key tensor of shape ``(B, S, num_heads, head_dim)``.
+        cos: Cosine cache of shape ``(B, S, head_dim)``.
+        sin: Sine cache of shape ``(B, S, head_dim)``.
+
+    Returns:
+        ``(q, k)`` with rotary embedding applied in-place.
+    """
+    if q.ndim != 4:
+        raise ValueError(f"q must be 4-D (B, S, H, D), got ndim={q.ndim}")
+    if k.shape != q.shape:
+        raise ValueError(f"q and k shape mismatch: {q.shape} vs {k.shape}")
+    if cos.shape != sin.shape:
+        raise ValueError(f"cos and sin shape mismatch: {cos.shape} vs {sin.shape}")
+    if cos.ndim != 3:
+        raise ValueError(f"cos/sin must be 3-D (B, S, D), got ndim={cos.ndim}")
+    if cos.size(0) != q.size(0) or cos.size(1) != q.size(1):
+        raise ValueError(
+            f"cos/sin batch/seq dims must match q: "
+            f"cos {cos.shape[:2]} vs q {q.shape[:2]}"
+        )
+    if cos.size(2) != q.size(3):
+        raise ValueError(
+            f"cos/sin last dim must match head_dim: "
+            f"cos {cos.size(2)} vs head_dim {q.size(3)}"
+        )
+    if q.size(3) % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {q.size(3)}")
+    if not q.is_contiguous() or not k.is_contiguous():
+        raise ValueError("q and k must be contiguous")
+    if not cos.is_contiguous() or not sin.is_contiguous():
+        raise ValueError("cos and sin must be contiguous")
+
     bsz, seq_len, num_heads, head_dim = q.shape
     NUM_HEADS = triton.next_power_of_2(num_heads)
     HEAD_DIM = triton.next_power_of_2(head_dim)
@@ -236,12 +268,13 @@ if current_platform.is_mps():
 
 if current_platform.is_npu() or current_platform.is_mps():
 
-    def ernie_image_rope_qk_inplace(
+    def ernie_image_rope_qk_inplace(  # type: ignore[misc]
         q: torch.Tensor,
         k: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pure-PyTorch fallback of :func:`ernie_image_rope_qk_inplace`."""
         q1, q2 = q.chunk(2, dim=-1)
         k1, k2 = k.chunk(2, dim=-1)
         cos = cos[:, :, None, :]
