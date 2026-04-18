@@ -255,7 +255,7 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
             x, attn_out, gate_msa, shift_mlp, scale_mlp
         )
         x = fuse_scale_shift_kernel(
-            self.mlp(normed_mlp),
+            self.mlp(normed_mlp.to(dtype=x.dtype)),
             gate_mlp,
             residual,
             scale_constant=0.0,
