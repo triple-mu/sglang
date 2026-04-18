@@ -125,6 +125,105 @@ def apply_rotary_embedding(
     return output
 
 
+@triton.jit
+def _ernie_image_rope_qk_inplace(
+    q_ptr,
+    k_ptr,
+    cos_ptr,
+    sin_ptr,
+    qk_stride_b,
+    qk_stride_s,
+    qk_stride_n,
+    cos_sin_stride_b,
+    cos_sin_stride_s,
+    num_heads,
+    head_dim,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    s_id = tl.program_id(0)
+    b_id = tl.program_id(1)
+
+    d_offset = tl.arange(0, HEAD_DIM)[None, :]
+    d_mask = d_offset < head_dim
+    n_offset = tl.arange(0, NUM_HEADS)[:, None]
+    n_mask = n_offset < num_heads
+    nd_mask = d_mask & n_mask
+
+    q_ptr += b_id * qk_stride_b + s_id * qk_stride_s
+    k_ptr += b_id * qk_stride_b + s_id * qk_stride_s
+    sin_ptr += b_id * cos_sin_stride_b + s_id * cos_sin_stride_s
+    cos_ptr += b_id * cos_sin_stride_b + s_id * cos_sin_stride_s
+
+    cos = tl.load(cos_ptr + d_offset, mask=d_mask, other=0.0).to(tl.float32)
+    sin = tl.load(sin_ptr + d_offset, mask=d_mask, other=0.0).to(tl.float32)
+
+    q_block_ptr = q_ptr + n_offset * qk_stride_n + d_offset
+    k_block_ptr = k_ptr + n_offset * qk_stride_n + d_offset
+
+    q = tl.load(q_block_ptr, mask=nd_mask, other=0.0).to(tl.float32)
+    k = tl.load(k_block_ptr, mask=nd_mask, other=0.0).to(tl.float32)
+
+    q1, q2 = tl.split(tl.trans(tl.reshape(q, [NUM_HEADS, 2, HEAD_DIM // 2]), [0, 2, 1]))
+    k1, k2 = tl.split(tl.trans(tl.reshape(k, [NUM_HEADS, 2, HEAD_DIM // 2]), [0, 2, 1]))
+
+    q_rot = tl.reshape(
+        tl.trans(
+            tl.reshape(tl.interleave(-q2, q1), [NUM_HEADS, HEAD_DIM // 2, 2]), [0, 2, 1]
+        ),
+        [NUM_HEADS, HEAD_DIM],
+    )
+    k_rot = tl.reshape(
+        tl.trans(
+            tl.reshape(tl.interleave(-k2, k1), [NUM_HEADS, HEAD_DIM // 2, 2]), [0, 2, 1]
+        ),
+        [NUM_HEADS, HEAD_DIM],
+    )
+
+    qo = tl.fma(q_rot, sin, q * cos)
+    ko = tl.fma(k_rot, sin, k * cos)
+
+    tl.store(q_block_ptr, qo, mask=nd_mask)
+    tl.store(k_block_ptr, ko, mask=nd_mask)
+
+
+def ernie_image_rope_qk_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert q.shape == k.shape and cos.shape == sin.shape
+    assert (
+        cos.ndim == 3
+        and sin.ndim == 3
+        and cos.size(0) == q.size(0)
+        and cos.size(1) == q.size(1)
+    )
+    bsz, seq_len, num_heads, head_dim = q.shape
+    NUM_HEADS = triton.next_power_of_2(num_heads)
+    HEAD_DIM = triton.next_power_of_2(head_dim)
+    grid = (seq_len, bsz)
+    with torch.cuda.device(q.device):
+        _ernie_image_rope_qk_inplace[grid](
+            q,
+            k,
+            cos,
+            sin,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            cos.stride(0),
+            cos.stride(1),
+            num_heads,
+            head_dim,
+            NUM_HEADS=NUM_HEADS,
+            HEAD_DIM=HEAD_DIM,
+            num_warps=8,
+        )
+    return q, k
+
+
 if current_platform.is_npu():
     from .npu_fallback import apply_rotary_embedding_native
 
@@ -134,3 +233,25 @@ if current_platform.is_mps():
     from .mps_fallback import apply_rotary_embedding_native
 
     apply_rotary_embedding = apply_rotary_embedding_native
+
+if current_platform.is_npu() or current_platform.is_mps():
+
+    def ernie_image_rope_qk_inplace(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q1, q2 = q.chunk(2, dim=-1)
+        k1, k2 = k.chunk(2, dim=-1)
+        cos = cos[:, :, None, :]
+        sin = sin[:, :, None, :]
+        q_rot = torch.cat([-q2, q1], dim=-1)
+        k_rot = torch.cat([-k2, k1], dim=-1)
+
+        qo = q * cos + q_rot * sin
+        ko = k * cos + k_rot * sin
+        q.copy_(qo)
+        k.copy_(ko)
+
+        return q, k

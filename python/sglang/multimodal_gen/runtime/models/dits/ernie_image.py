@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
+from sglang.jit_kernel.diffusion.triton.rotary import ernie_image_rope_qk_inplace
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,
 )
@@ -54,13 +55,14 @@ class EmbedND3(nn.Module):
         self.theta = theta
         self.axes_dim = list(axes_dim)
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         emb = torch.cat(
             [_rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(3)],
             dim=-1,
         )
-        emb = emb.unsqueeze(1).permute(2, 0, 1, 3)
-        return torch.stack([emb, emb], dim=-1).reshape(*emb.shape[:-1], -1)
+        emb = torch.repeat_interleave(emb, 2, -1)
+        emb = emb.float()
+        return emb.cos(), emb.sin()
 
 
 class ErnieImageSelfAttention(nn.Module):
@@ -141,7 +143,7 @@ class ErnieImageSelfAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
+        rotary_pos_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         B, S, H = x.shape
 
@@ -162,8 +164,7 @@ class ErnieImageSelfAttention(nn.Module):
                 self.head_dim,
             )
 
-        q = _apply_rotary_bshd(q, rotary_pos_emb)
-        k = _apply_rotary_bshd(k, rotary_pos_emb)
+        q, k = ernie_image_rope_qk_inplace(q, k, *rotary_pos_emb)
 
         attn_out = self.attn(q, k, v)
         attn_out = attn_out.reshape(B, S, self.num_local_heads * self.head_dim)
@@ -232,7 +233,7 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
+        rotary_pos_emb: tuple[torch.Tensor, torch.Tensor],
         shift_msa: torch.Tensor,
         scale_msa: torch.Tensor,
         gate_msa: torch.Tensor,
@@ -249,21 +250,6 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         x = residual + gate_mlp * self.mlp(x)
 
         return x
-
-
-def _apply_rotary_bshd(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    freqs = freqs.permute(1, 0, 2, 3)
-    rot_dim = freqs.shape[-1]
-    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-
-    cos_ = torch.cos(freqs).to(x.dtype)
-    sin_ = torch.sin(freqs).to(x.dtype)
-
-    x1, x2 = x_rot.chunk(2, dim=-1)
-    x_rotated = torch.cat((-x2, x1), dim=-1)
-
-    x_rot = x_rot * cos_ + x_rotated * sin_
-    return torch.cat((x_rot, x_pass), dim=-1)
 
 
 class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
