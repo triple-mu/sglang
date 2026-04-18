@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -49,7 +49,7 @@ def _rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
 class EmbedND3(nn.Module):
     """3D rotary positional embedding for (temporal/batch_idx, height, width)."""
 
-    def __init__(self, dim: int, theta: int, axes_dim: Tuple[int, int, int]):
+    def __init__(self, dim: int, theta: int, axes_dim: tuple[int, int, int]):
         super().__init__()
         self.dim = dim
         self.theta = theta
