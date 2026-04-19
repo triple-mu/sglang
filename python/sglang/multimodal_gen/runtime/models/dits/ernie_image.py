@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
 from sglang.jit_kernel.diffusion.triton.rotary import ernie_image_rope_qk_inplace
@@ -27,6 +26,7 @@ from sglang.multimodal_gen.configs.models.dits.ernie_image import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
@@ -202,11 +202,11 @@ class ErnieImageMLP(nn.Module):
             input_is_parallel=True,
             prefix=f"{prefix}.linear_fc2",
         )
+        self.act_fn = GeluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = up * F.gelu(gate)
+        x = self.act_fn(gate_up)
         x, _ = self.linear_fc2(x)
         return x
 
