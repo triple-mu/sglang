@@ -139,52 +139,55 @@ def _ernie_image_rope_qk_inplace(
     num_heads,
     head_dim,
     NUM_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
+    HALF_DIM: tl.constexpr,
 ):
     s_id = tl.program_id(0)
     b_id = tl.program_id(1)
 
-    d_offset = tl.arange(0, HEAD_DIM)[None, :]
-    d_mask = d_offset < head_dim
+    half_dim = head_dim // 2
+    h_offset = tl.arange(0, HALF_DIM)[None, :]
+    h_mask = h_offset < half_dim
     n_offset = tl.arange(0, NUM_HEADS)[:, None]
     n_mask = n_offset < num_heads
-    nd_mask = d_mask & n_mask
+    nh_mask = n_mask & h_mask
 
     q_ptr += b_id * qk_stride_b + s_id * qk_stride_s
     k_ptr += b_id * qk_stride_b + s_id * qk_stride_s
-    sin_ptr += b_id * cos_sin_stride_b + s_id * cos_sin_stride_s
     cos_ptr += b_id * cos_sin_stride_b + s_id * cos_sin_stride_s
+    sin_ptr += b_id * cos_sin_stride_b + s_id * cos_sin_stride_s
 
-    cos = tl.load(cos_ptr + d_offset, mask=d_mask, other=0.0).to(tl.float32)
-    sin = tl.load(sin_ptr + d_offset, mask=d_mask, other=0.0).to(tl.float32)
-
-    q_block_ptr = q_ptr + n_offset * qk_stride_n + d_offset
-    k_block_ptr = k_ptr + n_offset * qk_stride_n + d_offset
-
-    q = tl.load(q_block_ptr, mask=nd_mask, other=0.0).to(tl.float32)
-    k = tl.load(k_block_ptr, mask=nd_mask, other=0.0).to(tl.float32)
-
-    q1, q2 = tl.split(tl.trans(tl.reshape(q, [NUM_HEADS, 2, HEAD_DIM // 2]), [0, 2, 1]))
-    k1, k2 = tl.split(tl.trans(tl.reshape(k, [NUM_HEADS, 2, HEAD_DIM // 2]), [0, 2, 1]))
-
-    q_rot = tl.reshape(
-        tl.trans(
-            tl.reshape(tl.interleave(-q2, q1), [NUM_HEADS, HEAD_DIM // 2, 2]), [0, 2, 1]
-        ),
-        [NUM_HEADS, HEAD_DIM],
+    # cos/sin are half-size (head_dim // 2).  The full-size pattern is
+    # repeat_interleave(val, 2): [v0, v0, v1, v1, ...].  For the first
+    # half of q (index j in 0..H-1) the lookup is cos_half[j // 2]; for
+    # the second half (index H+j) it is cos_half[H//2 + j // 2].
+    cos1 = tl.load(cos_ptr + h_offset // 2, mask=h_mask, other=0.0).to(tl.float32)
+    sin1 = tl.load(sin_ptr + h_offset // 2, mask=h_mask, other=0.0).to(tl.float32)
+    cos2 = tl.load(cos_ptr + half_dim // 2 + h_offset // 2, mask=h_mask, other=0.0).to(
+        tl.float32
     )
-    k_rot = tl.reshape(
-        tl.trans(
-            tl.reshape(tl.interleave(-k2, k1), [NUM_HEADS, HEAD_DIM // 2, 2]), [0, 2, 1]
-        ),
-        [NUM_HEADS, HEAD_DIM],
+    sin2 = tl.load(sin_ptr + half_dim // 2 + h_offset // 2, mask=h_mask, other=0.0).to(
+        tl.float32
     )
 
-    qo = tl.fma(q_rot, sin, q * cos)
-    ko = tl.fma(k_rot, sin, k * cos)
+    q_base = q_ptr + n_offset * qk_stride_n
+    k_base = k_ptr + n_offset * qk_stride_n
 
-    tl.store(q_block_ptr, qo, mask=nd_mask)
-    tl.store(k_block_ptr, ko, mask=nd_mask)
+    q1 = tl.load(q_base + h_offset, mask=nh_mask, other=0.0).to(tl.float32)
+    q2 = tl.load(q_base + half_dim + h_offset, mask=nh_mask, other=0.0).to(tl.float32)
+    k1 = tl.load(k_base + h_offset, mask=nh_mask, other=0.0).to(tl.float32)
+    k2 = tl.load(k_base + half_dim + h_offset, mask=nh_mask, other=0.0).to(tl.float32)
+
+    # First half:  out[j]   = q1[j]*cos1[j] - q2[j]*sin1[j]
+    # Second half: out[H+j] = q2[j]*cos2[j] + q1[j]*sin2[j]
+    qo1 = tl.fma(-q2, sin1, q1 * cos1)
+    qo2 = tl.fma(q1, sin2, q2 * cos2)
+    ko1 = tl.fma(-k2, sin1, k1 * cos1)
+    ko2 = tl.fma(k1, sin2, k2 * cos2)
+
+    tl.store(q_base + h_offset, qo1, mask=nh_mask)
+    tl.store(q_base + half_dim + h_offset, qo2, mask=nh_mask)
+    tl.store(k_base + h_offset, ko1, mask=nh_mask)
+    tl.store(k_base + half_dim + h_offset, ko2, mask=nh_mask)
 
 
 def ernie_image_rope_qk_inplace(
@@ -201,8 +204,9 @@ def ernie_image_rope_qk_inplace(
     Args:
         q: Query tensor of shape ``(B, S, num_heads, head_dim)``.
         k: Key tensor of shape ``(B, S, num_heads, head_dim)``.
-        cos: Cosine cache of shape ``(B, S, head_dim)``.
-        sin: Sine cache of shape ``(B, S, head_dim)``.
+        cos: Cosine cache of shape ``(B, S, head_dim // 2)`` — half-size,
+            without the ``repeat_interleave`` expansion.
+        sin: Sine cache of shape ``(B, S, head_dim // 2)``.
 
     Returns:
         ``(q, k)`` with rotary embedding applied in-place.
@@ -220,13 +224,13 @@ def ernie_image_rope_qk_inplace(
             f"cos/sin batch/seq dims must match q: "
             f"cos {cos.shape[:2]} vs q {q.shape[:2]}"
         )
-    if cos.size(2) != q.size(3):
-        raise ValueError(
-            f"cos/sin last dim must match head_dim: "
-            f"cos {cos.size(2)} vs head_dim {q.size(3)}"
-        )
     if q.size(3) % 2 != 0:
         raise ValueError(f"head_dim must be even, got {q.size(3)}")
+    if cos.size(2) != q.size(3) // 2:
+        raise ValueError(
+            f"cos/sin last dim must be head_dim // 2: "
+            f"cos {cos.size(2)} vs head_dim // 2 = {q.size(3) // 2}"
+        )
     if not q.is_contiguous() or not k.is_contiguous():
         raise ValueError("q and k must be contiguous")
     if not cos.is_contiguous() or not sin.is_contiguous():
@@ -234,7 +238,7 @@ def ernie_image_rope_qk_inplace(
 
     bsz, seq_len, num_heads, head_dim = q.shape
     NUM_HEADS = triton.next_power_of_2(num_heads)
-    HEAD_DIM = triton.next_power_of_2(head_dim)
+    HALF_DIM = triton.next_power_of_2(head_dim // 2)
     grid = (seq_len, bsz)
     with torch.cuda.device(q.device):
         _ernie_image_rope_qk_inplace[grid](
@@ -250,7 +254,7 @@ def ernie_image_rope_qk_inplace(
             num_heads,
             head_dim,
             NUM_HEADS=NUM_HEADS,
-            HEAD_DIM=HEAD_DIM,
+            HALF_DIM=HALF_DIM,
             num_warps=8,
         )
     return q, k
@@ -275,10 +279,12 @@ if current_platform.is_npu() or current_platform.is_mps():
         sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pure-PyTorch fallback of :func:`ernie_image_rope_qk_inplace`."""
+        # Expand half-size cos/sin to full size
+        cos = cos.repeat_interleave(2, dim=-1)[:, :, None, :]
+        sin = sin.repeat_interleave(2, dim=-1)[:, :, None, :]
+
         q1, q2 = q.chunk(2, dim=-1)
         k1, k2 = k.chunk(2, dim=-1)
-        cos = cos[:, :, None, :]
-        sin = sin[:, :, None, :]
         q_rot = torch.cat([-q2, q1], dim=-1)
         k_rot = torch.cat([-k2, k1], dim=-1)
 

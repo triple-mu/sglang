@@ -1119,6 +1119,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         ):
             with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
+                    if (
+                        not ctx.is_warmup
+                        and step_index == 5
+                        and torch.cuda.current_device() == 0
+                    ):
+                        torch.cuda.cudart().cudaProfilerStart()
+                    if (
+                        not ctx.is_warmup
+                        and step_index == 6
+                        and torch.cuda.current_device() == 0
+                    ):
+                        torch.cuda.cudart().cudaProfilerStop()
                     with StageProfiler(
                         f"denoising_step_{step_index}",
                         logger=logger,

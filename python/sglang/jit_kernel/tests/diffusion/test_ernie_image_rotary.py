@@ -21,14 +21,19 @@ RTOL = 1e-2
 def ernie_image_rope_qk_reference(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    cos_half: torch.Tensor,
+    sin_half: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pure-PyTorch reference for ernie_image_rope_qk_inplace."""
+    """Pure-PyTorch reference for ernie_image_rope_qk_inplace.
+
+    Accepts half-size cos/sin of shape (B, S, head_dim // 2) and expands
+    via repeat_interleave to match the full head_dim before applying
+    the [-x2, x1] half-split rotation.
+    """
     q_fp32 = q.float()
     k_fp32 = k.float()
-    cos_fp32 = cos[:, :, None, :].float()
-    sin_fp32 = sin[:, :, None, :].float()
+    cos_fp32 = cos_half.repeat_interleave(2, dim=-1)[:, :, None, :].float()
+    sin_fp32 = sin_half.repeat_interleave(2, dim=-1)[:, :, None, :].float()
 
     q1, q2 = q_fp32.chunk(2, dim=-1)
     k1, k2 = k_fp32.chunk(2, dim=-1)
@@ -71,8 +76,8 @@ def test_ernie_image_rope_qk_inplace(
     k = torch.randn(
         batch_size, seq_len, num_heads, head_dim, device=DEVICE, dtype=DTYPE
     )
-    cos = torch.randn(batch_size, seq_len, head_dim, device=DEVICE, dtype=DTYPE)
-    sin = torch.randn(batch_size, seq_len, head_dim, device=DEVICE, dtype=DTYPE)
+    cos = torch.randn(batch_size, seq_len, head_dim // 2, device=DEVICE, dtype=DTYPE)
+    sin = torch.randn(batch_size, seq_len, head_dim // 2, device=DEVICE, dtype=DTYPE)
 
     q_ref, k_ref = ernie_image_rope_qk_reference(q, k, cos, sin)
 

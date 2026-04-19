@@ -67,7 +67,6 @@ class EmbedND3(nn.Module):
             [_rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(3)],
             dim=-1,
         )
-        emb = torch.repeat_interleave(emb, 2, -1)
         emb = emb.float()
         return emb.cos(), emb.sin()
 
