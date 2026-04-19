@@ -12,4 +12,4 @@ class ErnieImageSamplingParams(SamplingParams):
     num_frames: int = 1
     guidance_scale: float = 5.0
     num_inference_steps: int = 50
-    use_pe: bool = True
+    use_pe: bool = False
