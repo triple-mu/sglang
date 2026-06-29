@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
+    SGLANG_DIFFUSION_USE_CUSTOM_ULYSSES_A2A: bool = False
+    SGLANG_DIFFUSION_CUSTOM_ULYSSES_TMA: bool = True
+    SGLANG_DIFFUSION_CUSTOM_ULYSSES_POOL_BYTES: int = 2 << 30
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -265,6 +268,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    ),
+    # Custom NVSHMEM Ulysses all-to-all op (custom_ulysses_op) for the
+    # USPAttention sequence-parallel path. Opt-in A/B kill-switch; falls back
+    # to torch all_to_all when off or when the op is unavailable.
+    "SGLANG_DIFFUSION_USE_CUSTOM_ULYSSES_A2A": _lazy_bool(
+        "SGLANG_DIFFUSION_USE_CUSTOM_ULYSSES_A2A"
+    ),
+    # Force the TMA kernel path of the custom Ulysses op (requires sm90+).
+    "SGLANG_DIFFUSION_CUSTOM_ULYSSES_TMA": _lazy_bool(
+        "SGLANG_DIFFUSION_CUSTOM_ULYSSES_TMA", "true"
+    ),
+    # NVSHMEM symmetric heap reservation (bytes) for the custom Ulysses op.
+    "SGLANG_DIFFUSION_CUSTOM_ULYSSES_POOL_BYTES": _lazy_int(
+        "SGLANG_DIFFUSION_CUSTOM_ULYSSES_POOL_BYTES", 2 << 30
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference

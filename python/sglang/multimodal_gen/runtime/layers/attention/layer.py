@@ -795,9 +795,9 @@ class USPAttention(nn.Module):
                 k = k.contiguous()
                 v = v.contiguous()
             else:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+                q = _usp_input_all_to_all(q, head_dim=2, a2a_tag="uin_q")
+                k = _usp_input_all_to_all(k, head_dim=2, a2a_tag="uin_k")
+                v = _usp_input_all_to_all(v, head_dim=2, a2a_tag="uin_v")
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -816,7 +816,7 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All to restore original sharding
         if sp_size > 1:
             # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            out = _usp_output_all_to_all(out, head_dim=2, a2a_tag="uout")
 
         return out
 

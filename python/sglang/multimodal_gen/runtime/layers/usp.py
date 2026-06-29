@@ -13,6 +13,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.custom_ulysses_a2a import (
+    custom_ulysses_a2a,
+    is_custom_ulysses_a2a_enabled,
+)
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -66,7 +70,9 @@ def _usp_all_to_all_single_varlen(
     return output
 
 
-def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_input_all_to_all(
+    x: torch.Tensor, head_dim: int = 1, *, a2a_tag: str | None = None
+) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.
 
@@ -90,6 +96,16 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    # Custom NVSHMEM Ulysses all-to-all fast path (mode 0). Native 4D, skips the
+    # permute/contiguous/reshape host overhead of the torch path. Only head_dim==2
+    # (b, s_local, h_global, d) matches the op's (b, s, n, d) layout.
+    if a2a_tag is not None and head_dim == 2 and is_custom_ulysses_a2a_enabled():
+        b, s_local, h_global, d = x.shape
+        assert (
+            h_global % world_size == 0
+        ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+        return custom_ulysses_a2a(x, mode=0, tag=a2a_tag)
 
     # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
     if head_dim == 1:
@@ -199,7 +215,9 @@ def _usp_input_all_to_all_varlen(
     return x
 
 
-def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_output_all_to_all(
+    x: torch.Tensor, head_dim: int = 1, *, a2a_tag: str | None = None
+) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
 
@@ -223,6 +241,14 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    # Custom NVSHMEM Ulysses all-to-all fast path (mode 1, inverse of input).
+    if a2a_tag is not None and head_dim == 2 and is_custom_ulysses_a2a_enabled():
+        b, s_global, h_local, d = x.shape
+        assert (
+            s_global % world_size == 0
+        ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+        return custom_ulysses_a2a(x, mode=1, tag=a2a_tag)
 
     # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
     if head_dim == 1:
