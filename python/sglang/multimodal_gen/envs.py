@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES: bool = False
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
@@ -257,6 +259,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "SGLANG_DIFFUSION_SERVER_DEV_MODE": _lazy_bool("SGLANG_DIFFUSION_SERVER_DEV_MODE"),
+    # Experimental: route uniform Ulysses SP all-to-all through the
+    # fast_ulysses (NVSHMEM + NVLink P2P) library when importable.
+    "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES"
+    ),
+    # Experimental: additionally fuse Wan-style cross-head QK RMSNorm + RoPE
+    # into the fast_ulysses input all-to-all (requires the flag above).
+    "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION"
+    ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
