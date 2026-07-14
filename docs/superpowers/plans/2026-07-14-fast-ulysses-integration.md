@@ -2,13 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把 fast-ulysses（NVSHMEM+NVLink P2P 的 Ulysses a2a 与 QK norm/RoPE 融合算子）以实验开关接入 sglang diffusion 的 USPAttention 路径，并在远程 4×B200 上实测 Wan2.1-I2V-14B-720P（720p/81帧/50步）的 denoise latency 提升。
+**Goal:** 把 fast-ulysses（NVSHMEM+NVLink P2P 的 Ulysses a2a 与 QK norm/RoPE 融合算子）以实验开关接入 sglang diffusion 的 USPAttention 路径，并在远程 4×B200 上实测 Wan2.1-T2V-14B（720p/81帧/50步）的 denoise latency 提升。
 
 **Architecture:** 两阶段。阶段 1 在 `usp.py` 收口点把等长 Ulysses a2a 换成 `UlyssesGroup.all_to_all_single_4d`（逐位等价、省全部 permute）；阶段 2 在 Wan block 把 QK RMSNorm+RoPE+q/k 进注意力 a2a 融成一次 `all_to_all_single_4d_qk2`。新 wrapper 模块 `fast_ulysses_backend.py` 集中所有启用判定与 fallback，两个 env 开关分别控制两阶段。
 
 **Tech Stack:** PyTorch 2.13 (NGC 26.06) / CUDA 13.3 / NVSHMEM 3.7.1 / fast_ulysses 0.0.1（已装于远程容器）/ sglang multimodal_gen 运行时。
 
 **Spec:** `docs/superpowers/specs/2026-07-14-fast-ulysses-integration-design.md`
+
+**变更记录（2026-07-14，用户指示）：** 目标模型由 Wan-AI/Wan2.1-I2V-14B-720P-Diffusers 改为
+**Wan-AI/Wan2.1-T2V-14B-Diffusers**（T2V 任务，无图像条件：基准命令去掉 `--image-path`，
+cat.png 步骤作废，其余口径不变——T2V 14B 默认即 720p/81帧，序列长度与集成设计不受影响）。
+所有性能测试必须先确认 GPU 0-3 空闲（util 0%、无残留进程）；Task 1 的 op 级数字在空闲机上复测。
 
 ## Global Constraints
 
@@ -96,12 +101,12 @@ git commit -m "bench: fast-ulysses op-level numbers on 4xB200"
 
 ```bash
 ssh ion-b200 "docker exec -e HF_HOME=/data/hf-cache sglang-diffusion-triplemu bash -c \
-  'mkdir -p /data/bench/results && nohup python -c \"from huggingface_hub import snapshot_download; snapshot_download(\\\"Wan-AI/Wan2.1-I2V-14B-720P-Diffusers\\\")\" > /data/bench/download.log 2>&1 & echo started'"
+  'mkdir -p /data/bench/results && nohup python -c \"from huggingface_hub import snapshot_download; snapshot_download(\\\"Wan-AI/Wan2.1-T2V-14B-Diffusers\\\")\" > /data/bench/download.log 2>&1 & echo started'"
 ```
 
 轮询 `tail -2 /data/bench/download.log` 直到完成再进 Step 3（期间可先做 Task 3 的本地代码）。
 
-- [ ] **Step 2: 准备参考图**
+- [ ] **Step 2: 准备参考图（作废——T2V 无图像条件，跳过）**
 
 ```bash
 ssh ion-b200 "docker exec sglang-diffusion-triplemu bash -c \
@@ -125,9 +130,8 @@ ssh ion-b200 "docker exec -e HF_HOME=/data/hf-cache -e CUDA_VISIBLE_DEVICES=0,1,
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 <EXTRA_ENV> sglang-diffusion-triplemu bash -c \
   'cd /data/sglang && sglang generate \
     --backend=sglang \
-    --model-path=Wan-AI/Wan2.1-I2V-14B-720P-Diffusers \
-    --prompt=\"The cat starts walking slowly towards the camera.\" \
-    --image-path=/data/bench/cat.png \
+    --model-path=Wan-AI/Wan2.1-T2V-14B-Diffusers \
+    --prompt=\"A cat walks slowly towards the camera.\" \
     --width=1280 --height=720 --num-frames=81 --num-inference-steps=50 --seed=42 \
     --num-gpus=4 --ulysses-degree=4 --ring-degree=1 --cfg-parallel-size=1 \
     --text-encoder-cpu-offload --pin-cpu-memory \
