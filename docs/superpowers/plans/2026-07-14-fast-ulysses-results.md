@@ -88,3 +88,30 @@ docker exec -e HF_HOME=/data/hf-cache -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e FLASHIN
 ### nccl_compile
 
 run1 由 Task 2 agent 启动后 agent 被停止，远程进程继续运行中；JSON 产出后补录。run2/3 暂缓（用户占用机器做手测；eager 为主口径）。
+
+## 附录 A：模型加载慢定位（2026-07-14）
+
+现象：基准 run 模型加载 ~13 分钟（4 worker 满核 CPU 自旋、零磁盘 IO）。GPU 0-3 与 4-7 行为一致（run1 加载 12:47 / anchor 13:19）——非卡组问题。
+
+根因：`_adjust_offload()` else 分支（`runtime/server_args/server_args.py:646-653`）对视频生成模型**无条件** `dit_cpu_offload=True` + `text_encoder_cpu_offload=True`（不检查显存）。叠加 `pin_cpu_memory=True`（默认），4 个 worker 各自把 28GB DiT + 11GB T5 逐 tensor 锁页拷入 pinned CPU 内存（Run:ai streamer to cpu + 逐 tensor clone，~52MB/s/worker）。
+
+验证（Run B，全 offload 显式关，GPU 4-7）：
+
+| 组件 | offload auto（基准口径） | offload 全关 | 改善 |
+|---|---|---|---|
+| transformer (28GB) | 9:51 | 4:46 | 2.1x |
+| text_encoder (T5) | 3:22 | 0:13 | 15x |
+| 总加载 | 13:19 | **5:01** | 2.65x |
+
+- denoise 口径不受影响（anchor 134.7s ≈ baseline 133.6s）。基准继续用原 flag 保持可比；生产建议：B200 上显式 `--dit-cpu-offload false --text-encoder-cpu-offload false`。
+- 剩余瓶颈（transformer 4:46，~100MB/s/worker，疑 `pin_cpu_memory` 中转）未完成定位（Run C 被环境事故打断，见附录 B）。
+- 上游建议：auto offload 应按「模型尺寸 vs 显存」决策，而非无条件开启。
+
+## 附录 B：环境事故记录（cutlass-dsl 4.6.0 vs flash-attn-4）
+
+- 13:16 容器内安装 `quack_kernels 0.6.1` 时连带把 `nvidia-cutlass-dsl` 升至 4.6.0（用户手测操作）。
+- `flash-attn-4 4.0.0b15` 声明 `nvidia-cutlass-dsl>=4.4.2` 但实际与 4.6.0 API 不兼容（`cutlass.cute.core.ThrMma` 已移除）→ `from flash_attn.cute import ...` AttributeError。
+- sglang 在 Blackwell 上无条件 `set_fa_ver(4)`（`platforms/cuda.py:447`，不探测 FA4 可用性）→ FA backend 的 forward 必炸。**13:16 后所有 sglang run 均无法 denoise**（与本项目改动无关）。
+- 时间线证据：anchor（12:52 完成）成功；probe B（13:21）在 denoise 首步炸。
+- 处理：用户自行修复环境；修复后 fast 组基准继续。
+- 上游建议：`_prepare_flash_attention_for_blackwell` 应探测 FA4 import 可用性再 set_fa_ver(4)，失败时降级并 warn。
