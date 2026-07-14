@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers import fast_ulysses_backend
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -66,7 +67,9 @@ def _usp_all_to_all_single_varlen(
     return output
 
 
-def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_input_all_to_all(
+    x: torch.Tensor, head_dim: int = 1, comm_tag: str = ""
+) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.
 
@@ -90,6 +93,13 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    if head_dim == 2 and comm_tag:
+        # Experimental NVSHMEM fast path; consumes [b, s, h, d] directly, so
+        # the permute/contiguous round-trips below are skipped entirely.
+        fast_out = fast_ulysses_backend.maybe_all_to_all_4d(x, mode=0, tag=comm_tag)
+        if fast_out is not None:
+            return fast_out
 
     # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
     if head_dim == 1:
@@ -199,7 +209,9 @@ def _usp_input_all_to_all_varlen(
     return x
 
 
-def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_output_all_to_all(
+    x: torch.Tensor, head_dim: int = 1, comm_tag: str = ""
+) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
 
@@ -223,6 +235,13 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    if head_dim == 2 and comm_tag:
+        # Experimental NVSHMEM fast path; consumes [b, s, h, d] directly, so
+        # the permute/contiguous round-trips below are skipped entirely.
+        fast_out = fast_ulysses_backend.maybe_all_to_all_4d(x, mode=1, tag=comm_tag)
+        if fast_out is not None:
+            return fast_out
 
     # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
     if head_dim == 1:
