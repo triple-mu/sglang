@@ -77,9 +77,9 @@ Ulysses all-to-all 自定义算子库，提供：
 
 ### 3.1 总体结构（两阶段，两个 env 开关）
 
-- **阶段 1 — a2a 替换**：`SGLANG_DIFFUSION_FAST_ULYSSES=1` 时，USPAttention 等长主路径的 4 次
+- **阶段 1 — a2a 替换**：`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1` 时，USPAttention 等长主路径的 4 次
   a2a 改走 `UlyssesGroup.all_to_all_single_4d`（含省 permute）。搬运语义逐位等价，可强验证。
-- **阶段 2 — QK 融合**：`SGLANG_DIFFUSION_FAST_ULYSSES_QK_FUSION=1`（依赖前者）时，Wan block 的
+- **阶段 2 — QK 融合**：`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION=1`（依赖前者）时，Wan block 的
   norm_q/norm_k + RoPE + q/k 进注意力 a2a 融成一次 `all_to_all_single_4d_qk2`。数值上更准
   （全程 fp32 中间），与 baseline 非逐位一致，用容差/轨迹相似度验证。
 

@@ -1,6 +1,6 @@
 # fast-ulysses 集成实测记录
 
-环境：ion-b200，容器 `sglang-diffusion-triplemu`，8×B200（全 NVLink），本次使用 GPU 0-3（`CUDA_VISIBLE_DEVICES=0,1,2,3`，ws=4）。NVSHMEM v3.6.5。库源码 `/data/fast-ulysses`（只读），fast_ulysses wheel 已 pip 安装。
+环境：ion-b200，容器 `sglang-diffusion-triplemu`，8×B200（全 NVLink），本次使用 GPU 0-3（`CUDA_VISIBLE_DEVICES=0,1,2,3`，ws=4）。NVSHMEM 运行时报告 v3.6.5（wheel 构建时链接的版本；/data 下另有 3.7.1 archive，二者差异未深究，正确性/性能以本次实测为准）。库源码 `/data/fast-ulysses`（只读），fast_ulysses wheel 已 pip 安装。
 
 ## Op-level (4×B200)
 
@@ -30,6 +30,8 @@ N=  75600 | ours(auto) med=   234.0us    620 GB/s | NCCL med=   548.0us    265 G
 ```
 
 ### qk 融合基准（`bench_qk_fused.py`，ws=4, dtype=bf16, n_global=40, d=128，单位 ms/iter）
+
+注意：seq_global 20480/46080 是脚本默认 shape（heads/d 与 Wan 一致，但**非** Wan 720p 的 75600）；加速比作量级参考，e2e 收益以后续任务实测为准。
 
 | seq_global | a2a | unfused | fused | fused/unfused | nr_unfused | nr_fused | qk2 | qk2/2fused |
 |---|---|---|---|---|---|---|---|---|
