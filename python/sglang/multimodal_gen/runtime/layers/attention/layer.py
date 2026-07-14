@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers import fast_ulysses_backend
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
@@ -619,6 +620,7 @@ class USPAttention(nn.Module):
         num_replicated_kv_prefix: int = 0,
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
+        qk_fused_ctx: "fast_ulysses_backend.QKFusedCtx | None" = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -653,6 +655,14 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        if qk_fused_ctx is not None:
+            assert (
+                attn_mask is None
+                and num_replicated_prefix == 0
+                and num_replicated_suffix == 0
+                and num_replicated_kv_prefix == 0
+                and not effective_skip_sp
+            ), "qk_fused_ctx is only supported on the uniform Ulysses path"
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
@@ -955,7 +965,12 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
+            if qk_fused_ctx is not None:
+                # Fused cross-head RMSNorm + RoPE + input a2a for q/k (the
+                # caller skipped its own norm/rope); v has no norm/rope.
+                q, k = fast_ulysses_backend.qk2_input_a2a(q=q, k=k, ctx=qk_fused_ctx)
+                v = _usp_input_all_to_all(v, head_dim=2, comm_tag="usp_v")
+            elif self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
                 q, k, v = async_a2a_communicate(
                     [q, k, v],
                     sp_size,

@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.layers import fast_ulysses_backend
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
@@ -483,6 +484,48 @@ class WanTransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+        # fp32 copies of the QK norm weights for the fast_ulysses fused path,
+        # built lazily on first use.
+        self._fast_qk_norm_weights_fp32: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _maybe_fast_qk_fused_ctx(
+        self,
+        query: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> "fast_ulysses_backend.QKFusedCtx | None":
+        """Context for the fused cross-head QK RMSNorm + RoPE + input-a2a.
+
+        None keeps the unfused norm/rope path. Every condition is identical
+        across SP ranks, keeping the collective call pattern in lockstep.
+        """
+        if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
+            return None
+        if (
+            not isinstance(self.attn1, USPAttention)
+            or self.attn1.skip_sequence_parallel
+        ):
+            return None
+        if not fast_ulysses_backend.can_use_qk2(
+            num_heads=self.local_num_heads,
+            head_dim=self.dim_head,
+            dtype=query.dtype,
+        ):
+            return None
+        if self._fast_qk_norm_weights_fp32 is None:
+            self._fast_qk_norm_weights_fp32 = (
+                self.norm_q.weight.detach().float().contiguous(),
+                self.norm_k.weight.detach().float().contiguous(),
+            )
+        weight_q, weight_k = self._fast_qk_norm_weights_fp32
+        cos, sin = freqs_cis
+        return fast_ulysses_backend.QKFusedCtx(
+            weight_q=weight_q,
+            weight_k=weight_k,
+            cos=cos.contiguous(),
+            sin=sin.contiguous(),
+            eps=self.norm_q.variance_epsilon,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -526,57 +569,64 @@ class WanTransformerBlock(nn.Module):
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
 
-        if self.norm_q is not None:
-            if self.tp_rmsnorm:
-                query = tensor_parallel_rms_norm(query, self.norm_q)
-            else:
-                query = self.norm_q(query)
-        if self.norm_k is not None:
-            if self.tp_rmsnorm:
-                key = tensor_parallel_rms_norm(key, self.norm_k)
-            else:
-                key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        elif USE_AITER:
-            query_shape = query.shape
-            key_shape = key.shape
-            num_tokens = query.shape[:-2].numel()
-            q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
-            k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
-            cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
-            sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
-            rope_cached_2c_fwd_inplace(
-                q_sbhd,
-                k_sbhd,
-                cos_sbhd,
-                sin_sbhd,
-                1,  # GPTJ rotate style
-                True,  # reuse_freqs_front_part
-                False,  # nope_first
-            )
-            query = q_sbhd.view(query_shape)
-            key = k_sbhd.view(key_shape)
+        fused_ctx = self._maybe_fast_qk_fused_ctx(query, freqs_cis)
+        if fused_ctx is not None:
+            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            attn_output = self.attn1(query, key, value, qk_fused_ctx=fused_ctx)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output = self.attn1(query, key, value)
+            if self.norm_q is not None:
+                if self.tp_rmsnorm:
+                    query = tensor_parallel_rms_norm(query, self.norm_q)
+                else:
+                    query = self.norm_q(query)
+            if self.norm_k is not None:
+                if self.tp_rmsnorm:
+                    key = tensor_parallel_rms_norm(key, self.norm_k)
+                else:
+                    key = self.norm_k(key)
+            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+
+            # Apply rotary embeddings
+            cos, sin = freqs_cis
+            if _is_cuda and query.shape == key.shape:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
+                query, key = apply_flashinfer_rope_qk_inplace(
+                    query, key, cos_sin_cache, is_neox=False
+                )
+            elif USE_AITER:
+                query_shape = query.shape
+                key_shape = key.shape
+                num_tokens = query.shape[:-2].numel()
+                q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
+                k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
+                cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
+                sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
+                rope_cached_2c_fwd_inplace(
+                    q_sbhd,
+                    k_sbhd,
+                    cos_sbhd,
+                    sin_sbhd,
+                    1,  # GPTJ rotate style
+                    True,  # reuse_freqs_front_part
+                    False,  # nope_first
+                )
+                query = q_sbhd.view(query_shape)
+                key = k_sbhd.view(key_shape)
+            else:
+                query, key = _apply_rotary_emb(
+                    query, cos, sin, is_neox_style=False
+                ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
