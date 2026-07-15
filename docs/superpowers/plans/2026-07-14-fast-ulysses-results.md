@@ -175,3 +175,61 @@ fused_run1 视频（`A_cat_walks_slowly_towards_the_camera._20260715-013412_53f7
 
   2 步差异在 bf16 舍入累积量级（160 次融合调用 + VAE decode → 38 dB），50 步降至 20 dB——差异随步数单调放大，是标准的扩散采样混沌放大曲线。结合单次算子对拍（maxdiff 0.03 ≈ 2 ulp bf16；若为 RoPE 布局/eps bug 会是 O(1) 错误）与视觉验收（双侧高质量无伪影），**判定为良性发散，非实现 bug**。
 - **验收口径修订**：对「改变中间计算精度/运算次序」的优化，50 步 PSNR ≥35dB 阈值不适用（混沌采样器上任何 ulp 级扰动都会发散到 ~20dB）。阶段 2 正确性验收修订为三重证据：① 4 卡算子对拍容差通过 ✓；② 2 步短程 e2e PSNR ≥35dB ✓（38.31）；③ 50 步视觉质量验收 ✓。**阶段 2 验收通过。**
+
+## nsys 归因（2026-07-15，GPU 4-7）
+
+方法：`nsys profile --trace=cuda-sw,nvtx --sample=none --cpuctxsw=none --trace-fork-before-exec=true --delay 210 --duration 100`，基准命令与 e2e run 相同（去 `--warmup`）。两份 profile：`nsys_nccl`（无开关）与 `nsys_fused`（两开关全开），采集窗口均落在 denoise 段内。环境注两条：① 该机 nsys 2026.3 默认硬件 CUDA tracing 全部 rank 报 `CUPTI_ERROR_HARDWARE_BUSY`（采不到 kernel），改软件 tracing（`--trace=cuda-sw`）后正常，为此去掉需硬件 trace 的 `--cuda-graph-trace=node`（eager 无 CUDA graph，无影响）；② 本轮模型加载仅 ~2.5 分钟（transformer 62s，远快于 07-14 实测的 13 分钟，疑宿主页缓存/锁页状态差异），首次 delay=820 落空后按预案改 delay=210。
+
+归一化：以 flash-attn 实例数折算捕获步数（每步每 rank 160 次 attention：40 blocks × (self+cross) × 2 CFG）——nccl 窗口 36.5 步、fused 窗口 30.9 步。下表为**每 rank 每步** kernel 忙时（4 rank 总和 ÷4÷步数）：
+
+| kernel | nccl (ms/步) | 次/rank/步 | fused (ms/步) | 次/rank/步 |
+|---|---|---|---|---|
+| ncclDevKernel_SendRecv（a2a） | 191.8（avg 599us/med 424us/max 3.6ms） | 320 | **0（实例数 0）** | 0 |
+| a2a permute 拷贝（elementwise direct_copy 桶） | 171.0 | 568 | 8.4（非 a2a 残余） | ~8 |
+| flashinfer RMSNorm（QK norm） | 18.0 | 320 | 7.0（仅剩 cross-attn） | 160 |
+| flashinfer BatchQKApplyRotary（RoPE） | 13.5 | 80 | **0（实例数 0）** | 0 |
+| ulysses::ulysses_barrier_kernel | — | — | 53.4（med 21us/avg 223us，吸收 rank skew） | 240 |
+| ulysses::a2a_qk_chil_kernel（a2a+norm+RoPE 融合） | — | — | 47.6（avg 298us） | 160 |
+| ulysses::a2a_tma_kernel（v/out 纯 a2a） | — | — | 37.3（avg 233us） | 160 |
+| ulysses::token_inv_rms_kernel | — | — | 8.6 | 160 |
+| **本优化涉及路径小计** | **378.9** | | **146.9** | |
+| flash attn（对照锚，不应变） | 1654.7 | 160 | 1697.1（+2.6%） | 160 |
+| 主 GEMM nvjet 128x256（对照锚） | 439.2 | 562 | 449.9（+2.4%） | 562 |
+
+结论：
+
+1. **每步省 232ms/rank，×50 步 ≈ 11.6s kernel 忙时/请求**，e2e 实测 −8.7s 落在其内且被完全覆盖（差额为旧路径 a2a 在独立 stream 上与计算部分重叠、以及窗口归一误差——对照锚在 fused 窗口普遍 +2.4~3.0%）。
+2. 归因干净：NCCL SendRecv 与 RoPE kernel 在 fused profile 中**实例数为 0**，RMSNorm 减半（只剩 cross-attn），permute 拷贝桶 568→~8 次/步。节省确实来自 a2a/permute/norm/rope 这组 kernel，别处（flash attn、GEMM）不变。
+3. 实模型中旧路径每 tensor-a2a 全程 1.11ms ≈ 2× microbench（0.55ms）：SendRecv 内含 rank 间 skew 等待（med 424us→max 3.6ms），permute 拷贝实测 508us/tensor。新路径把 skew 显式吸收进 barrier（med 21us），TMA a2a avg 233us 与 microbench 一致——这解释了 e2e 收益（8.1–8.7s）为何高于用 microbench 直算的 ~4.8s（16000 次 × ~0.3ms）。
+
+产物：远程 `/data/bench/nsys/{nsys_nccl,nsys_fused}.{nsys-rep,log}`（`smoke.*` 为软件 tracing 验证残留）。
+
+## 最终汇总
+
+### 性能矩阵（Wan2.1-T2V-14B，720p/81 帧/50 步，4×B200 纯 Ulysses，denoise 中位数）
+
+| 组 | GPU | denoise (s) | vs anchor |
+|---|---|---|---|
+| nccl_eager（基线） | 0-3 | 133.6 | −0.8%（跨卡组参考） |
+| nccl_eager_anchor（锚点） | 4-7 | 134.7 | — |
+| fast_a2a（阶段 1） | 4-7 | 126.6 | **−6.0%** |
+| fast_a2a + QK 融合（阶段 2） | 4-7 | 126.0 | **−6.5%** |
+| nccl_compile / fused_compile | — | 未跑 | 环境 inductor `spmd_check` 跨 rank 图不一致（与本项目无关，见 nccl_compile 小节） |
+
+### op 级 ↔ e2e 收益对账
+
+- op 级：a2a 2.18×（mode0）/ 2.34×（mode1）vs NCCL 完整旧路径；每请求 16000 次 a2a（40 blocks × 4 次/block × 2 CFG × 50 步）。
+- e2e：阶段 1（纯 a2a）省 8.1s；阶段 2（+QK 融合）累计省 8.7s（融合增量 0.6s，与 op 级预估 nr 开销占比一致）。
+- nsys 归因（上节）：旧路径相关 kernel 18.9s/请求 → 新路径 7.3s，**省 11.6s kernel 忙时**，覆盖并解释 e2e 的 8.7s；实模型旧路径开销 ≈ 2× microbench（skew 等待 + permute 实测更贵），故 e2e 收益高于 microbench 直算的 ~4.8s。
+
+### 正确性结论
+
+- op 级：纯 a2a 与 NCCL **逐位一致**（int16 位视图对拍，fp16/bf16 × d∈{64,128,256} × mode0/1 × ws∈{2,4,8}）；QK 融合 vs 全 fp32 参考 maxdiff ≤0.031（bf16 舍入量级，atol/rtol 2e-2 PASS）。
+- 阶段 1 e2e：81 帧逐帧 MD5 与 anchor/GPU0-3 基线**逐位一致**（`bf3324bb`）。
+- 阶段 2 e2e：三重证据通过——① 4 卡算子对拍 ✓；② 2 步短程 PSNR 38.31dB ≥35 ✓；③ 50 步视觉验收 ✓。50 步全程 PSNR ~19.9dB 判定为混沌采样下的**良性发散**（非实现 bug），验收口径已按此修订。
+
+### 生产建议与上游化
+
+- 推荐 flag：`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1` + `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION=1`；同时显式 `--dit-cpu-offload false --text-encoder-cpu-offload false`（B200 显存充足，可再省 ~8 分钟加载，见附录 A）。
+- 上游化 TODO：① env 开关升格为 server flag（如 `--enable-fast-ulysses`），进 ServerArgs；② CI 增加 4 卡对拍测试（纯 a2a 逐位 + QK 融合容差）；③ 支持多 Ulysses 子组 / ring>1 / 非均匀 seq（当前仅 uniform 单子组路径）。
+- 过程中发现的三个上游问题：① auto offload 对视频模型无条件开启（不按「模型尺寸 vs 显存」决策），B200 上白付 ~8 分钟加载（附录 A）；② Blackwell 上 `set_fa_ver(4)` 不探测 FA4 可用性，cutlass-dsl 4.6.0 兼容性事故后所有 run 必炸（附录 B）；③ torch.compile inductor `spmd_check` 跨 rank 图不一致（rank0 vs rank2/3），compile 组因此未跑。
