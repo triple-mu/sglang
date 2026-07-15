@@ -75,6 +75,8 @@ def _get_group():
         return None
     ulysses_pg = get_sp_group().ulysses_group
     ulysses_world = dist.get_world_size(group=ulysses_pg)
+    # Single-node NVLink P2P only: a multi-node pure-Ulysses layout passes the
+    # world-size check below but fails loudly at NVSHMEM init.
     if ulysses_world != dist.get_world_size():
         # cfg-parallel / tp / ring layouts would need one NVSHMEM domain per
         # sub-group, which is unvalidated; keep NCCL there.

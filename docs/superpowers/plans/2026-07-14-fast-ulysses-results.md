@@ -134,7 +134,7 @@ run1 由 Task 2 agent 启动后 agent 被停止，远程进程继续运行中；
 | 2 | 126.6 | 128.9 | 36.2 |
 | 3 | 126.6 | 129.1 | 36.2 |
 
-- **中位数 denoise 126.6s：vs 同卡组锚点 134.7s = +6.0%，vs GPU 0-3 基线 133.6s = +5.3%**。三次离散 <0.1%。
+- **中位数 denoise 126.6s：vs 同卡组锚点 134.7s 提升 6.0%，vs GPU 0-3 基线 133.6s 提升 5.3%**。三次离散 <0.1%。
 - 正确性：81 帧逐帧 MD5（PyAV rgb24）fast_run1 ≡ anchor ≡ baseline(GPU 0-3)，**逐位一致**（`bf3324bb1be2570a650abaea2a919312`）。NCCL 跨卡组确定性同时得证。
 - fast path 生效确认：每个 run 的 log 中 `fast_ulysses UlyssesGroup initialized (world=4)` 出现 4 次（4 rank），无 diffusers fallback、无 Traceback。
 - 环境注：run1/2/3 跑于 cutlass-dsl 4.5.2（用户修复后），anchor 跑于修复前兼容版本；两者 FA backend 路径一致（"Using fa attention backend"）。
