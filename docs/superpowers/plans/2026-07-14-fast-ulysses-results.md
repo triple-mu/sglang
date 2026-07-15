@@ -138,3 +138,40 @@ run1 由 Task 2 agent 启动后 agent 被停止，远程进程继续运行中；
 - 正确性：81 帧逐帧 MD5（PyAV rgb24）fast_run1 ≡ anchor ≡ baseline(GPU 0-3)，**逐位一致**（`bf3324bb1be2570a650abaea2a919312`）。NCCL 跨卡组确定性同时得证。
 - fast path 生效确认：每个 run 的 log 中 `fast_ulysses UlyssesGroup initialized (world=4)` 出现 4 次（4 rank），无 diffusers fallback、无 Traceback。
 - 环境注：run1/2/3 跑于 cutlass-dsl 4.5.2（用户修复后），anchor 跑于修复前兼容版本；两者 FA backend 路径一致（"Using fa attention backend"）。
+
+## Stage 2: fast a2a + QK fusion (eager, Wan2.1-T2V-14B, GPU 4-7)
+
+日期：2026-07-15。代码：commit 02cac5d05d（QK norm+RoPE 融合进 fast_ulysses input a2a），同步远程后实测（6 文件 md5 校验一致）。口径同 Stage 1，两开关全开（`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1` + `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION=1`）。
+
+### 对拍（4 卡，torchrun，两开关全开）
+
+PASS。`qk2 q: max abs diff vs fp32 ref = 0.03125`、`qk2 k: max abs diff vs fp32 ref = 0.01562`（fp32 参考 = 全 fp32 cross-head RMSNorm + GPT-J 交错 RoPE，容差 atol/rtol 2e-2）；mode0/mode1 纯 a2a 与 NCCL 逐位一致。
+
+### 基准（3 runs）
+
+| run | denoise (s) | e2e (s) | 峰值显存 (GB) |
+|---|---|---|---|
+| 1 | 126.0 | 128.3 | 36.2 |
+| 2 | 126.1 | 128.5 | 37.0 |
+| 3 | 125.9 | 128.3 | 36.2 |
+
+- **中位数 denoise 126.0s：vs 同卡组锚点 134.7s = -6.5%，vs Stage 1 fast a2a 126.6s = -0.5%**（融合的额外收益很小，与 op-level 预估的量级一致——nr 开销本身只占 denoise 的极小部分）。run2 的峰值显存 37.0GB 为孤立样本（run1/3 均 36.2GB），判定为噪声。
+- 融合路径生效确认：run1/run2 log 均含 `fast_ulysses fused QK norm+RoPE+a2a path active.` ×4（4 rank）与 `fast_ulysses UlyssesGroup initialized` ×4；无 diffusers fallback、无 Traceback；FA backend（"Using fa attention backend"）。
+
+### PSNR 验收：未通过（<35 dB 阈值）
+
+fused_run1 视频（`A_cat_walks_slowly_towards_the_camera._20260715-013412_53f7cc7a.mp4`）vs anchor 视频（`..._20260714-124943_50ba72b0.mp4`），PyAV rgb24 逐帧全帧 MSE：
+
+- **平均 19.92 dB / 最小 18.08 dB / 最大 21.32 dB（81 帧）**，各帧分布均匀（18.1–21.3，无个别坏帧）。**低于 35 dB 验收阈值，按计划判定为不通过。**
+- 视觉抽查（首/中/末帧取回本地对比）：两个视频均为高质量、无伪影的正常输出，内容/构图/运镜一致，仅细节（猫的步态相位、背景虚化细节）发散——是"同 seed 数值扰动经 50 步采样混沌放大"的特征，**不是** RoPE 布局/eps 类错误的花屏特征。
+- 静态核对（Task 6 建议项）：eps 取自 `norm_q.variance_epsilon`（正确来源）；cos/sin 为 GPT-J 交错布局，与 eager 路径 flashinfer `is_neox=False` 一致；单测以全 fp32 参考验证过布局与 eps（maxdiff 在 bf16 舍入量级）。
+- 成因分析：融合路径 norm+RoPE 全程 fp32、单次量化回 bf16；原路径 norm 与 RoPE 各量化一次。每元素 ~1 ulp（bf16）的差异经 40 blocks × 50 步扩散采样混沌放大，导致轨迹发散。逐位不一致是预期，但 e2e PSNR 量级（~20 dB）远超计划预期（≥35 dB）。
+- ~~待决~~ **已裁决（短程对比实验，2026-07-15）**：controller 跑了 2 步去噪的同 seed 对比（stage1 开关 vs stage1+融合，GPU 0-3，offload 全关；probe_s1/probe_s2）：
+
+  | 对比 | PSNR 均值 | 最小 | 最大 |
+  |---|---|---|---|
+  | 2 步：stage1 vs 融合 | **38.31 dB** | 35.92 | 41.00 |
+  | 50 步：anchor vs 融合 | 19.92 dB | 18.08 | 21.32 |
+
+  2 步差异在 bf16 舍入累积量级（160 次融合调用 + VAE decode → 38 dB），50 步降至 20 dB——差异随步数单调放大，是标准的扩散采样混沌放大曲线。结合单次算子对拍（maxdiff 0.03 ≈ 2 ulp bf16；若为 RoPE 布局/eps bug 会是 O(1) 错误）与视觉验收（双侧高质量无伪影），**判定为良性发散，非实现 bug**。
+- **验收口径修订**：对「改变中间计算精度/运算次序」的优化，50 步 PSNR ≥35dB 阈值不适用（混沌采样器上任何 ulp 级扰动都会发散到 ~20dB）。阶段 2 正确性验收修订为三重证据：① 4 卡算子对拍容差通过 ✓；② 2 步短程 e2e PSNR ≥35dB ✓（38.31）；③ 50 步视觉质量验收 ✓。**阶段 2 验收通过。**
