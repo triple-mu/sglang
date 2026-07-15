@@ -89,6 +89,13 @@ docker exec -e HF_HOME=/data/hf-cache -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e FLASHIN
 
 run1 由 Task 2 agent 启动后 agent 被停止，远程进程继续运行中；JSON 产出后补录。run2/3 暂缓（用户占用机器做手测；eager 为主口径）。
 
+**补录（2026-07-14，Task 5）：run1 失败，无 JSON 产出，本阶段不重跑 compile。** 失败特征（`/data/bench/results/nccl_compile_run1.log`）：
+
+- log 中无 Traceback/OOM/Killed（`grep -cE "Traceback|OOM|out of memory|Killed"` = 0），`error` 命中仅为 pytree Enum 弃用警告。
+- 进程死于 inductor autotune/compile 阶段：log 全程为 triton_mm 自动调优输出，从未进入任何 denoise step。
+- log 尾部（11:47:55 后无更新）：`torch/_inductor/fx_passes/spmd_check.py` 报跨 rank 图不一致警告（rank0 vs rank2/3：`aten.slice.Tensor` vs `aten.empty.memory_format`，float32 [1,16,3,1,162]，channels_last_3d），以及 dynamo `Dynamo does not know how to trace the builtin list.append` UserWarning。
+- 判定：compile 路径在该环境下自身不稳定（与 fast_ulysses 无关，此 run 未开 fast 开关）；阶段 1 以 eager 为主口径，compile 组留待后续单独排查。
+
 ## 附录 A：模型加载慢定位（2026-07-14）
 
 现象：基准 run 模型加载 ~13 分钟（4 worker 满核 CPU 自旋、零磁盘 IO）。GPU 0-3 与 4-7 行为一致（run1 加载 12:47 / anchor 13:19）——非卡组问题。
@@ -115,3 +122,19 @@ run1 由 Task 2 agent 启动后 agent 被停止，远程进程继续运行中；
 - 时间线证据：anchor（12:52 完成）成功；probe B（13:21）在 denoise 首步炸。
 - 处理：用户自行修复环境；修复后 fast 组基准继续。
 - 上游建议：`_prepare_flash_attention_for_blackwell` 应探测 FA4 import 可用性再 set_fa_ver(4)，失败时降级并 warn。
+
+## Stage 1: fast a2a (eager, Wan2.1-T2V-14B, GPU 4-7)
+
+口径：与 baseline 完全一致（720p/81帧/50步/seed 42/4卡纯 Ulysses/--warmup/layerwise offload 关），仅加 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1`。
+换卡组锚点：`nccl_eager_anchor`（GPU 4-7，NCCL）denoise **134.7s** / e2e 137.0s / 峰值 36.5GB（vs GPU 0-3 基线 133.6s，+0.82%，锚点有效）。
+
+| run | denoise (s) | e2e (s) | 峰值显存 (GB) |
+|---|---|---|---|
+| 1 | 126.6 | 128.9 | 36.2 |
+| 2 | 126.6 | 128.9 | 36.2 |
+| 3 | 126.6 | 129.1 | 36.2 |
+
+- **中位数 denoise 126.6s：vs 同卡组锚点 134.7s = +6.0%，vs GPU 0-3 基线 133.6s = +5.3%**。三次离散 <0.1%。
+- 正确性：81 帧逐帧 MD5（PyAV rgb24）fast_run1 ≡ anchor ≡ baseline(GPU 0-3)，**逐位一致**（`bf3324bb1be2570a650abaea2a919312`）。NCCL 跨卡组确定性同时得证。
+- fast path 生效确认：每个 run 的 log 中 `fast_ulysses UlyssesGroup initialized (world=4)` 出现 4 次（4 rank），无 diffusers fallback、无 Traceback。
+- 环境注：run1/2/3 跑于 cutlass-dsl 4.5.2（用户修复后），anchor 跑于修复前兼容版本；两者 FA backend 路径一致（"Using fa attention backend"）。
