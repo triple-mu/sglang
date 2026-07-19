@@ -526,6 +526,21 @@ class WanTransformerBlock(nn.Module):
             eps=self.norm_q.variance_epsilon,
         )
 
+    def _maybe_async_v_input_a2a(
+        self, value: torch.Tensor
+    ) -> "fast_ulysses_backend.AsyncA2AHandle | None":
+        """Issue the v input a2a on the fast_ulysses comm stream so it overlaps
+        the q/k projections. Every condition is identical across SP ranks,
+        keeping the collective call pattern in lockstep. Unlike the QK fusion,
+        v has no norm/rope, so this works with the fusion on or off.
+        """
+        if (
+            not isinstance(self.attn1, USPAttention)
+            or self.attn1.skip_sequence_parallel
+        ):
+            return None
+        return fast_ulysses_backend.maybe_async_input_a2a_v(v=value)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -565,16 +580,22 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        # v first: its input a2a can run on the fast_ulysses comm stream while
+        # the q/k projections (plus norm/rope on the unfused path) fill the
+        # overlap window on the main stream.
+        value, _ = self.to_v(norm_hidden_states)
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        v_a2a_handle = self._maybe_async_v_input_a2a(value)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
 
         fused_ctx = self._maybe_fast_qk_fused_ctx(query, freqs_cis)
         if fused_ctx is not None:
             query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
             key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            attn_output = self.attn1(query, key, value, qk_fused_ctx=fused_ctx)
+            attn_output = self.attn1(
+                query, key, value, qk_fused_ctx=fused_ctx, v_a2a_handle=v_a2a_handle
+            )
         else:
             if self.norm_q is not None:
                 if self.tp_rmsnorm:
@@ -588,7 +609,6 @@ class WanTransformerBlock(nn.Module):
                     key = self.norm_k(key)
             query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
             key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
             # Apply rotary embeddings
             cos, sin = freqs_cis
@@ -626,7 +646,11 @@ class WanTransformerBlock(nn.Module):
                 query, key = _apply_rotary_emb(
                     query, cos, sin, is_neox_style=False
                 ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-            attn_output = self.attn1(query, key, value)
+            if v_a2a_handle is not None:
+                # A non-None handle implies attn1 is USPAttention.
+                attn_output = self.attn1(query, key, value, v_a2a_handle=v_a2a_handle)
+            else:
+                attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)

@@ -2,8 +2,10 @@
 
 Enabled via SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES (plus
 SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION for the fused QK norm+RoPE
-input a2a). Every entry point returns None / False when the fast path cannot
-serve the call, and callers must then run the NCCL path.
+input a2a, and SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A for the
+async v input a2a that overlaps the q/k projections). Every entry point
+returns None / False when the fast path cannot serve the call, and callers
+must then run the NCCL path.
 
 Collective safety: every decision here (env flags, group topology, tensor
 shape/dtype) is identical across SP ranks under SPMD execution, so for a given
@@ -12,6 +14,7 @@ call site either all ranks take the fast path or none does.
 
 import functools
 import logging
+from typing import TYPE_CHECKING
 
 import msgspec
 import torch
@@ -22,6 +25,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_world_size,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+
+if TYPE_CHECKING:
+    from fast_ulysses import AsyncA2AHandle
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +41,7 @@ _MAX_WORLD_SIZE = 8
 
 # Calls actually served by the fast path; tests assert on these to catch
 # silent fallbacks.
-fast_call_counts: dict[str, int] = {"a2a": 0, "qk2": 0}
+fast_call_counts: dict[str, int] = {"a2a": 0, "qk2": 0, "a2a_async": 0}
 
 
 class QKFusedCtx(msgspec.Struct):
@@ -53,6 +62,13 @@ def _a2a_enabled() -> bool:
 @functools.cache
 def _qk_fusion_enabled() -> bool:
     return _a2a_enabled() and bool(envs.SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION)
+
+
+@functools.cache
+def _async_v_enabled() -> bool:
+    return _a2a_enabled() and bool(
+        envs.SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A
+    )
 
 
 @functools.cache
@@ -133,6 +149,39 @@ def maybe_all_to_all_4d(x: torch.Tensor, *, mode: int, tag: str) -> torch.Tensor
     out = group.all_to_all_single_4d(x, mode=mode, tag=tag)
     fast_call_counts["a2a"] += 1
     return out
+
+
+def maybe_async_input_a2a_v(v: torch.Tensor) -> "AsyncA2AHandle | None":
+    """Async mode0 a2a for v on the group's comm stream; overlaps the caller's
+    subsequent q/k projections.
+
+    The caller MUST wait() the handle before issuing the next fast_ulysses
+    collective on the main stream: the per-group barrier epoch is a single
+    monotonic counter, so barrier kernels must execute in submission order
+    (see fast_ulysses comm.py). Tag "usp_v" matches the sync path, so the same
+    symmetric buffer is reused; cross-layer reuse stays safe because the
+    handle's ready-event trails the previous layer's output a2a, whose flag
+    barrier orders every peer's reads of this buffer before the new writes.
+
+    Returns None whenever the fast path cannot serve the call.
+    """
+    if not _async_v_enabled():
+        return None
+    group = _get_group()
+    if group is None:
+        return None
+    if not _shape_ok(v, split_dim=2, world_size=get_ulysses_parallel_world_size()):
+        return None
+    if is_in_breakable_cuda_graph():
+        # The async launch uses Tensor.record_stream + cross-stream events,
+        # both illegal under CUDA graph capture; the BCG scope flag flips in
+        # SPMD lockstep, so this stays rank-uniform.
+        return None
+    if fast_call_counts["a2a_async"] == 0:
+        logger.info("fast_ulysses async v input a2a path active.")
+    handle = group.all_to_all_single_4d_async(v, mode=0, tag="usp_v")
+    fast_call_counts["a2a_async"] += 1
+    return handle
 
 
 def can_use_qk2(*, num_heads: int, head_dim: int, dtype: torch.dtype) -> bool:

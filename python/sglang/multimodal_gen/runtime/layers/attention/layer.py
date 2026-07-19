@@ -621,6 +621,7 @@ class USPAttention(nn.Module):
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
         qk_fused_ctx: "fast_ulysses_backend.QKFusedCtx | None" = None,
+        v_a2a_handle: "fast_ulysses_backend.AsyncA2AHandle | None" = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -644,6 +645,10 @@ class USPAttention(nn.Module):
                 Callers may pass ``build_varlen_mask_meta(attn_mask)`` or a
                 known contiguous padding gap. Masked query rows are zero-filled
                 on output (differs from SDPA semantics).
+            v_a2a_handle: in-flight fast_ulysses async input a2a for v. When
+                set, the uniform Ulysses path takes its wait() output as v
+                (the passed-in v is the handle's input) and waits before the
+                q/k input collectives.
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -663,6 +668,20 @@ class USPAttention(nn.Module):
                 and num_replicated_kv_prefix == 0
                 and not effective_skip_sp
             ), "qk_fused_ctx is only supported on the uniform Ulysses path"
+        if v_a2a_handle is not None:
+            # A handle that strayed into a masked/replicated/skip-sp branch
+            # would never be waited: numerically wrong AND a barrier-epoch
+            # ordering hazard for the whole group. attn_mask_meta alone (tail
+            # pad) also opts into the masked branch, so it is excluded too.
+            assert (
+                attn_mask is None
+                and attn_mask_meta is None
+                and num_replicated_prefix == 0
+                and num_replicated_suffix == 0
+                and num_replicated_kv_prefix == 0
+                and not effective_skip_sp
+                and not self.enable_packed_qkv_input_a2a
+            ), "v_a2a_handle is only supported on the uniform Ulysses path"
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
@@ -965,7 +984,19 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            if qk_fused_ctx is not None:
+            if v_a2a_handle is not None:
+                # Wait BEFORE the q/k input collectives: the fast_ulysses
+                # barrier epoch must execute in submission order (see
+                # maybe_async_input_a2a_v / fast_ulysses comm.py).
+                v = v_a2a_handle.wait()
+                if qk_fused_ctx is not None:
+                    q, k = fast_ulysses_backend.qk2_input_a2a(
+                        q=q, k=k, ctx=qk_fused_ctx
+                    )
+                else:
+                    q = _usp_input_all_to_all(q, head_dim=2, comm_tag="usp_q")
+                    k = _usp_input_all_to_all(k, head_dim=2, comm_tag="usp_k")
+            elif qk_fused_ctx is not None:
                 # Fused cross-head RMSNorm + RoPE + input a2a for q/k (the
                 # caller skipped its own norm/rope); v has no norm/rope.
                 q, k = fast_ulysses_backend.qk2_input_a2a(q=q, k=k, ctx=qk_fused_ctx)

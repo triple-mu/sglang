@@ -204,6 +204,39 @@ fused_run1 视频（`A_cat_walks_slowly_towards_the_camera._20260715-013412_53f7
 
 产物：远程 `/data/bench/nsys/{nsys_nccl,nsys_fused}.{nsys-rep,log}`（`smoke.*` 为软件 tracing 验证残留）。
 
+## Stage 3: async v input a2a（v-first overlap，hyper00 4×H200）
+
+日期：2026-07-19。设计：`docs/superpowers/specs/2026-07-19-fast-ulysses-async-v-a2a-design.md`。
+环境切换说明：ion-b200 当日 sshd 故障（kex 拒绝），改在 **hyper00 8×H200**（容器 `sglang-qwenimage`，GPU 4-7，torch 2.13+cu132）验证；口径相应改为用户提供的推理配置 **720p/81 帧/40 步/guidance 4/seed 42**，与 Stage 1/2 的 B200/50 步数字不可直接对比。fast_ulysses 复用 `/data/fast-ulysses-test` 容器内构建（python 层与本地参考逐字节一致），经 `.pth` 挂入 venv。
+
+### 对拍（4 卡 torchrun，test_fast_ulysses_a2a.py 三种开关组合 + 全关）
+
+全 PASS：`FAST+QK` 回归 ✓；`FAST+ASYNC`（async v + 非融合 q/k）✓；`FAST+QK+ASYNC`（async v 与同步 qk2 混排）✓，qk2 maxdiff 0.0156（口径同 Stage 2）；全关时计数断言按预期失败 ✓。async 用例在 wait() 后立即读取（竞争观测窗口）且三轮迭代无 host 同步流水复用 "usp_v" 缓冲。
+
+### e2e（warmup excluded；帧 MD5 = PyAV rgb24 逐帧）
+
+| run | denoise (s) | 帧 MD5 |
+|---|---|---|
+| qk_anchor（FAST+QK）r1/r2 | 205.52 / 205.70 | `5c9980…` |
+| qk_async（+ASYNC）r1/r2 | 205.52 / 205.49 | `5c9980…` ≡ anchor **逐位一致** |
+| qk_async_tma（bench-only `use_tma=True`）r1 | 205.35 | `5c9980…` ≡ anchor |
+| nofuse_anchor（仅 FAST）r1 | 206.35 | `6eb208…` |
+| nofuse_async（+ASYNC）r1 | 205.92 | `6eb208…` ≡ anchor **逐位一致** |
+
+**正确性红线全部通过**（融合/非融合两组 async 均与各自 anchor 逐位一致，且跨 run 确定性成立）；**性能打平**（差异 ≤0.2%，噪声级）。
+
+### nsys 归因（--cuda-flush-interval 5000；此参数必须加：worker 退出被强杀导致 CUPTI 缓冲不 flush，首版 trace 在 denoise 开始 ~7s 后整体截断）
+
+- async v scatter 与 GEMM 的重叠：SM 直写路径 **1.9-2.8%**，TMA 路径 **7.5-8.8%**——两者都几乎没叠上。
+- 时间轴切片显示根因比"coop GEMM 不释放 SM"更基础：该 eager 管线 host 开销大，to_q 与 to_k 两次 GEMM 之间本就有 ~370µs 主 stream 气泡，v scatter（~0.4-0.6ms）实际落在气泡里执行；且每 block 的大头是 ~44ms 的 attention kernel，qkv GEMM 窗口（~4ms）与 v a2a 都是小量。
+- 收益上限对账：v a2a 全隐藏的理论上限 ≈ 0.4ms × 80 次/步 ≈ 33ms/步，对 5.1s/步仅 ~0.6%；实测主 stream 气泡本来就吸收了 v 通信，故 async ≈ sync，e2e 打平在机制上闭环。
+
+### 结论与建议
+
+- 功能正确且默认关闭时零风险（v-first 纯重排，帧逐位不变）；`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A` **保持默认关、暂不进推荐 flag 组合**。
+- 该负载（Wan14B 720p，H200 ws=4，eager）下输入侧通信不在暴露的关键路径上，v-first overlap 无收益；B200 上的复验与更深的 head 分块流水（需先消除 host 气泡/降低 attention 占比才有意义）留待后续。
+- 产物：远程 hyper00 `/data/bench/{logs,results,videos,nsys}/`（`tma_flush`/`auto_flush` 为修复截断后的有效 trace）。
+
 ## 最终汇总
 
 ### 性能矩阵（Wan2.1-T2V-14B，720p/81 帧/50 步，4×B200 纯 Ulysses，denoise 中位数）
