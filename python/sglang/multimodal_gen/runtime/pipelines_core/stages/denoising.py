@@ -1590,9 +1590,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                     # use non-integer timesteps keep their precision in markers.
                     step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
-                    if step_index == 5:
+                    if not ctx.is_warmup and step_index == 5:
                         torch.cuda.cudart().cudaProfilerStart()
-                    if step_index == 6:
+                    if not ctx.is_warmup and step_index == 6:
                         torch.cuda.cudart().cudaProfilerStop()
                     with (
                         maybe_nvtx_range(step_marker, use_nvtx),
