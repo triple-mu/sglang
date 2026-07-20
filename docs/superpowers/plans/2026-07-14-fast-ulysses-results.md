@@ -279,9 +279,23 @@ sglang 侧新增 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_CE_A2A`（依赖基础开
 
 结论：B 比 A 慢 ~0.4s（0.2%）。CE overlap 相对非融合同步基线（206.35）省 ~0.2s，但补不上放弃 qk2 融合的 ~0.8s；且 e2e 里输入 a2a 本就多在 host 气泡中（microbench 的 93% 隐藏兑现不出来）。**生产推荐维持 A（FAST+QK_FUSION）**；CE_A2A 保持默认关，其价值待管线去 host-bound（CUDA graph 化）或 head 分块流水后重估——届时 CE 是唯一能与计算真并发的传输形态。
 
+### 追加：pipelined QKV（tma vs ce）与环境面收敛（2026-07-20 终态）
+
+用户指定的流水形态（to_q→发 q、to_k→发 k、to_v→发 v、统一 wait；逐投影本地 `fast_ulysses.norm_rope` fp32 融合 norm+rope）实现为 `SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV`，e2e 两轮（4×H200 空闲卡）：
+
+| 配置 | denoise r1/r2 | 帧 MD5 |
+|---|---|---|
+| pipelined-TMA | 206.74 / 206.93 | `57f7963e…` |
+| **pipelined-CE** | **205.51 / 205.56** | `57f7963e…`（两路径逐位互证） |
+
+**CE 稳定快 ~1.3s 且追平 qk2 融合默认路径（205.5s 档）**——CE 微基准的 93% 隐藏率首次在 e2e 兑现（q 藏进 to_k+to_v，k 藏进 to_v，仅 v 暴露）。
+
+**环境面收敛（用户决定）**：只保留 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES`（qk2 融合并入默认行为）、`SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV`（bool，流水替代融合）、`SGLANG_DIFFUSION_FAST_ULYSSES_TYPE`（none/base/tma/ce，非融合 a2a 的传输路径，none=库默认自动路由）；删除 QK_FUSION/ASYNC_V_A2A/ASYNC_QK_A2A/CE_A2A 及全部关联死代码，layer 接口合并为 `qkv_a2a_handles` 三元组。语义回归（独立选卡）：5 组单测全符合预期；e2e `FAST=1` ≡ 融合锚点 `5c9980…`（205.37s）、`PIPELINE=1 TYPE=ce` ≡ `57f7963e…`（205.41s），**两个推荐配置并驾齐驱**。
+
 ### 结论与建议
 
-- 功能正确且默认关闭时零风险（v-first 纯重排，帧逐位不变）；`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A`、`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A` 与 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_CE_A2A` **保持默认关、暂不进推荐 flag 组合**。
+- 生产推荐两选一（性能等价，~205.4s）：`ENABLE_FAST_ULYSSES=1`（融合，最简）或 `ENABLE_FAST_ULYSSES=1 + PIPELINE_QKV=1 + TYPE=ce`（流水+CE，通信隐藏形态，为未来更大 overlap 场景铺路）。
+- `TYPE=tma/base` 仅作诊断/对比用途；流水下 tma 慢 ~1.3s。
 - 该负载（Wan14B 720p，H200 ws=4，eager）下输入侧通信不在暴露的关键路径上，v-first overlap 无收益；B200 上的复验与更深的 head 分块流水（需先消除 host 气泡/降低 attention 占比才有意义）留待后续。
 - 产物：远程 hyper00 `/data/bench/{logs,results,videos,nsys}/`（`tma_flush`/`auto_flush` 为修复截断后的有效 trace）。
 
