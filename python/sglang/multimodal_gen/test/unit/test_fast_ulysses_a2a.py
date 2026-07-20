@@ -1,35 +1,23 @@
 """4-GPU parity tests: fast_ulysses backend vs NCCL Ulysses a2a.
 
-Not registered in CI (experimental). Run inside the ion-b200 container:
+Not registered in CI (experimental). Run on a 4-GPU NVLink host:
 
     # expected FAIL (fast path off -> counter assertion trips):
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
-    # expected PASS:
+    # expected PASS (fast a2a + fused qk2; TYPE defaults to none = auto):
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION=1 \
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
-    # expected PASS (async v + unfused q/k):
+    # expected PASS for each transfer type (base / tma / ce):
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A=1 \
+    SGLANG_DIFFUSION_FAST_ULYSSES_TYPE=ce \
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
-    # expected PASS (async v mixed with the sync fused qk2 collective):
+    # expected PASS (pipelined QKV; combine with any TYPE):
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION=1 \
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A=1 \
-    torchrun --nproc_per_node=4 \
-        python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
-    # expected PASS (async q/k in flight together, sync v after the waits):
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A=1 \
-    torchrun --nproc_per_node=4 \
-        python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
-    # expected PASS (three async handles in flight: v + q + k):
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A=1 \
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A=1 \
+    SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV=1 \
+    SGLANG_DIFFUSION_FAST_ULYSSES_TYPE=ce \
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
 """
@@ -82,26 +70,27 @@ def _ref_norm_rope(x, weight, cos, sin, eps):
     return out.to(x.dtype)
 
 
-def test_qk2_parity(rank: int, device: torch.device, world: int) -> None:
-    q = _rand((B, S_LOCAL, H, D), 111 + rank, device)
-    k = _rand((B, S_LOCAL, H, D), 222 + rank, device)
+def _make_qk_ctx(device):
     gen = torch.Generator(device=device).manual_seed(9)
     wq = 1.0 + 0.1 * torch.randn(H * D, generator=gen, device=device)
     wk = 1.0 + 0.1 * torch.randn(H * D, generator=gen, device=device)
     ang = torch.rand((S_LOCAL, D // 2), generator=gen, device=device) * 6.28
     cos, sin = ang.cos().contiguous(), ang.sin().contiguous()
-    eps = 1e-6
-
-    assert fast_ulysses_backend.can_use_qk2(
-        num_heads=H, head_dim=D, dtype=torch.bfloat16
-    )
     ctx = fast_ulysses_backend.QKFusedCtx(
-        weight_q=wq, weight_k=wk, cos=cos, sin=sin, eps=eps
+        weight_q=wq, weight_k=wk, cos=cos, sin=sin, eps=1e-6
     )
+    return ctx, wq, wk, cos, sin
+
+
+def test_qk2_parity(rank: int, device: torch.device, world: int) -> None:
+    q = _rand((B, S_LOCAL, H, D), 111 + rank, device)
+    k = _rand((B, S_LOCAL, H, D), 222 + rank, device)
+    ctx, wq, wk, cos, sin = _make_qk_ctx(device)
+
     fq, fk = fast_ulysses_backend.qk2_input_a2a(q=q, k=k, ctx=ctx)
 
-    rq = _usp_input_all_to_all(_ref_norm_rope(q, wq, cos, sin, eps), head_dim=2)
-    rk = _usp_input_all_to_all(_ref_norm_rope(k, wk, cos, sin, eps), head_dim=2)
+    rq = _usp_input_all_to_all(_ref_norm_rope(q, wq, cos, sin, ctx.eps), head_dim=2)
+    rk = _usp_input_all_to_all(_ref_norm_rope(k, wk, cos, sin, ctx.eps), head_dim=2)
     for name, f, r in (("q", fq, rq), ("k", fk, rk)):
         diff = (f.float() - r.float()).abs().max().item()
         if rank == 0:
@@ -109,106 +98,46 @@ def test_qk2_parity(rank: int, device: torch.device, world: int) -> None:
         torch.testing.assert_close(f, r, atol=2e-2, rtol=2e-2)
 
 
-def test_async_v_parity(
-    rank: int, device: torch.device, world: int, *, with_qk2: bool
-) -> None:
-    """Production-shaped call sequence: async v issued first, main-stream
-    compute in the overlap window, wait(), then the sync q/k input collectives
-    and the output a2a. Three iterations reuse the "usp_v" symmetric buffer
-    across "layers"."""
+def test_pipelined_parity(rank: int, device: torch.device, world: int) -> None:
+    """Production-shaped pipelined QKV sequence: per-tensor local fused
+    norm+rope + async a2a (q, then k, then v), the three handles waited
+    together, then the output a2a. Deferred compares keep the loop free of
+    host syncs so the iterations pipeline and pressure the tag-buffer reuse;
+    the clones right after the waits race a broken wait() while the a2a is
+    still in flight."""
     filler = _rand((4096, 4096), 7 + rank, device)
-    if with_qk2:
-        gen = torch.Generator(device=device).manual_seed(9)
-        wq = 1.0 + 0.1 * torch.randn(H * D, generator=gen, device=device)
-        wk = 1.0 + 0.1 * torch.randn(H * D, generator=gen, device=device)
-        ang = torch.rand((S_LOCAL, D // 2), generator=gen, device=device) * 6.28
-        cos, sin = ang.cos().contiguous(), ang.sin().contiguous()
-        eps = 1e-6
-        ctx = fast_ulysses_backend.QKFusedCtx(
-            weight_q=wq, weight_k=wk, cos=cos, sin=sin, eps=eps
-        )
+    ctx, wq, wk, cos, sin = _make_qk_ctx(device)
     base = fast_ulysses_backend.fast_call_counts["a2a_async"]
-    # No host sync inside the loop (after the first call's autotune): the
-    # comparisons are deferred so the three iterations actually pipeline and
-    # put concurrency pressure on the cross-layer "usp_v" buffer reuse.
     exact_checks: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     close_checks: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     for it in range(3):
-        v = _rand((B, S_LOCAL, H, D), 1000 * it + rank, device)
-        ref_v = _usp_input_all_to_all(v, head_dim=2)  # no tag -> NCCL
-        hv = fast_ulysses_backend.maybe_async_input_a2a_v(v=v)
-        assert hv is not None, "async v fast path not taken"
-        _ = filler @ filler  # main-stream compute inside the overlap window
-        fast_v = hv.wait()  # wait BEFORE the next sync fast_ulysses collective
-        # Clone immediately: the a2a (~253us) is still in flight if wait()
-        # failed to synchronize, so this read races it and the deferred
-        # compare catches the corruption.
-        exact_checks.append((f"v(iter {it})", fast_v.clone(), ref_v))
         q = _rand((B, S_LOCAL, H, D), 2000 * it + rank, device)
         k = _rand((B, S_LOCAL, H, D), 3000 * it + rank, device)
-        if with_qk2:
-            fq, fk = fast_ulysses_backend.qk2_input_a2a(q=q, k=k, ctx=ctx)
-            rq = _usp_input_all_to_all(_ref_norm_rope(q, wq, cos, sin, eps), head_dim=2)
-            rk = _usp_input_all_to_all(_ref_norm_rope(k, wk, cos, sin, eps), head_dim=2)
-            close_checks.append((f"q(iter {it})", fq.clone(), rq))
-            close_checks.append((f"k(iter {it})", fk.clone(), rk))
-        else:
-            fq = _usp_input_all_to_all(q, head_dim=2, comm_tag="usp_q")
-            fk = _usp_input_all_to_all(k, head_dim=2, comm_tag="usp_k")
-            exact_checks.append(
-                (f"q(iter {it})", fq.clone(), _usp_input_all_to_all(q, head_dim=2))
-            )
-            exact_checks.append(
-                (f"k(iter {it})", fk.clone(), _usp_input_all_to_all(k, head_dim=2))
-            )
+        v = _rand((B, S_LOCAL, H, D), 1000 * it + rank, device)
+        rq = _usp_input_all_to_all(_ref_norm_rope(q, wq, cos, sin, ctx.eps), head_dim=2)
+        rk = _usp_input_all_to_all(_ref_norm_rope(k, wk, cos, sin, ctx.eps), head_dim=2)
+        ref_v = _usp_input_all_to_all(v, head_dim=2)  # no tag -> NCCL
+
+        nq = fast_ulysses_backend.pipelined_norm_rope(q, weight=wq, ctx=ctx)
+        hq = fast_ulysses_backend.pipelined_input_a2a(nq, tag="usp_q")
+        nk = fast_ulysses_backend.pipelined_norm_rope(k, weight=wk, ctx=ctx)
+        hk = fast_ulysses_backend.pipelined_input_a2a(nk, tag="usp_k")
+        hv = fast_ulysses_backend.pipelined_input_a2a(v, tag="usp_v")
+        _ = filler @ filler  # main-stream compute inside the overlap window
+        fq = hq.wait()
+        fk = hk.wait()
+        fv = hv.wait()
+        close_checks.append((f"q(iter {it})", fq.clone(), rq))
+        close_checks.append((f"k(iter {it})", fk.clone(), rk))
+        exact_checks.append((f"v(iter {it})", fv.clone(), ref_v))
         # Close the barrier chain like production's output a2a; this is also
         # the cross-rank ordering anchor for the next iteration's buffer reuse.
-        _usp_output_all_to_all(fast_v, head_dim=2, comm_tag="usp_out")
+        _usp_output_all_to_all(fv, head_dim=2, comm_tag="usp_out")
     for name, fast, ref in exact_checks:
-        assert torch.equal(ref, fast), f"async-mode mismatch: {name}"
+        assert torch.equal(ref, fast), f"pipelined mismatch: {name}"
     for name, fast, ref in close_checks:
         torch.testing.assert_close(fast, ref, atol=2e-2, rtol=2e-2, msg=name)
-    assert fast_ulysses_backend.fast_call_counts["a2a_async"] == base + 3
-
-
-def test_async_qk_parity(
-    rank: int, device: torch.device, world: int, *, with_v_async: bool
-) -> None:
-    """q and k a2as both in flight on the comm stream, waited together
-    (optionally with a third in-flight v handle). The sync v fallback runs
-    AFTER the waits, matching the dispatch's barrier-epoch ordering. Deferred
-    bitwise compares as in test_async_v_parity."""
-    filler = _rand((4096, 4096), 7 + rank, device)
-    base_qk = fast_ulysses_backend.fast_call_counts["a2a_async_qk"]
-    exact_checks: list[tuple[str, torch.Tensor, torch.Tensor]] = []
-    for it in range(3):
-        q = _rand((B, S_LOCAL, H, D), 5000 * it + rank, device)
-        k = _rand((B, S_LOCAL, H, D), 6000 * it + rank, device)
-        v = _rand((B, S_LOCAL, H, D), 7000 * it + rank, device)
-        ref_q = _usp_input_all_to_all(q, head_dim=2)  # no tag -> NCCL
-        ref_k = _usp_input_all_to_all(k, head_dim=2)
-        ref_v = _usp_input_all_to_all(v, head_dim=2)
-        hv = fast_ulysses_backend.maybe_async_input_a2a_v(v=v) if with_v_async else None
-        hqk = fast_ulysses_backend.maybe_async_input_a2a_qk(q=q, k=k)
-        assert hqk is not None, "async q/k fast path not taken"
-        _ = filler @ filler  # main-stream compute inside the overlap window
-        if hv is not None:
-            fast_v = hv.wait()
-        fast_q = hqk[0].wait()
-        fast_k = hqk[1].wait()
-        # Clone right after the joint wait: a broken wait() leaves the a2as
-        # in flight and these reads race them.
-        exact_checks.append((f"q(iter {it})", fast_q.clone(), ref_q))
-        exact_checks.append((f"k(iter {it})", fast_k.clone(), ref_k))
-        if hv is None:
-            # Sync collective only AFTER all waits (barrier-epoch ordering).
-            fast_v = _usp_input_all_to_all(v, head_dim=2, comm_tag="usp_v")
-        exact_checks.append((f"v(iter {it})", fast_v.clone(), ref_v))
-        # Close the barrier chain like production's output a2a.
-        _usp_output_all_to_all(fast_v, head_dim=2, comm_tag="usp_out")
-    for name, fast, ref in exact_checks:
-        assert torch.equal(ref, fast), f"async-qk mismatch: {name}"
-    assert fast_ulysses_backend.fast_call_counts["a2a_async_qk"] == base_qk + 6
+    assert fast_ulysses_backend.fast_call_counts["a2a_async"] == base + 9
 
 
 def main() -> None:
@@ -232,32 +161,12 @@ def main() -> None:
     elif rank == 0:
         print("qk2 disabled; skipped its parity test", flush=True)
 
-    if fast_ulysses_backend._async_v_enabled():
-        with_qk2 = fast_ulysses_backend.can_use_qk2(
-            num_heads=H, head_dim=D, dtype=torch.bfloat16
-        )
-        test_async_v_parity(rank, device, world, with_qk2=with_qk2)
-    else:
-        v = _rand((B, S_LOCAL, H, D), 55, device)
-        assert fast_ulysses_backend.maybe_async_input_a2a_v(v=v) is None
-        assert fast_ulysses_backend.fast_call_counts["a2a_async"] == 0
-        if rank == 0:
-            print("async v disabled; verified no-op", flush=True)
-
-    if fast_ulysses_backend._async_qk_enabled():
-        test_async_qk_parity(
-            rank,
-            device,
-            world,
-            with_v_async=fast_ulysses_backend._async_v_enabled(),
-        )
-    else:
-        q = _rand((B, S_LOCAL, H, D), 56, device)
-        k = _rand((B, S_LOCAL, H, D), 57, device)
-        assert fast_ulysses_backend.maybe_async_input_a2a_qk(q=q, k=k) is None
-        assert fast_ulysses_backend.fast_call_counts["a2a_async_qk"] == 0
-        if rank == 0:
-            print("async qk disabled; verified no-op", flush=True)
+    if fast_ulysses_backend.can_use_pipelined_qkv(
+        num_heads=H, head_dim=D, dtype=torch.bfloat16
+    ):
+        test_pipelined_parity(rank, device, world)
+    elif rank == 0:
+        print("pipelined qkv disabled; skipped its parity test", flush=True)
 
     if rank == 0:
         print("PASS", flush=True)

@@ -268,9 +268,20 @@ fused_run1 视频（`A_cat_walks_slowly_towards_the_camera._20260715-013412_53f7
 
 结论：**batch 不能提升吞吐**（CUDA 13.3 驱动的 batch pitched 路径本身慢 ~40-60%，`PreferOverlapWithCompute` hint 再腰斩），serial 也不优于 pool；**pool 保持默认**，其净暴露 0.04-0.05ms/call，比 base/tma 低 ~7-9 倍。实验收口后（2026-07-20，用户决定）serial/batch 变体与 `FAST_ULYSSES_CE_IMPL` 开关已从库中删除，仅保留 pool 实现；实验结论以注释形式留档在 `all_to_all_ce.cu` 的 NOTE 中（防止未来重做同一实验）。API 坑记档：① batch 系 API 拒绝 legacy 默认流（invalid argument，需显式流）；② novita 机器需 `NCCL_NVLS_ENABLE=0`（Fabric Manager 不支持 NVLS）；③ 共享机上未独占的性能数字不可信——独占校验（运行期进程采样 + 端点复核）应成为该机 bench 的标配流程（脚本 `/data/fast-ulysses-ce/run_ws4_suite.sh`）。
 
+### 追加：CE overlap e2e 对比（2026-07-20，hyper00 4×H200 空闲卡动态选取，两轮）
+
+sglang 侧新增 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_CE_A2A`（依赖基础开关 + 任一 ASYNC 开关）：async 输入 a2a 改走 fast_ulysses 的 CE 路径（`all_to_all_single_4d_ce_async`，需含 CE op 的库构建；hyper00 的 `.pth` 已切至 `/data/fast-ulysses-ce`）。对比配置：A = 默认融合（FAST+QK_FUSION，qk2+auto 同步）；B = CE overlap（FAST+ASYNC_V+ASYNC_QK+CE_A2A，非融合本地 GEMM+RMSNorm+RoPE 提供窗口）。
+
+| 配置 | denoise r1/r2 | 帧 MD5 |
+|---|---|---|
+| A 默认融合 | 205.50 / 205.97 | `5c9980…` ≡ 融合锚点 ✓ |
+| B CE overlap | 206.19 / 206.08 | `6eb208…` ≡ 非融合锚点 **逐位一致** ✓（"(ce)" 激活日志 v+qk 各 4 rank） |
+
+结论：B 比 A 慢 ~0.4s（0.2%）。CE overlap 相对非融合同步基线（206.35）省 ~0.2s，但补不上放弃 qk2 融合的 ~0.8s；且 e2e 里输入 a2a 本就多在 host 气泡中（microbench 的 93% 隐藏兑现不出来）。**生产推荐维持 A（FAST+QK_FUSION）**；CE_A2A 保持默认关，其价值待管线去 host-bound（CUDA graph 化）或 head 分块流水后重估——届时 CE 是唯一能与计算真并发的传输形态。
+
 ### 结论与建议
 
-- 功能正确且默认关闭时零风险（v-first 纯重排，帧逐位不变）；`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A` 与 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A` **保持默认关、暂不进推荐 flag 组合**。
+- 功能正确且默认关闭时零风险（v-first 纯重排，帧逐位不变）；`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A`、`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A` 与 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_CE_A2A` **保持默认关、暂不进推荐 flag 组合**。
 - 该负载（Wan14B 720p，H200 ws=4，eager）下输入侧通信不在暴露的关键路径上，v-first overlap 无收益；B200 上的复验与更深的 head 分块流水（需先消除 host 气泡/降低 attention 占比才有意义）留待后续。
 - 产物：远程 hyper00 `/data/bench/{logs,results,videos,nsys}/`（`tma_flush`/`auto_flush` 为修复截断后的有效 trace）。
 

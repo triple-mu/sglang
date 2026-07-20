@@ -33,9 +33,8 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES: bool = False
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION: bool = False
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A: bool = False
-    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A: bool = False
+    SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV: bool = False
+    SGLANG_DIFFUSION_FAST_ULYSSES_TYPE: str = "none"
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
@@ -262,27 +261,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # e.g. `/reset_prefix_cache`
     "SGLANG_DIFFUSION_SERVER_DEV_MODE": _lazy_bool("SGLANG_DIFFUSION_SERVER_DEV_MODE"),
     # Experimental: route uniform Ulysses SP all-to-all through the
-    # fast_ulysses (NVSHMEM + NVLink P2P) library when importable.
+    # fast_ulysses (NVSHMEM + NVLink P2P) library when importable, with the
+    # Wan cross-head QK RMSNorm + RoPE fused into the input a2a when eligible.
     "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES"
     ),
-    # Experimental: additionally fuse Wan-style cross-head QK RMSNorm + RoPE
-    # into the fast_ulysses input all-to-all (requires the flag above).
-    "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION"
+    # Fully pipelined Wan QKV input a2a instead of the fused QK path: each
+    # projection is followed by a local fused norm+rope
+    # (fast_ulysses.norm_rope) and its async a2a; the three handles are
+    # waited together before attention (requires the flag above).
+    "SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV": _lazy_bool(
+        "SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV"
     ),
-    # Experimental: issue the Wan self-attention v input all-to-all
-    # asynchronously on the fast_ulysses comm stream so it overlaps the q/k
-    # projections (requires SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES).
-    "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A"
-    ),
-    # Experimental: issue the Wan self-attention q and k input all-to-alls
-    # asynchronously (two handles in flight, waited together before
-    # attention). Unfused path only -- inert when the QK fusion is active
-    # (requires SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES).
-    "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A"
+    # Transfer path for the non-fused fast_ulysses a2a calls (sync and
+    # pipelined-async): "none" = library default routing (autotuned),
+    # "base" = force the SM scatter, "tma" = force the TMA kernel,
+    # "ce" = the copy-engine path (overlaps concurrent compute).
+    "SGLANG_DIFFUSION_FAST_ULYSSES_TYPE": _lazy_str(
+        "SGLANG_DIFFUSION_FAST_ULYSSES_TYPE", "none"
     ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage

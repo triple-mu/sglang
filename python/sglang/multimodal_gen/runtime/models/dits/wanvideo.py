@@ -492,7 +492,7 @@ class WanTransformerBlock(nn.Module):
         self,
         query: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> "fast_ulysses_backend.QKFusedCtx | None":
+    ) -> fast_ulysses_backend.QKFusedCtx | None:
         """Context for the fused cross-head QK RMSNorm + RoPE + input-a2a.
 
         None keeps the unfused norm/rope path. Every condition is identical
@@ -526,35 +526,137 @@ class WanTransformerBlock(nn.Module):
             eps=self.norm_q.variance_epsilon,
         )
 
-    def _maybe_async_v_input_a2a(
-        self, value: torch.Tensor
-    ) -> "fast_ulysses_backend.AsyncA2AHandle | None":
-        """Issue the v input a2a on the fast_ulysses comm stream so it overlaps
-        the q/k projections. Every condition is identical across SP ranks,
-        keeping the collective call pattern in lockstep. Unlike the QK fusion,
-        v has no norm/rope, so this works with the fusion on or off.
+    def _maybe_pipelined_qkv_ctx(
+        self,
+        dtype_probe: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> "fast_ulysses_backend.QKFusedCtx | None":
+        """Ctx for the fully pipelined QKV path (per-projection local fused
+        norm+rope + async a2a on the transfer path picked by
+        SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV). Same rank-uniform
+        conditions and weights/cos/sin as the fused QK ctx; takes precedence
+        over the QK fusion in forward.
         """
+        if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
+            return None
         if (
             not isinstance(self.attn1, USPAttention)
             or self.attn1.skip_sequence_parallel
         ):
             return None
-        return fast_ulysses_backend.maybe_async_input_a2a_v(v=value)
+        if not fast_ulysses_backend.can_use_pipelined_qkv(
+            num_heads=self.local_num_heads,
+            head_dim=self.dim_head,
+            dtype=dtype_probe.dtype,
+        ):
+            return None
+        if self._fast_qk_norm_weights_fp32 is None:
+            self._fast_qk_norm_weights_fp32 = (
+                self.norm_q.weight.detach().float().contiguous(),
+                self.norm_k.weight.detach().float().contiguous(),
+            )
+        weight_q, weight_k = self._fast_qk_norm_weights_fp32
+        cos, sin = freqs_cis
+        return fast_ulysses_backend.QKFusedCtx(
+            weight_q=weight_q,
+            weight_k=weight_k,
+            cos=cos.contiguous(),
+            sin=sin.contiguous(),
+            eps=self.norm_q.variance_epsilon,
+        )
 
-    def _maybe_async_qk_input_a2a(
-        self, query: torch.Tensor, key: torch.Tensor
-    ) -> "tuple[fast_ulysses_backend.AsyncA2AHandle, fast_ulysses_backend.AsyncA2AHandle] | None":
-        """Issue the q and k input a2as on the fast_ulysses comm stream, both
-        in flight at once, waited together inside USPAttention. Unfused path
-        only (the caller's norm/rope already ran). Every condition is
-        identical across SP ranks.
+    def _pipelined_qkv_attention(
+        self,
+        norm_hidden_states: torch.Tensor,
+        ctx: "fast_ulysses_backend.QKFusedCtx",
+    ) -> torch.Tensor:
+        """Fully pipelined QKV input a2a: each projection's a2a is issued as
+        soon as its local fused norm+rope finishes, overlapping the remaining
+        projections; the three handles are waited together inside attn1.
         """
-        if (
-            not isinstance(self.attn1, USPAttention)
-            or self.attn1.skip_sequence_parallel
-        ):
-            return None
-        return fast_ulysses_backend.maybe_async_input_a2a_qk(q=query, k=key)
+        hd = (self.local_num_heads, self.dim_head)
+        query, _ = self.to_q(norm_hidden_states)
+        query = fast_ulysses_backend.pipelined_norm_rope(
+            query.squeeze(1).unflatten(2, hd), weight=ctx.weight_q, ctx=ctx
+        )
+        hq = fast_ulysses_backend.pipelined_input_a2a(query, tag="usp_q")
+        key, _ = self.to_k(norm_hidden_states)
+        key = fast_ulysses_backend.pipelined_norm_rope(
+            key.squeeze(1).unflatten(2, hd), weight=ctx.weight_k, ctx=ctx
+        )
+        hk = fast_ulysses_backend.pipelined_input_a2a(key, tag="usp_k")
+        value, _ = self.to_v(norm_hidden_states)
+        value = value.squeeze(1).unflatten(2, hd)
+        hv = fast_ulysses_backend.pipelined_input_a2a(value, tag="usp_v")
+        return self.attn1(query, key, value, qkv_a2a_handles=(hq, hk, hv))
+
+    def _self_attention_a2a(
+        self,
+        norm_hidden_states: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Self-attention with the fused / plain Ulysses a2a paths."""
+        query, _ = self.to_q(norm_hidden_states)
+        key, _ = self.to_k(norm_hidden_states)
+        value, _ = self.to_v(norm_hidden_states)
+
+        fused_ctx = self._maybe_fast_qk_fused_ctx(query, freqs_cis)
+        if fused_ctx is not None:
+            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            return self.attn1(query, key, value, qk_fused_ctx=fused_ctx)
+        if self.norm_q is not None:
+            if self.tp_rmsnorm:
+                query = tensor_parallel_rms_norm(query, self.norm_q)
+            else:
+                query = self.norm_q(query)
+        if self.norm_k is not None:
+            if self.tp_rmsnorm:
+                key = tensor_parallel_rms_norm(key, self.norm_k)
+            else:
+                key = self.norm_k(key)
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+
+        # Apply rotary embeddings
+        cos, sin = freqs_cis
+        if _is_cuda and query.shape == key.shape:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
+            )
+        elif USE_AITER:
+            query_shape = query.shape
+            key_shape = key.shape
+            num_tokens = query.shape[:-2].numel()
+            q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
+            k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
+            cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
+            sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
+            rope_cached_2c_fwd_inplace(
+                q_sbhd,
+                k_sbhd,
+                cos_sbhd,
+                sin_sbhd,
+                1,  # GPTJ rotate style
+                True,  # reuse_freqs_front_part
+                False,  # nope_first
+            )
+            query = q_sbhd.view(query_shape)
+            key = k_sbhd.view(key_shape)
+        else:
+            query, key = _apply_rotary_emb(
+                query, cos, sin, is_neox_style=False
+            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        return self.attn1(query, key, value)
 
     def forward(
         self,
@@ -595,84 +697,13 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        # v first: its input a2a can run on the fast_ulysses comm stream while
-        # the q/k projections (plus norm/rope on the unfused path) fill the
-        # overlap window on the main stream.
-        value, _ = self.to_v(norm_hidden_states)
-        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        v_a2a_handle = self._maybe_async_v_input_a2a(value)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-
-        fused_ctx = self._maybe_fast_qk_fused_ctx(query, freqs_cis)
-        if fused_ctx is not None:
-            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            attn_output = self.attn1(
-                query, key, value, qk_fused_ctx=fused_ctx, v_a2a_handle=v_a2a_handle
+        pipelined_ctx = self._maybe_pipelined_qkv_ctx(norm_hidden_states, freqs_cis)
+        if pipelined_ctx is not None:
+            attn_output = self._pipelined_qkv_attention(
+                norm_hidden_states, pipelined_ctx
             )
         else:
-            if self.norm_q is not None:
-                if self.tp_rmsnorm:
-                    query = tensor_parallel_rms_norm(query, self.norm_q)
-                else:
-                    query = self.norm_q(query)
-            if self.norm_k is not None:
-                if self.tp_rmsnorm:
-                    key = tensor_parallel_rms_norm(key, self.norm_k)
-                else:
-                    key = self.norm_k(key)
-            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-
-            # Apply rotary embeddings
-            cos, sin = freqs_cis
-            if _is_cuda and query.shape == key.shape:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-                query, key = apply_flashinfer_rope_qk_inplace(
-                    query, key, cos_sin_cache, is_neox=False
-                )
-            elif USE_AITER:
-                query_shape = query.shape
-                key_shape = key.shape
-                num_tokens = query.shape[:-2].numel()
-                q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
-                k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
-                cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
-                sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
-                rope_cached_2c_fwd_inplace(
-                    q_sbhd,
-                    k_sbhd,
-                    cos_sbhd,
-                    sin_sbhd,
-                    1,  # GPTJ rotate style
-                    True,  # reuse_freqs_front_part
-                    False,  # nope_first
-                )
-                query = q_sbhd.view(query_shape)
-                key = k_sbhd.view(key_shape)
-            else:
-                query, key = _apply_rotary_emb(
-                    query, cos, sin, is_neox_style=False
-                ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-            qk_a2a_handles = self._maybe_async_qk_input_a2a(query, key)
-            if v_a2a_handle is not None or qk_a2a_handles is not None:
-                # Non-None handles imply attn1 is USPAttention.
-                attn_output = self.attn1(
-                    query,
-                    key,
-                    value,
-                    v_a2a_handle=v_a2a_handle,
-                    qk_a2a_handles=qk_a2a_handles,
-                )
-            else:
-                attn_output = self.attn1(query, key, value)
+            attn_output = self._self_attention_a2a(norm_hidden_states, freqs_cis)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
