@@ -622,6 +622,7 @@ class USPAttention(nn.Module):
         attn_mask_meta: dict | None = None,
         qk_fused_ctx: "fast_ulysses_backend.QKFusedCtx | None" = None,
         v_a2a_handle: "fast_ulysses_backend.AsyncA2AHandle | None" = None,
+        qk_a2a_handles: "tuple[fast_ulysses_backend.AsyncA2AHandle, fast_ulysses_backend.AsyncA2AHandle] | None" = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -649,6 +650,9 @@ class USPAttention(nn.Module):
                 set, the uniform Ulysses path takes its wait() output as v
                 (the passed-in v is the handle's input) and waits before the
                 q/k input collectives.
+            qk_a2a_handles: in-flight fast_ulysses async input a2as for q and
+                k (both issued, waited together). Mutually exclusive with
+                qk_fused_ctx; the passed-in q/k are the handles' inputs.
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -668,7 +672,7 @@ class USPAttention(nn.Module):
                 and num_replicated_kv_prefix == 0
                 and not effective_skip_sp
             ), "qk_fused_ctx is only supported on the uniform Ulysses path"
-        if v_a2a_handle is not None:
+        if v_a2a_handle is not None or qk_a2a_handles is not None:
             # A handle that strayed into a masked/replicated/skip-sp branch
             # would never be waited: numerically wrong AND a barrier-epoch
             # ordering hazard for the whole group. attn_mask_meta alone (tail
@@ -681,7 +685,10 @@ class USPAttention(nn.Module):
                 and num_replicated_kv_prefix == 0
                 and not effective_skip_sp
                 and not self.enable_packed_qkv_input_a2a
-            ), "v_a2a_handle is only supported on the uniform Ulysses path"
+            ), "async a2a handles are only supported on the uniform Ulysses path"
+        assert not (
+            qk_a2a_handles is not None and qk_fused_ctx is not None
+        ), "qk_a2a_handles and qk_fused_ctx are mutually exclusive"
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
@@ -984,18 +991,25 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            if v_a2a_handle is not None:
-                # Wait BEFORE the q/k input collectives: the fast_ulysses
-                # barrier epoch must execute in submission order (see
-                # maybe_async_input_a2a_v / fast_ulysses comm.py).
-                v = v_a2a_handle.wait()
-                if qk_fused_ctx is not None:
+            if v_a2a_handle is not None or qk_a2a_handles is not None:
+                # Wait every in-flight async handle BEFORE issuing any sync
+                # fast_ulysses collective: the barrier epoch must execute in
+                # submission order (see maybe_async_input_a2a_v / fast_ulysses
+                # comm.py). Hence the sync fallbacks below run after the waits.
+                if v_a2a_handle is not None:
+                    v = v_a2a_handle.wait()
+                if qk_a2a_handles is not None:
+                    q = qk_a2a_handles[0].wait()
+                    k = qk_a2a_handles[1].wait()
+                elif qk_fused_ctx is not None:
                     q, k = fast_ulysses_backend.qk2_input_a2a(
                         q=q, k=k, ctx=qk_fused_ctx
                     )
                 else:
                     q = _usp_input_all_to_all(q, head_dim=2, comm_tag="usp_q")
                     k = _usp_input_all_to_all(k, head_dim=2, comm_tag="usp_k")
+                if v_a2a_handle is None:
+                    v = _usp_input_all_to_all(v, head_dim=2, comm_tag="usp_v")
             elif qk_fused_ctx is not None:
                 # Fused cross-head RMSNorm + RoPE + input a2a for q/k (the
                 # caller skipped its own norm/rope); v has no norm/rope.

@@ -21,6 +21,17 @@ Not registered in CI (experimental). Run inside the ion-b200 container:
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A=1 \
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
+    # expected PASS (async q/k in flight together, sync v after the waits):
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A=1 \
+    torchrun --nproc_per_node=4 \
+        python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
+    # expected PASS (three async handles in flight: v + q + k):
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A=1 \
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A=1 \
+    torchrun --nproc_per_node=4 \
+        python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
 """
 
 import os
@@ -160,6 +171,46 @@ def test_async_v_parity(
     assert fast_ulysses_backend.fast_call_counts["a2a_async"] == base + 3
 
 
+def test_async_qk_parity(
+    rank: int, device: torch.device, world: int, *, with_v_async: bool
+) -> None:
+    """q and k a2as both in flight on the comm stream, waited together
+    (optionally with a third in-flight v handle). The sync v fallback runs
+    AFTER the waits, matching the dispatch's barrier-epoch ordering. Deferred
+    bitwise compares as in test_async_v_parity."""
+    filler = _rand((4096, 4096), 7 + rank, device)
+    base_qk = fast_ulysses_backend.fast_call_counts["a2a_async_qk"]
+    exact_checks: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+    for it in range(3):
+        q = _rand((B, S_LOCAL, H, D), 5000 * it + rank, device)
+        k = _rand((B, S_LOCAL, H, D), 6000 * it + rank, device)
+        v = _rand((B, S_LOCAL, H, D), 7000 * it + rank, device)
+        ref_q = _usp_input_all_to_all(q, head_dim=2)  # no tag -> NCCL
+        ref_k = _usp_input_all_to_all(k, head_dim=2)
+        ref_v = _usp_input_all_to_all(v, head_dim=2)
+        hv = fast_ulysses_backend.maybe_async_input_a2a_v(v=v) if with_v_async else None
+        hqk = fast_ulysses_backend.maybe_async_input_a2a_qk(q=q, k=k)
+        assert hqk is not None, "async q/k fast path not taken"
+        _ = filler @ filler  # main-stream compute inside the overlap window
+        if hv is not None:
+            fast_v = hv.wait()
+        fast_q = hqk[0].wait()
+        fast_k = hqk[1].wait()
+        # Clone right after the joint wait: a broken wait() leaves the a2as
+        # in flight and these reads race them.
+        exact_checks.append((f"q(iter {it})", fast_q.clone(), ref_q))
+        exact_checks.append((f"k(iter {it})", fast_k.clone(), ref_k))
+        if hv is None:
+            # Sync collective only AFTER all waits (barrier-epoch ordering).
+            fast_v = _usp_input_all_to_all(v, head_dim=2, comm_tag="usp_v")
+        exact_checks.append((f"v(iter {it})", fast_v.clone(), ref_v))
+        # Close the barrier chain like production's output a2a.
+        _usp_output_all_to_all(fast_v, head_dim=2, comm_tag="usp_out")
+    for name, fast, ref in exact_checks:
+        assert torch.equal(ref, fast), f"async-qk mismatch: {name}"
+    assert fast_ulysses_backend.fast_call_counts["a2a_async_qk"] == base_qk + 6
+
+
 def main() -> None:
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=1, sp_size=4, ulysses_degree=4
@@ -192,6 +243,21 @@ def main() -> None:
         assert fast_ulysses_backend.fast_call_counts["a2a_async"] == 0
         if rank == 0:
             print("async v disabled; verified no-op", flush=True)
+
+    if fast_ulysses_backend._async_qk_enabled():
+        test_async_qk_parity(
+            rank,
+            device,
+            world,
+            with_v_async=fast_ulysses_backend._async_v_enabled(),
+        )
+    else:
+        q = _rand((B, S_LOCAL, H, D), 56, device)
+        k = _rand((B, S_LOCAL, H, D), 57, device)
+        assert fast_ulysses_backend.maybe_async_input_a2a_qk(q=q, k=k) is None
+        assert fast_ulysses_backend.fast_call_counts["a2a_async_qk"] == 0
+        if rank == 0:
+            print("async qk disabled; verified no-op", flush=True)
 
     if rank == 0:
         print("PASS", flush=True)

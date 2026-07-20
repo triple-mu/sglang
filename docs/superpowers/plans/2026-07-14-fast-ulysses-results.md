@@ -231,9 +231,46 @@ fused_run1 视频（`A_cat_walks_slowly_towards_the_camera._20260715-013412_53f7
 - 时间轴切片显示根因比"coop GEMM 不释放 SM"更基础：该 eager 管线 host 开销大，to_q 与 to_k 两次 GEMM 之间本就有 ~370µs 主 stream 气泡，v scatter（~0.4-0.6ms）实际落在气泡里执行；且每 block 的大头是 ~44ms 的 attention kernel，qkv GEMM 窗口（~4ms）与 v a2a 都是小量。
 - 收益上限对账：v a2a 全隐藏的理论上限 ≈ 0.4ms × 80 次/步 ≈ 33ms/步，对 5.1s/步仅 ~0.6%；实测主 stream 气泡本来就吸收了 v 通信，故 async ≈ sync，e2e 打平在机制上闭环。
 
+### 追加：async q/k input a2a（2026-07-20，用户指定实验）
+
+设计：非融合路径上 q、k 的 mode0 a2a 也改异步——两个 handle 同时 in-flight（comm stream 上按提交序排队），进 attention 前联合 wait；v 无 handle 时其同步 a2a 移到 wait 之后（barrier epoch 顺序约束）。qk2 融合路径无 async 变体，该开关在融合开启时惰性。开关 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A`（默认关，依赖基础开关，与 ASYNC_V 正交）。
+
+| run | denoise (s) | 帧 MD5 |
+|---|---|---|
+| nofuse_anchor r1（对照） | 206.35 | `6eb208…` |
+| nofuse_async_qk r1（q/k 异步） | 206.02 | `6eb208…` ≡ anchor **逐位一致** |
+| nofuse_async_vqk r1（v+q+k 三 handle in-flight） | 206.25 | `6eb208…` ≡ anchor **逐位一致** |
+
+对拍：6 种开关组合全 PASS（3 回归 + async q/k 单开 + v/q/k 全开 + 全关预期失败）；async q/k 与 NCCL 逐位一致，含"sync v 在联合 wait 之后"的 epoch 顺序用例。
+
+结论：**可行但同样无收益**（≤0.3s，噪声级），机制与 async v 相同——非融合路径上 q/k 在同一个 in-place RoPE kernel 后同时就绪，issue 与 wait 之间没有主 stream 计算可重叠，且两次 a2a 在唯一一条 comm stream/NVLink 上本就串行。价值在于验证了库的多 handle in-flight 语义在生产调用序中的正确性。
+
+**GEMM×a2a 并发微基准（2026-07-20，`/data/bench/bench_overlap.py`，4×H200，排除 host 气泡因素）**：主 stream 跑 3×to_q 形状 nvjet GEMM（4.00ms），comm stream 并发跑 q 形状 mode0 a2a——SM 直写路径 a2a 0.48ms，串行 4.56ms vs 并发 4.69ms（隐藏率 **-26%**）；TMA 路径 a2a 0.53ms，串行 4.60ms vs 并发 4.70ms（**-20%**）。即：**该环境下 GEMM 与 fast_ulysses a2a 无法并发，反而多付调度开销**——nvjet 满占 SM block slot 且不释放，连 1 block 的 TMA kernel 都拿不到 slot，只能在 GEMM 间隙分时执行。库文档的 coop-gemm-blocks-a2a-overlap 结论在 H200 被干净复现。对照：Stage-1 nsys 归因显示旧 NCCL a2a（block 数少）反而能与计算部分重叠——"快通信（满 SM、不可叠）vs 慢通信（少 SM、可部分叠）"是真实 trade-off；真正的出路是 copy-engine 传输（不占 SM，库的 documented future work）或 SM carveout。
+
+**CE 可行性微基准（2026-07-20，`/data/bench/ce_bench.cu`，4×H200，单进程 peer-access 代理）**：a2a_4d 的每-peer 传输可分解为 `s_local` 行 × `n_local*d*2B` 的 2D pitched 拷贝（Wan/ws=4 即 18900×2560B，一侧 pitched 一侧连续）＝ `cudaMemcpy2DAsync` 硬件形态。实测：线性单 peer **385.6 GB/s**（单 CE 即打满源端 NVLink egress）；**pitched 2560B 行零损耗**（384.5 GB/s，无需 pack kernel）；3-peer 并发聚合 386 GB/s（源端 egress 450GB/s 封顶，符合 all-to-all 下界 0.376ms）；**SM 全部被 FMA spin kernel 占满时拷贝带宽纹丝不动**（386.0/385.2 GB/s）——CE 与计算的并行是构造性成立的。asyncEngineCount=3/卡。据此 CE 版 a2a 估算 ~0.4ms（vs 现 SM 路径 0.48ms 含 barrier），标配可叠；若 barrier 再改用 `cuStreamWriteValue/WaitValue`（stream memops，同样零 SM），整个 collective 可以完全不碰 SM。
+
+**CE 路径已在 fast-ulysses 库实现（2026-07-20，`/data/fast-ulysses-ce`，本地仓库工作区未提交）**：新 op `all_to_all_single_4d_ce(x, mode, tag)` + async 变体，per-peer `cudaMemcpy2DAsync` fan-out（组内惰性 stream/event 池）+ 共享 tag 缓冲与 barrier epoch，无 autotune 无 launch config。验证（动态挑空闲卡）：正确性 **ALL PASS**（ws=4 与 ws=2，各 18 个 CE 用例逐位一致：fp16/bf16 × d∈{64,128,256,512} × mode0/1，b=2 覆盖 per-(peer,b) 循环；base/ce 混排共享 epoch 完好；async 往返 ✓）。GEMM 隐藏率（交替测量取中位）：**ce +32%（ws=2）/+34%（ws=4）**，vs base ≈0%/-36%、tma +8%/-15%——CE 是唯一稳定正隐藏的路径；残余暴露主要是收尾的 flag barrier spin kernel 在 GEMM 间隙才能拿到 SM slot。附：`cuStreamWriteValue64/WaitValue64` 版 barrier 实测反而干扰并发 GEMM（DEFAULT -28%、NO_MEMORY_BARRIER -15%），已回退为 kernel barrier 并在代码中留档。构建注意：CUDA 13 需 `-DCMAKE_CXX_FLAGS=-I/usr/local/cuda/include/cccl`（libcu++ 移位）。
+
+**CE 提交策略 A/B —— 独占验证终版（2026-07-20，novita-h100 4×H100，ws=4 Wan shape，每实验：选卡前空闲检查 + 运行期 10s 采样进程数 + 收尾复核，三关全过标记 EXCLUSIVE_OK；早前未独占窗口的 serial 2.96ms/batch0 1.52ms 等坏数字均已被本轮推翻）**：
+
+正确性（ws=4，pool/serial/batch 三实现）：**全部 ALL PASS**（各 18 用例逐位一致）。
+
+| 实现（均 EXCLUSIVE_OK） | a2a | 吞吐 | 隐藏率 | 净暴露 |
+|---|---|---|---|---|
+| base (SM) | 0.521ms | 279 GB/s | 27% | 0.38ms |
+| tma | 0.530ms | 274 GB/s | 33% | 0.36ms |
+| **ce-pool（默认）** | 0.695ms | 209 GB/s | **93%** | **0.05ms** |
+| ce-serial | 0.824ms | 176 GB/s | 90% | 0.08ms |
+| ce-batch(hint=1) | 1.383ms | 105 GB/s | 90% | 0.14ms |
+| ce-batch(hint=0) | 0.827ms | 175 GB/s | 81% | 0.16ms |
+
+**H200 对照（hyper00 GPU 0,4,5,7 用户指定，7 实验全部一次 EXCLUSIVE_OK）**：正确性三实现 ALL PASS；base 0.481ms/302GB/s/25%、tma 0.526ms/276GB/s/38%、**ce-pool 0.694ms/209GB/s/94%（净暴露 0.04ms）**、ce-serial 0.825ms/93%、ce-batch(hint) 1.354ms/99%（净暴露 0.014ms 最低但占线 2 倍，仅适合孤立大窗口场景）、ce-batch(no hint) 0.824ms/92%。**与 H100 独占数字逐项一致到 1-2%**（两代同为 NVLink4 450GB/s），结论跨平台成立。
+
+结论：**batch 不能提升吞吐**（CUDA 13.3 驱动的 batch pitched 路径本身慢 ~40-60%，`PreferOverlapWithCompute` hint 再腰斩），serial 也不优于 pool；**pool 保持默认**，其净暴露 0.04-0.05ms/call，比 base/tma 低 ~7-9 倍。实验收口后（2026-07-20，用户决定）serial/batch 变体与 `FAST_ULYSSES_CE_IMPL` 开关已从库中删除，仅保留 pool 实现；实验结论以注释形式留档在 `all_to_all_ce.cu` 的 NOTE 中（防止未来重做同一实验）。API 坑记档：① batch 系 API 拒绝 legacy 默认流（invalid argument，需显式流）；② novita 机器需 `NCCL_NVLS_ENABLE=0`（Fabric Manager 不支持 NVLS）；③ 共享机上未独占的性能数字不可信——独占校验（运行期进程采样 + 端点复核）应成为该机 bench 的标配流程（脚本 `/data/fast-ulysses-ce/run_ws4_suite.sh`）。
+
 ### 结论与建议
 
-- 功能正确且默认关闭时零风险（v-first 纯重排，帧逐位不变）；`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A` **保持默认关、暂不进推荐 flag 组合**。
+- 功能正确且默认关闭时零风险（v-first 纯重排，帧逐位不变）；`SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A` 与 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A` **保持默认关、暂不进推荐 flag 组合**。
 - 该负载（Wan14B 720p，H200 ws=4，eager）下输入侧通信不在暴露的关键路径上，v-first overlap 无收益；B200 上的复验与更深的 head 分块流水（需先消除 host 气泡/降低 attention 占比才有意义）留待后续。
 - 产物：远程 hyper00 `/data/bench/{logs,results,videos,nsys}/`（`tma_flush`/`auto_flush` 为修复截断后的有效 trace）。
 

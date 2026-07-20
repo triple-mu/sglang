@@ -2,10 +2,11 @@
 
 Enabled via SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES (plus
 SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION for the fused QK norm+RoPE
-input a2a, and SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A for the
-async v input a2a that overlaps the q/k projections). Every entry point
-returns None / False when the fast path cannot serve the call, and callers
-must then run the NCCL path.
+input a2a, SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A for the async v
+input a2a that overlaps the q/k projections, and
+SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A for async q/k input a2a on
+the unfused path). Every entry point returns None / False when the fast path
+cannot serve the call, and callers must then run the NCCL path.
 
 Collective safety: every decision here (env flags, group topology, tensor
 shape/dtype) is identical across SP ranks under SPMD execution, so for a given
@@ -41,7 +42,12 @@ _MAX_WORLD_SIZE = 8
 
 # Calls actually served by the fast path; tests assert on these to catch
 # silent fallbacks.
-fast_call_counts: dict[str, int] = {"a2a": 0, "qk2": 0, "a2a_async": 0}
+fast_call_counts: dict[str, int] = {
+    "a2a": 0,
+    "qk2": 0,
+    "a2a_async": 0,
+    "a2a_async_qk": 0,
+}
 
 
 class QKFusedCtx(msgspec.Struct):
@@ -68,6 +74,13 @@ def _qk_fusion_enabled() -> bool:
 def _async_v_enabled() -> bool:
     return _a2a_enabled() and bool(
         envs.SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A
+    )
+
+
+@functools.cache
+def _async_qk_enabled() -> bool:
+    return _a2a_enabled() and bool(
+        envs.SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A
     )
 
 
@@ -182,6 +195,41 @@ def maybe_async_input_a2a_v(v: torch.Tensor) -> "AsyncA2AHandle | None":
     handle = group.all_to_all_single_4d_async(v, mode=0, tag="usp_v")
     fast_call_counts["a2a_async"] += 1
     return handle
+
+
+def maybe_async_input_a2a_qk(
+    q: torch.Tensor, k: torch.Tensor
+) -> "tuple[AsyncA2AHandle, AsyncA2AHandle] | None":
+    """Async mode0 a2a for q and k: both collectives are in flight on the
+    group's comm stream at once and the caller waits the two handles together.
+
+    Unfused path only -- the fused qk2 collective has no async variant. Same
+    ordering contract as maybe_async_input_a2a_v: the caller MUST wait BOTH
+    handles before issuing the next sync fast_ulysses collective (e.g. a sync
+    v a2a must run after the waits, not between issue and wait).
+
+    Returns None whenever the fast path cannot serve the call.
+    """
+    if not _async_qk_enabled():
+        return None
+    group = _get_group()
+    if group is None:
+        return None
+    world_size = get_ulysses_parallel_world_size()
+    if not (
+        _shape_ok(q, split_dim=2, world_size=world_size)
+        and _shape_ok(k, split_dim=2, world_size=world_size)
+    ):
+        return None
+    if is_in_breakable_cuda_graph():
+        # Same capture hazard as maybe_async_input_a2a_v.
+        return None
+    if fast_call_counts["a2a_async_qk"] == 0:
+        logger.info("fast_ulysses async q/k input a2a path active.")
+    hq = group.all_to_all_single_4d_async(q, mode=0, tag="usp_q")
+    hk = group.all_to_all_single_4d_async(k, mode=0, tag="usp_k")
+    fast_call_counts["a2a_async_qk"] += 2
+    return hq, hk
 
 
 def can_use_qk2(*, num_heads: int, head_dim: int, dtype: torch.dtype) -> bool:

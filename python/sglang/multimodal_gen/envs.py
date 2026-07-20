@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES: bool = False
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_QK_FUSION: bool = False
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A: bool = False
+    SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
@@ -275,6 +276,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # projections (requires SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES).
     "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_V_A2A"
+    ),
+    # Experimental: issue the Wan self-attention q and k input all-to-alls
+    # asynchronously (two handles in flight, waited together before
+    # attention). Unfused path only -- inert when the QK fusion is active
+    # (requires SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES).
+    "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_ASYNC_QK_A2A"
     ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage

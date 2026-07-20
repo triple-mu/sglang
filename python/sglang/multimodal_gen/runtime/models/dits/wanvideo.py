@@ -541,6 +541,21 @@ class WanTransformerBlock(nn.Module):
             return None
         return fast_ulysses_backend.maybe_async_input_a2a_v(v=value)
 
+    def _maybe_async_qk_input_a2a(
+        self, query: torch.Tensor, key: torch.Tensor
+    ) -> "tuple[fast_ulysses_backend.AsyncA2AHandle, fast_ulysses_backend.AsyncA2AHandle] | None":
+        """Issue the q and k input a2as on the fast_ulysses comm stream, both
+        in flight at once, waited together inside USPAttention. Unfused path
+        only (the caller's norm/rope already ran). Every condition is
+        identical across SP ranks.
+        """
+        if (
+            not isinstance(self.attn1, USPAttention)
+            or self.attn1.skip_sequence_parallel
+        ):
+            return None
+        return fast_ulysses_backend.maybe_async_input_a2a_qk(q=query, k=key)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -646,9 +661,16 @@ class WanTransformerBlock(nn.Module):
                 query, key = _apply_rotary_emb(
                     query, cos, sin, is_neox_style=False
                 ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-            if v_a2a_handle is not None:
-                # A non-None handle implies attn1 is USPAttention.
-                attn_output = self.attn1(query, key, value, v_a2a_handle=v_a2a_handle)
+            qk_a2a_handles = self._maybe_async_qk_input_a2a(query, key)
+            if v_a2a_handle is not None or qk_a2a_handles is not None:
+                # Non-None handles imply attn1 is USPAttention.
+                attn_output = self.attn1(
+                    query,
+                    key,
+                    value,
+                    v_a2a_handle=v_a2a_handle,
+                    qk_a2a_handles=qk_a2a_handles,
+                )
             else:
                 attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
