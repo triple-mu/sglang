@@ -621,7 +621,9 @@ class USPAttention(nn.Module):
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
         qk_fused_ctx: fast_ulysses_backend.QKFusedCtx | None = None,
-        qkv_a2a_handles: tuple[fast_ulysses_backend.AsyncA2AHandle, ...] | None = None,
+        qkv_a2a_handles: (
+            tuple["fast_ulysses_backend.AsyncA2AHandle", ...] | None
+        ) = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
