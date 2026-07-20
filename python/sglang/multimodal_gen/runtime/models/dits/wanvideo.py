@@ -526,68 +526,40 @@ class WanTransformerBlock(nn.Module):
             eps=self.norm_q.variance_epsilon,
         )
 
-    def _maybe_pipelined_qkv_ctx(
-        self,
-        dtype_probe: torch.Tensor,
-        freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> "fast_ulysses_backend.QKFusedCtx | None":
-        """Ctx for the fully pipelined QKV path (per-projection local fused
-        norm+rope + async a2a on the transfer path picked by
-        SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV). Same rank-uniform
-        conditions and weights/cos/sin as the fused QK ctx; takes precedence
+    def _use_pipelined_qkv(self, dtype_probe: torch.Tensor) -> bool:
+        """Rank-uniform gate for the fully pipelined QKV path (native local
+        norm/rope, one async a2a per tensor, v issued first). Takes precedence
         over the QK fusion in forward.
         """
-        if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
-            return None
         if (
             not isinstance(self.attn1, USPAttention)
             or self.attn1.skip_sequence_parallel
         ):
-            return None
-        if not fast_ulysses_backend.can_use_pipelined_qkv(
+            return False
+        return fast_ulysses_backend.can_use_pipelined_qkv(
             num_heads=self.local_num_heads,
             head_dim=self.dim_head,
             dtype=dtype_probe.dtype,
-        ):
-            return None
-        if self._fast_qk_norm_weights_fp32 is None:
-            self._fast_qk_norm_weights_fp32 = (
-                self.norm_q.weight.detach().float().contiguous(),
-                self.norm_k.weight.detach().float().contiguous(),
-            )
-        weight_q, weight_k = self._fast_qk_norm_weights_fp32
-        cos, sin = freqs_cis
-        return fast_ulysses_backend.QKFusedCtx(
-            weight_q=weight_q,
-            weight_k=weight_k,
-            cos=cos.contiguous(),
-            sin=sin.contiguous(),
-            eps=self.norm_q.variance_epsilon,
         )
 
     def _pipelined_qkv_attention(
         self,
         norm_hidden_states: torch.Tensor,
-        ctx: "fast_ulysses_backend.QKFusedCtx",
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """Fully pipelined QKV input a2a: each projection's a2a is issued as
-        soon as its local fused norm+rope finishes, overlapping the remaining
-        projections; the three handles are waited together inside attn1.
+        """Fully pipelined QKV input a2a: v has no norm/rope, so it is
+        projected and issued first -- its transfer hides under the q/k
+        projections and norm/rope; q and k are issued right after. The three
+        handles are waited together inside attn1.
         """
-        hd = (self.local_num_heads, self.dim_head)
-        query, _ = self.to_q(norm_hidden_states)
-        query = fast_ulysses_backend.pipelined_norm_rope(
-            query.squeeze(1).unflatten(2, hd), weight=ctx.weight_q, ctx=ctx
-        )
-        hq = fast_ulysses_backend.pipelined_input_a2a(query, tag="usp_q")
-        key, _ = self.to_k(norm_hidden_states)
-        key = fast_ulysses_backend.pipelined_norm_rope(
-            key.squeeze(1).unflatten(2, hd), weight=ctx.weight_k, ctx=ctx
-        )
-        hk = fast_ulysses_backend.pipelined_input_a2a(key, tag="usp_k")
         value, _ = self.to_v(norm_hidden_states)
-        value = value.squeeze(1).unflatten(2, hd)
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         hv = fast_ulysses_backend.pipelined_input_a2a(value, tag="usp_v")
+        query, _ = self.to_q(norm_hidden_states)
+        key, _ = self.to_k(norm_hidden_states)
+        query, key = self._qk_norm_rope(query, key, freqs_cis)
+        hq = fast_ulysses_backend.pipelined_input_a2a(query, tag="usp_q")
+        hk = fast_ulysses_backend.pipelined_input_a2a(key, tag="usp_k")
         return self.attn1(query, key, value, qkv_a2a_handles=(hq, hk, hv))
 
     def _self_attention_a2a(
@@ -606,6 +578,18 @@ class WanTransformerBlock(nn.Module):
             key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
             value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
             return self.attn1(query, key, value, qk_fused_ctx=fused_ctx)
+        query, key = self._qk_norm_rope(query, key, freqs_cis)
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        return self.attn1(query, key, value)
+
+    def _qk_norm_rope(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Native QK norm + reshape + rotary embedding (shared by the plain
+        and pipelined attention paths)."""
         if self.norm_q is not None:
             if self.tp_rmsnorm:
                 query = tensor_parallel_rms_norm(query, self.norm_q)
@@ -618,7 +602,6 @@ class WanTransformerBlock(nn.Module):
                 key = self.norm_k(key)
         query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
@@ -656,7 +639,7 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        return self.attn1(query, key, value)
+        return query, key
 
     def forward(
         self,
@@ -697,11 +680,8 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        pipelined_ctx = self._maybe_pipelined_qkv_ctx(norm_hidden_states, freqs_cis)
-        if pipelined_ctx is not None:
-            attn_output = self._pipelined_qkv_attention(
-                norm_hidden_states, pipelined_ctx
-            )
+        if self._use_pipelined_qkv(norm_hidden_states):
+            attn_output = self._pipelined_qkv_attention(norm_hidden_states, freqs_cis)
         else:
             attn_output = self._self_attention_a2a(norm_hidden_states, freqs_cis)
         attn_output = attn_output.flatten(2)

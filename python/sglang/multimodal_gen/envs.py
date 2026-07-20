@@ -266,10 +266,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES"
     ),
-    # Fully pipelined Wan QKV input a2a instead of the fused QK path: each
-    # projection is followed by a local fused norm+rope
-    # (fast_ulysses.norm_rope) and its async a2a; the three handles are
-    # waited together before attention (requires the flag above).
+    # Fully pipelined Wan QKV input a2a instead of the fused QK path: v is
+    # projected and issued first (no norm/rope), q/k follow after the model's
+    # native norm/rope; the three handles are waited together before
+    # attention (requires the flag above; works with an a2a-only
+    # fast_ulysses build).
     "SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV": _lazy_bool(
         "SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV"
     ),

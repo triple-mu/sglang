@@ -99,44 +99,39 @@ def test_qk2_parity(rank: int, device: torch.device, world: int) -> None:
 
 
 def test_pipelined_parity(rank: int, device: torch.device, world: int) -> None:
-    """Production-shaped pipelined QKV sequence: per-tensor local fused
-    norm+rope + async a2a (q, then k, then v), the three handles waited
-    together, then the output a2a. Deferred compares keep the loop free of
-    host syncs so the iterations pipeline and pressure the tag-buffer reuse;
-    the clones right after the waits race a broken wait() while the a2a is
-    still in flight."""
+    """Production-shaped pipelined QKV sequence: three async a2as issued
+    v-first (v, then q, then k -- v has no norm/rope so it goes out earliest),
+    waited together, then the output a2a. Pure data movement (norm/rope stays
+    in the model), so every compare is bitwise. Deferred compares keep the
+    loop free of host syncs so the iterations pipeline and pressure the
+    tag-buffer reuse; the clones right after the waits race a broken wait()
+    while the a2a is still in flight."""
     filler = _rand((4096, 4096), 7 + rank, device)
-    ctx, wq, wk, cos, sin = _make_qk_ctx(device)
     base = fast_ulysses_backend.fast_call_counts["a2a_async"]
     exact_checks: list[tuple[str, torch.Tensor, torch.Tensor]] = []
-    close_checks: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     for it in range(3):
+        v = _rand((B, S_LOCAL, H, D), 1000 * it + rank, device)
         q = _rand((B, S_LOCAL, H, D), 2000 * it + rank, device)
         k = _rand((B, S_LOCAL, H, D), 3000 * it + rank, device)
-        v = _rand((B, S_LOCAL, H, D), 1000 * it + rank, device)
-        rq = _usp_input_all_to_all(_ref_norm_rope(q, wq, cos, sin, ctx.eps), head_dim=2)
-        rk = _usp_input_all_to_all(_ref_norm_rope(k, wk, cos, sin, ctx.eps), head_dim=2)
         ref_v = _usp_input_all_to_all(v, head_dim=2)  # no tag -> NCCL
+        ref_q = _usp_input_all_to_all(q, head_dim=2)
+        ref_k = _usp_input_all_to_all(k, head_dim=2)
 
-        nq = fast_ulysses_backend.pipelined_norm_rope(q, weight=wq, ctx=ctx)
-        hq = fast_ulysses_backend.pipelined_input_a2a(nq, tag="usp_q")
-        nk = fast_ulysses_backend.pipelined_norm_rope(k, weight=wk, ctx=ctx)
-        hk = fast_ulysses_backend.pipelined_input_a2a(nk, tag="usp_k")
         hv = fast_ulysses_backend.pipelined_input_a2a(v, tag="usp_v")
+        hq = fast_ulysses_backend.pipelined_input_a2a(q, tag="usp_q")
+        hk = fast_ulysses_backend.pipelined_input_a2a(k, tag="usp_k")
         _ = filler @ filler  # main-stream compute inside the overlap window
+        fv = hv.wait()
         fq = hq.wait()
         fk = hk.wait()
-        fv = hv.wait()
-        close_checks.append((f"q(iter {it})", fq.clone(), rq))
-        close_checks.append((f"k(iter {it})", fk.clone(), rk))
         exact_checks.append((f"v(iter {it})", fv.clone(), ref_v))
+        exact_checks.append((f"q(iter {it})", fq.clone(), ref_q))
+        exact_checks.append((f"k(iter {it})", fk.clone(), ref_k))
         # Close the barrier chain like production's output a2a; this is also
         # the cross-rank ordering anchor for the next iteration's buffer reuse.
         _usp_output_all_to_all(fv, head_dim=2, comm_tag="usp_out")
     for name, fast, ref in exact_checks:
         assert torch.equal(ref, fast), f"pipelined mismatch: {name}"
-    for name, fast, ref in close_checks:
-        torch.testing.assert_close(fast, ref, atol=2e-2, rtol=2e-2, msg=name)
     assert fast_ulysses_backend.fast_call_counts["a2a_async"] == base + 9
 
 

@@ -5,7 +5,8 @@ Env surface (see envs.py):
   fast_ulysses, with the Wan cross-head QK RMSNorm + RoPE fused into the input
   a2a (qk2) when eligible.
 - SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV: fully pipelined QKV input a2a
-  instead of the fused path (per-projection local norm+rope + async a2a).
+  instead of the fused path (model-native local norm/rope, one async a2a per
+  tensor, v issued first). Works against an a2a-only fast_ulysses build.
 - SGLANG_DIFFUSION_FAST_ULYSSES_TYPE: transfer path for the non-fused calls,
   none (library default routing) / base (SM scatter) / tma / ce (copy engine).
 
@@ -176,7 +177,13 @@ def can_use_qk2(*, num_heads: int, head_dim: int, dtype: torch.dtype) -> bool:
     """Rank-invariant pre-check so the model can skip its own norm/rope."""
     if not _a2a_enabled():
         return False
-    if _get_group() is None:
+    group = _get_group()
+    if group is None:
+        return False
+    # Feature detection, not defensive access: the fused qk2 op only exists on
+    # fast_ulysses builds from the examples/qk-norm-rope-fusion branch; the
+    # a2a-only core falls back to the model's native norm/rope + plain a2a.
+    if not hasattr(group, "all_to_all_single_4d_qk2"):
         return False
     world_size = get_ulysses_parallel_world_size()
     return (
@@ -214,11 +221,11 @@ def qk2_input_a2a(
 
 
 def can_use_pipelined_qkv(*, num_heads: int, head_dim: int, dtype: torch.dtype) -> bool:
-    """Rank-invariant pre-check for the pipelined QKV path: same shape/dtype
-    envelope as the fused QK path (norm_rope shares its kernel limits) plus a
-    usable group and no CUDA graph capture (the async launch uses
-    Tensor.record_stream + cross-stream events, both illegal under capture;
-    the BCG scope flag flips in SPMD lockstep, so this stays rank-uniform)."""
+    """Rank-invariant pre-check for the pipelined QKV path: the plain-a2a
+    shape/dtype envelope plus a usable group and no CUDA graph capture (the
+    async launch uses Tensor.record_stream + cross-stream events, both illegal
+    under capture; the BCG scope flag flips in SPMD lockstep, so this stays
+    rank-uniform)."""
     if not _pipeline_qkv_enabled():
         return False
     if _get_group() is None:
@@ -229,28 +236,14 @@ def can_use_pipelined_qkv(*, num_heads: int, head_dim: int, dtype: torch.dtype) 
     return (
         dtype in (torch.bfloat16, torch.float16)
         and num_heads % world_size == 0
-        and head_dim >= 2
-        and (head_dim & (head_dim - 1)) == 0
-        and head_dim * dtype.itemsize >= 32
-    )
-
-
-def pipelined_norm_rope(
-    x: torch.Tensor, *, weight: torch.Tensor, ctx: QKFusedCtx
-) -> torch.Tensor:
-    """Local fused cross-head RMSNorm + interleaved RoPE (fast_ulysses.norm_rope,
-    all-fp32 single pass) for one tensor of the pipelined QKV path."""
-    from fast_ulysses import norm_rope
-
-    return norm_rope(
-        x, weight, ctx.cos, ctx.sin, mode="cross_head", interleaved=True, eps=ctx.eps
+        and (head_dim * dtype.itemsize) % 16 == 0
     )
 
 
 def pipelined_input_a2a(x: torch.Tensor, *, tag: str) -> "AsyncA2AHandle":
     """Async mode0 a2a on the transfer path selected by
     SGLANG_DIFFUSION_FAST_ULYSSES_TYPE. Caller must have checked
-    can_use_pipelined_qkv().
+    can_use_pipelined_qkv(); production issue order is v, then q, then k.
 
     The caller MUST wait() every handle before issuing the next sync
     fast_ulysses collective on the main stream: the per-group barrier epoch is
