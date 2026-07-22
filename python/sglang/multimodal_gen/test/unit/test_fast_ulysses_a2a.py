@@ -117,9 +117,9 @@ def test_pipelined_parity(rank: int, device: torch.device, world: int) -> None:
         ref_q = _usp_input_all_to_all(q, head_dim=2)
         ref_k = _usp_input_all_to_all(k, head_dim=2)
 
-        hv = fast_ulysses_backend.pipelined_input_a2a(v, tag="usp_v")
-        hq = fast_ulysses_backend.pipelined_input_a2a(q, tag="usp_q")
-        hk = fast_ulysses_backend.pipelined_input_a2a(k, tag="usp_k")
+        hv = fast_ulysses_backend.pipelined_input_a2a(v, tag="usp_v", barrier=False)
+        hq = fast_ulysses_backend.pipelined_input_a2a(q, tag="usp_q", barrier=False)
+        hk = fast_ulysses_backend.pipelined_input_a2a(k, tag="usp_k", barrier=True)
         _ = filler @ filler  # main-stream compute inside the overlap window
         fv = hv.wait()
         fq = hq.wait()

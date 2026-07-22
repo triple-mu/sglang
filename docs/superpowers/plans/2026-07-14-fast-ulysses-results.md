@@ -292,6 +292,22 @@ sglang 侧新增 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES_CE_A2A`（依赖基础开
 
 **环境面收敛（用户决定）**：只保留 `SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES`（qk2 融合并入默认行为）、`SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV`（bool，流水替代融合）、`SGLANG_DIFFUSION_FAST_ULYSSES_TYPE`（none/base/tma/ce，非融合 a2a 的传输路径，none=库默认自动路由）；删除 QK_FUSION/ASYNC_V_A2A/ASYNC_QK_A2A/CE_A2A 及全部关联死代码，layer 接口合并为 `qkv_a2a_handles` 三元组。语义回归（独立选卡）：5 组单测全符合预期；e2e `FAST=1` ≡ 融合锚点 `5c9980…`（205.37s）、`PIPELINE=1 TYPE=ce` ≡ `57f7963e…`（205.41s），**两个推荐配置并驾齐驱**。
 
+### 追加：native norm/rope 回归 + v-first 顺序（2026-07-20，用户指定）
+
+用户要求取消流水路径里 fast-ulysses 的 norm/rope（回用 sglang 原生 norm_q/norm_k + flashinfer rope），并把通信顺序改为 **v 先发、再 q/k**（v 无 norm/rope，最早就绪，掩盖窗口最大）。实现：`wanvideo.py` 新增 `_pipelined_qkv_attention`（to_v→v a2a 异步→to_q/to_k→共享 `_qk_norm_rope`→q/k a2a 异步→attention 内统一 wait）。语义结果随之改变——流水路径 MD5 从 `57f7963e…`（norm_rope 融合语义）变为 **`6eb208cb…`，与原生非融合锚点逐位一致**（数值路径完全回归原生）。e2e denoise 205.45-205.7s，与此前持平。
+
+### 追加：输入组共享 barrier（3→1）与 consumer-signal（2026-07-20，DeepEP 参照）
+
+用户观察到流水开启后每 block 输入侧有 3 个同步 kernel，问能否一次同步；随后进一步要求降低占 SM 的 barrier 开销（参考 DeepEP）。两步演进（均为 CE 流水路径，4×H200 空闲卡，红线：帧 MD5 ≡ `6eb208cb…`）：
+
+**第一步：deferred barrier（库 commit `66d9304`）**。`all_to_all_single_4d[_ce]` 增加 `barrier: bool = True`；`barrier=False` 跳过 quiet+fast_barrier，把组内握手推迟到最后一个 `barrier=True` 调用（quiet 是 per-PE 全局的，最后一次覆盖之前全部 deferred 写）。sglang 侧 v/q 传 `barrier=False`、k 携带唯一 barrier。nsys：barrier kernel 1280→640/请求（输入侧每 block 3→1）；denoise 205.45s。
+
+**第二步：consumer-signal（库 commit `c581afe`）**。DeepEP 调研结论：其 low-latency 路径用 `st.release.sys` 写 tail flag + 接收端 `ld.acquire` 自旋（put-with-signal）、recv_hook 把"发起"与"等待"拆开（发起后 0 SM 占用）、通篇不用 stream memops（与我们实测 memops 伤并发 GEMM 的结论一致）。据此实现 arrive/wait 拆分：
+- `signal_arrive`（comm stream）：epoch 字节（`epoch & 0xFF`，跳 0）经 **1 字节 `cudaMemsetAsync` CE 写**入每个 rank 的 flag 槽——到达通告零 SM，不会被满 SM 的 GEMM 饿死，也不会因本 rank barrier kernel 被调度延迟而拖累 peer。
+- `signal_wait`（消费者 stream）：1-block poll kernel，单 lane `ld.acquire.sys` 读 8 字节 flag 字直到全部 rank 字节相等——字节相等协议免 reset/免回绕；数据一到即放行，砍掉 barrier 退出→event→stream-wait 的跳链。
+
+验证（e2e 两轮 + 4 步 nsys）：**comm stream 同步 kernel 320→0**；主 stream 新增 `signal_wait` 320 个、忙时 149.4ms ≈ 旧 comm-stream barrier 的 150.6ms（本质是等数据，守恒——证实原 barrier 忙时几乎全是通信暴露而非握手开销）；out 侧 a2a barrier 320 个不变（389ms，同为通信暴露）。denoise 205.50/205.70s，与 one-barrier 版（205.45）持平——结构收益（comm stream 零同步 kernel、无 SM 争抢、无 event 跳链）在当前负载下不折现为 walltime，因为该等待由数据到达时刻决定；其价值在 SM 更拥挤或未来做 PDL 化时显现。
+
 ### 结论与建议
 
 - 生产推荐两选一（性能等价，~205.4s）：`ENABLE_FAST_ULYSSES=1`（融合，最简）或 `ENABLE_FAST_ULYSSES=1 + PIPELINE_QKV=1 + TYPE=ce`（流水+CE，通信隐藏形态，为未来更大 overlap 场景铺路）。

@@ -240,10 +240,30 @@ def can_use_pipelined_qkv(*, num_heads: int, head_dim: int, dtype: torch.dtype) 
     )
 
 
-def pipelined_input_a2a(x: torch.Tensor, *, tag: str) -> "AsyncA2AHandle":
+class _SignalledHandle:
+    """Handle for the last call of a consumer-signalled CE group: wait() joins this
+    rank's local copies (event) and launches the consumer-signal poll kernel on the
+    caller's stream -- remote data of the WHOLE group is guaranteed after this wait."""
+
+    def __init__(self, inner, group):
+        self._inner = inner
+        self._group = group
+
+    def wait(self):
+        out = self._inner.wait()
+        self._group.signal_wait()
+        return out
+
+
+def pipelined_input_a2a(
+    x: torch.Tensor, *, tag: str, barrier: bool
+) -> "AsyncA2AHandle":
     """Async mode0 a2a on the transfer path selected by
     SGLANG_DIFFUSION_FAST_ULYSSES_TYPE. Caller must have checked
-    can_use_pipelined_qkv(); production issue order is v, then q, then k.
+    can_use_pipelined_qkv(); production issue order is v, then q, then k, with
+    barrier=True only on the last call -- the whole group shares ONE
+    completion handshake, and remote data is guaranteed only after the
+    barrier-carrying handle's wait() (all three are waited before attention).
 
     The caller MUST wait() every handle before issuing the next sync
     fast_ulysses collective on the main stream: the per-group barrier epoch is
@@ -259,10 +279,16 @@ def pipelined_input_a2a(x: torch.Tensor, *, tag: str) -> "AsyncA2AHandle":
     if fast_call_counts["a2a_async"] == 0:
         logger.info("fast_ulysses pipelined qkv input a2a path active (%s).", a2a_type)
     if a2a_type == "ce":
-        handle = group.all_to_all_single_4d_ce_async(x, mode=0, tag=tag)
+        # The CE group never runs a barrier kernel on the comm stream: the last call
+        # appends CE-written arrival flags (zero SM) and its handle's wait() launches
+        # the poll on the consumer stream instead (DeepEP-style arrive/wait split).
+        handle = group.all_to_all_single_4d_ce_async(x, mode=0, tag=tag, barrier=False)
+        if barrier:
+            group.signal_arrive_async()
+            handle = _SignalledHandle(handle, group)
     else:
         handle = group.all_to_all_single_4d_async(
-            x, mode=0, tag=tag, use_tma=_USE_TMA_BY_TYPE[a2a_type]
+            x, mode=0, tag=tag, use_tma=_USE_TMA_BY_TYPE[a2a_type], barrier=barrier
         )
     fast_call_counts["a2a_async"] += 1
     return handle

@@ -554,12 +554,13 @@ class WanTransformerBlock(nn.Module):
         """
         value, _ = self.to_v(norm_hidden_states)
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        hv = fast_ulysses_backend.pipelined_input_a2a(value, tag="usp_v")
+        hv = fast_ulysses_backend.pipelined_input_a2a(value, tag="usp_v", barrier=False)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         query, key = self._qk_norm_rope(query, key, freqs_cis)
-        hq = fast_ulysses_backend.pipelined_input_a2a(query, tag="usp_q")
-        hk = fast_ulysses_backend.pipelined_input_a2a(key, tag="usp_k")
+        hq = fast_ulysses_backend.pipelined_input_a2a(query, tag="usp_q", barrier=False)
+        # The last call carries the ONE shared barrier for all three transfers.
+        hk = fast_ulysses_backend.pipelined_input_a2a(key, tag="usp_k", barrier=True)
         return self.attn1(query, key, value, qkv_a2a_handles=(hq, hk, hv))
 
     def _self_attention_a2a(
