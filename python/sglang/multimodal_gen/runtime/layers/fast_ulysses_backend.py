@@ -2,12 +2,11 @@
 
 Env surface (see envs.py):
 - SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES: route the uniform Ulysses a2a through
-  fast_ulysses, with the Wan cross-head QK RMSNorm + RoPE fused into the input
-  a2a (qk2) when eligible.
+  fast_ulysses.
 - SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV: fully pipelined QKV input a2a
-  instead of the fused path (model-native local norm/rope, one async a2a per
-  tensor, v issued first). Works against an a2a-only fast_ulysses build.
-- SGLANG_DIFFUSION_FAST_ULYSSES_TYPE: transfer path for the non-fused calls,
+  (per-tensor norm+rope, one async a2a per tensor, v issued first; q's a2a
+  overlaps k's projection).
+- SGLANG_DIFFUSION_FAST_ULYSSES_TYPE: transfer path,
   none (library default routing) / base (SM scatter) / tma / ce (copy engine).
 
 Every entry point returns None / False when the fast path cannot serve the
@@ -22,7 +21,6 @@ import functools
 import logging
 from typing import TYPE_CHECKING
 
-import msgspec
 import torch
 import torch.distributed as dist
 
@@ -31,6 +29,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -47,17 +46,7 @@ _MAX_WORLD_SIZE = 8
 
 # Calls actually served by the fast path; tests assert on these to catch
 # silent fallbacks.
-fast_call_counts: dict[str, int] = {"a2a": 0, "qk2": 0, "a2a_async": 0}
-
-
-class QKFusedCtx(msgspec.Struct):
-    """Inputs for the fused / pipelined cross-head QK RMSNorm + RoPE."""
-
-    weight_q: torch.Tensor  # fp32 [num_heads * head_dim]
-    weight_k: torch.Tensor  # fp32 [num_heads * head_dim]
-    cos: torch.Tensor  # fp32 [s_local, head_dim // 2]
-    sin: torch.Tensor  # fp32 [s_local, head_dim // 2]
-    eps: float
+fast_call_counts: dict[str, int] = {"a2a": 0, "a2a_async": 0}
 
 
 @functools.cache
@@ -163,61 +152,15 @@ def maybe_all_to_all_4d(x: torch.Tensor, *, mode: int, tag: str) -> torch.Tensor
     ):
         return None
     a2a_type = _a2a_type()
-    if a2a_type == "ce":
-        out = group.all_to_all_single_4d_ce(x, mode=mode, tag=tag)
-    else:
-        out = group.all_to_all_single_4d(
-            x, mode=mode, tag=tag, use_tma=_USE_TMA_BY_TYPE[a2a_type]
-        )
+    with maybe_nvtx_range(f"fu::a2a[{tag}] mode={mode} type={a2a_type}"):
+        if a2a_type == "ce":
+            out = group.all_to_all_single_4d_ce(x, mode=mode, tag=tag)
+        else:
+            out = group.all_to_all_single_4d(
+                x, mode=mode, tag=tag, use_tma=_USE_TMA_BY_TYPE[a2a_type]
+            )
     fast_call_counts["a2a"] += 1
     return out
-
-
-def can_use_qk2(*, num_heads: int, head_dim: int, dtype: torch.dtype) -> bool:
-    """Rank-invariant pre-check so the model can skip its own norm/rope."""
-    if not _a2a_enabled():
-        return False
-    group = _get_group()
-    if group is None:
-        return False
-    # Feature detection, not defensive access: the fused qk2 op only exists on
-    # fast_ulysses builds from the examples/qk-norm-rope-fusion branch; the
-    # a2a-only core falls back to the model's native norm/rope + plain a2a.
-    if not hasattr(group, "all_to_all_single_4d_qk2"):
-        return False
-    world_size = get_ulysses_parallel_world_size()
-    return (
-        dtype in (torch.bfloat16, torch.float16)
-        and num_heads % world_size == 0
-        and head_dim >= 2
-        and (head_dim & (head_dim - 1)) == 0
-        and head_dim * dtype.itemsize >= 32
-    )
-
-
-def qk2_input_a2a(
-    q: torch.Tensor, k: torch.Tensor, *, ctx: QKFusedCtx
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused cross-head RMSNorm + RoPE + mode0 a2a for q and k in one
-    collective. Caller must have checked can_use_qk2()."""
-    group = _get_group()
-    assert group is not None, "qk2_input_a2a requires can_use_qk2() == True"
-    if fast_call_counts["qk2"] == 0:
-        logger.info("fast_ulysses fused QK norm+RoPE+a2a path active.")
-    out_q, out_k = group.all_to_all_single_4d_qk2(
-        q,
-        k,
-        ctx.weight_q,
-        ctx.weight_k,
-        ctx.cos,
-        ctx.sin,
-        mode="cross_head",
-        interleaved=True,
-        eps=ctx.eps,
-        tag="usp_qk",
-    )
-    fast_call_counts["qk2"] += 1
-    return out_q, out_k
 
 
 def can_use_pipelined_qkv(*, num_heads: int, head_dim: int, dtype: torch.dtype) -> bool:
@@ -238,21 +181,6 @@ def can_use_pipelined_qkv(*, num_heads: int, head_dim: int, dtype: torch.dtype) 
         and num_heads % world_size == 0
         and (head_dim * dtype.itemsize) % 16 == 0
     )
-
-
-class _SignalledHandle:
-    """Handle for the last call of a consumer-signalled CE group: wait() joins this
-    rank's local copies (event) and launches the consumer-signal poll kernel on the
-    caller's stream -- remote data of the WHOLE group is guaranteed after this wait."""
-
-    def __init__(self, inner, group):
-        self._inner = inner
-        self._group = group
-
-    def wait(self):
-        out = self._inner.wait()
-        self._group.signal_wait()
-        return out
 
 
 def pipelined_input_a2a(
@@ -278,17 +206,14 @@ def pipelined_input_a2a(
     a2a_type = _a2a_type()
     if fast_call_counts["a2a_async"] == 0:
         logger.info("fast_ulysses pipelined qkv input a2a path active (%s).", a2a_type)
-    if a2a_type == "ce":
-        # The CE group never runs a barrier kernel on the comm stream: the last call
-        # appends CE-written arrival flags (zero SM) and its handle's wait() launches
-        # the poll on the consumer stream instead (DeepEP-style arrive/wait split).
-        handle = group.all_to_all_single_4d_ce_async(x, mode=0, tag=tag, barrier=False)
-        if barrier:
-            group.signal_arrive_async()
-            handle = _SignalledHandle(handle, group)
-    else:
-        handle = group.all_to_all_single_4d_async(
-            x, mode=0, tag=tag, use_tma=_USE_TMA_BY_TYPE[a2a_type], barrier=barrier
-        )
+    with maybe_nvtx_range(f"fu::a2a_async[{tag}] barrier={barrier} type={a2a_type}"):
+        if a2a_type == "ce":
+            handle = group.all_to_all_single_4d_ce_async(
+                x, mode=0, tag=tag, barrier=barrier
+            )
+        else:
+            handle = group.all_to_all_single_4d_async(
+                x, mode=0, tag=tag, use_tma=_USE_TMA_BY_TYPE[a2a_type], barrier=barrier
+            )
     fast_call_counts["a2a_async"] += 1
     return handle

@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.utils import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -620,7 +621,6 @@ class USPAttention(nn.Module):
         num_replicated_kv_prefix: int = 0,
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
-        qk_fused_ctx: fast_ulysses_backend.QKFusedCtx | None = None,
         qkv_a2a_handles: (
             tuple["fast_ulysses_backend.AsyncA2AHandle", ...] | None
         ) = None,
@@ -650,8 +650,7 @@ class USPAttention(nn.Module):
             qkv_a2a_handles: in-flight fast_ulysses async input a2as (hq, hk,
                 hv) from the pipelined QKV path. The uniform Ulysses path
                 takes the handles' wait() outputs as q/k/v (the passed-in
-                tensors are the handles' inputs). Mutually exclusive with
-                qk_fused_ctx.
+                tensors are the handles' inputs).
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -663,14 +662,6 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
-        if qk_fused_ctx is not None:
-            assert (
-                attn_mask is None
-                and num_replicated_prefix == 0
-                and num_replicated_suffix == 0
-                and num_replicated_kv_prefix == 0
-                and not effective_skip_sp
-            ), "qk_fused_ctx is only supported on the uniform Ulysses path"
         if qkv_a2a_handles is not None:
             # A handle that strayed into a masked/replicated/skip-sp branch
             # would never be waited: numerically wrong AND a barrier-epoch
@@ -684,7 +675,6 @@ class USPAttention(nn.Module):
                 and num_replicated_kv_prefix == 0
                 and not effective_skip_sp
                 and not self.enable_packed_qkv_input_a2a
-                and qk_fused_ctx is None
                 and len(qkv_a2a_handles) == 3
             ), "qkv_a2a_handles is only supported on the uniform Ulysses path"
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
@@ -994,15 +984,11 @@ class USPAttention(nn.Module):
                 # fast_ulysses collective: the barrier epoch must execute in
                 # submission order (see pipelined_input_a2a / fast_ulysses
                 # comm.py).
-                hq, hk, hv = qkv_a2a_handles
-                q = hq.wait()
-                k = hk.wait()
-                v = hv.wait()
-            elif qk_fused_ctx is not None:
-                # Fused cross-head RMSNorm + RoPE + input a2a for q/k (the
-                # caller skipped its own norm/rope); v has no norm/rope.
-                q, k = fast_ulysses_backend.qk2_input_a2a(q=q, k=k, ctx=qk_fused_ctx)
-                v = _usp_input_all_to_all(v, head_dim=2, comm_tag="usp_v")
+                with maybe_nvtx_range("fu::wait_qkv"):
+                    hq, hk, hv = qkv_a2a_handles
+                    q = hq.wait()
+                    k = hk.wait()
+                    v = hv.wait()
             elif self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
                 q, k, v = async_a2a_communicate(
                     [q, k, v],

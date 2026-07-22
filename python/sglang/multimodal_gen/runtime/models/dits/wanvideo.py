@@ -4,11 +4,15 @@
 
 import math
 from functools import lru_cache
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn as nn
 
+from sglang.jit_kernel.diffusion.norm_rope import (
+    can_use_fused_inplace_norm_rope,
+    fused_inplace_norm_rope,
+)
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -61,6 +65,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
@@ -331,6 +336,19 @@ class WanI2VCrossAttention(WanSelfAttention):
         return x
 
 
+class _NormRopeCtx(NamedTuple):
+    """Inputs for the per-tensor fused RMSNorm + RoPE (split pipelined path)."""
+
+    weight_q: (
+        torch.Tensor
+    )  # fp32, [head_dim] per-head | [num_heads * head_dim] cross-head
+    weight_k: torch.Tensor
+    cos: torch.Tensor  # fp32 [s_local, head_dim // 2]
+    sin: torch.Tensor
+    eps: float
+    cross_head: bool
+
+
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -484,31 +502,33 @@ class WanTransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-        # fp32 copies of the QK norm weights for the fast_ulysses fused path,
+        # fp32 copies of the QK norm weights for the per-tensor fused norm+rope,
         # built lazily on first use.
         self._fast_qk_norm_weights_fp32: tuple[torch.Tensor, torch.Tensor] | None = None
 
-    def _maybe_fast_qk_fused_ctx(
+    def _maybe_split_norm_rope_ctx(
         self,
-        query: torch.Tensor,
+        dtype_probe: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> fast_ulysses_backend.QKFusedCtx | None:
-        """Context for the fused cross-head QK RMSNorm + RoPE + input-a2a.
+    ) -> _NormRopeCtx | None:
+        """Context for the per-tensor fused RMSNorm + RoPE on the pipelined path.
 
-        None keeps the unfused norm/rope path. Every condition is identical
-        across SP ranks, keeping the collective call pattern in lockstep.
+        None keeps the joint flashinfer norm/rope fallback. Every condition is
+        identical across SP ranks; either way the collective sequence (v, q, k
+        with the barrier on k) is the same, only local compute differs.
         """
-        if self.qk_norm != "rms_norm_across_heads" or self.tp_rmsnorm:
+        if self.tp_rmsnorm:
             return None
-        if (
-            not isinstance(self.attn1, USPAttention)
-            or self.attn1.skip_sequence_parallel
-        ):
+        cross_head = self.qk_norm == "rms_norm_across_heads"
+        cos, sin = freqs_cis
+        if cos.dtype != torch.float32 or cos.size(-1) * 2 != self.dim_head:
             return None
-        if not fast_ulysses_backend.can_use_qk2(
-            num_heads=self.local_num_heads,
-            head_dim=self.dim_head,
-            dtype=query.dtype,
+        if not can_use_fused_inplace_norm_rope(
+            self.dim_head,
+            self.local_num_heads,
+            cross_head,
+            True,  # interleaved: Wan uses the GPT-J pair convention
+            dtype_probe.dtype,
         ):
             return None
         if self._fast_qk_norm_weights_fp32 is None:
@@ -517,13 +537,13 @@ class WanTransformerBlock(nn.Module):
                 self.norm_k.weight.detach().float().contiguous(),
             )
         weight_q, weight_k = self._fast_qk_norm_weights_fp32
-        cos, sin = freqs_cis
-        return fast_ulysses_backend.QKFusedCtx(
+        return _NormRopeCtx(
             weight_q=weight_q,
             weight_k=weight_k,
             cos=cos.contiguous(),
             sin=sin.contiguous(),
             eps=self.norm_q.variance_epsilon,
+            cross_head=cross_head,
         )
 
     def _use_pipelined_qkv(self, dtype_probe: torch.Tensor) -> bool:
@@ -548,19 +568,55 @@ class WanTransformerBlock(nn.Module):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         """Fully pipelined QKV input a2a: v has no norm/rope, so it is
-        projected and issued first -- its transfer hides under the q/k
-        projections and norm/rope; q and k are issued right after. The three
-        handles are waited together inside attn1.
+        projected and issued first -- its transfer hides under the q work.
+        With the per-tensor fused norm+rope, q is normed and issued before the
+        k projection even starts, so q's a2a overlaps k's GEMM; the joint
+        flashinfer fallback only frees q and k together. The three handles are
+        waited together inside attn1.
         """
+        ctx = self._maybe_split_norm_rope_ctx(norm_hidden_states, freqs_cis)
         value, _ = self.to_v(norm_hidden_states)
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         hv = fast_ulysses_backend.pipelined_input_a2a(value, tag="usp_v", barrier=False)
         query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        query, key = self._qk_norm_rope(query, key, freqs_cis)
-        hq = fast_ulysses_backend.pipelined_input_a2a(query, tag="usp_q", barrier=False)
-        # The last call carries the ONE shared barrier for all three transfers.
-        hk = fast_ulysses_backend.pipelined_input_a2a(key, tag="usp_k", barrier=True)
+        if ctx is not None:
+            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            with maybe_nvtx_range("wan::norm_rope[q]"):
+                fused_inplace_norm_rope(
+                    query,
+                    ctx.weight_q,
+                    ctx.cos,
+                    ctx.sin,
+                    cross_head=ctx.cross_head,
+                    eps=ctx.eps,
+                )
+            hq = fast_ulysses_backend.pipelined_input_a2a(
+                query, tag="usp_q", barrier=False
+            )
+            key, _ = self.to_k(norm_hidden_states)
+            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+            with maybe_nvtx_range("wan::norm_rope[k]"):
+                fused_inplace_norm_rope(
+                    key,
+                    ctx.weight_k,
+                    ctx.cos,
+                    ctx.sin,
+                    cross_head=ctx.cross_head,
+                    eps=ctx.eps,
+                )
+            # The last call carries the ONE shared barrier for all three transfers.
+            hk = fast_ulysses_backend.pipelined_input_a2a(
+                key, tag="usp_k", barrier=True
+            )
+        else:
+            key, _ = self.to_k(norm_hidden_states)
+            query, key = self._qk_norm_rope(query, key, freqs_cis)
+            hq = fast_ulysses_backend.pipelined_input_a2a(
+                query, tag="usp_q", barrier=False
+            )
+            hk = fast_ulysses_backend.pipelined_input_a2a(
+                key, tag="usp_k", barrier=True
+            )
         return self.attn1(query, key, value, qkv_a2a_handles=(hq, hk, hv))
 
     def _self_attention_a2a(
@@ -568,17 +624,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """Self-attention with the fused / plain Ulysses a2a paths."""
+        """Self-attention with the plain (sync) Ulysses a2a path."""
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-
-        fused_ctx = self._maybe_fast_qk_fused_ctx(query, freqs_cis)
-        if fused_ctx is not None:
-            query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-            return self.attn1(query, key, value, qk_fused_ctx=fused_ctx)
         query, key = self._qk_norm_rope(query, key, freqs_cis)
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         return self.attn1(query, key, value)

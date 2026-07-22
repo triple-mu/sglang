@@ -5,7 +5,7 @@ Not registered in CI (experimental). Run on a 4-GPU NVLink host:
     # expected FAIL (fast path off -> counter assertion trips):
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
-    # expected PASS (fast a2a + fused qk2; TYPE defaults to none = auto):
+    # expected PASS (fast sync a2a; TYPE defaults to none = auto):
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
@@ -14,7 +14,7 @@ Not registered in CI (experimental). Run on a 4-GPU NVLink host:
     SGLANG_DIFFUSION_FAST_ULYSSES_TYPE=ce \
     torchrun --nproc_per_node=4 \
         python/sglang/multimodal_gen/test/unit/test_fast_ulysses_a2a.py
-    # expected PASS (pipelined QKV; combine with any TYPE):
+    # expected PASS (pipelined QKV + per-tensor norm+rope; combine with any TYPE):
     SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES=1 \
     SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV=1 \
     SGLANG_DIFFUSION_FAST_ULYSSES_TYPE=ce \
@@ -26,6 +26,10 @@ import os
 
 import torch
 
+from sglang.jit_kernel.diffusion.norm_rope import (
+    can_use_fused_inplace_norm_rope,
+    fused_inplace_norm_rope,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
 )
@@ -70,32 +74,13 @@ def _ref_norm_rope(x, weight, cos, sin, eps):
     return out.to(x.dtype)
 
 
-def _make_qk_ctx(device):
+def _make_norm_rope_inputs(device):
     gen = torch.Generator(device=device).manual_seed(9)
     wq = 1.0 + 0.1 * torch.randn(H * D, generator=gen, device=device)
     wk = 1.0 + 0.1 * torch.randn(H * D, generator=gen, device=device)
     ang = torch.rand((S_LOCAL, D // 2), generator=gen, device=device) * 6.28
     cos, sin = ang.cos().contiguous(), ang.sin().contiguous()
-    ctx = fast_ulysses_backend.QKFusedCtx(
-        weight_q=wq, weight_k=wk, cos=cos, sin=sin, eps=1e-6
-    )
-    return ctx, wq, wk, cos, sin
-
-
-def test_qk2_parity(rank: int, device: torch.device, world: int) -> None:
-    q = _rand((B, S_LOCAL, H, D), 111 + rank, device)
-    k = _rand((B, S_LOCAL, H, D), 222 + rank, device)
-    ctx, wq, wk, cos, sin = _make_qk_ctx(device)
-
-    fq, fk = fast_ulysses_backend.qk2_input_a2a(q=q, k=k, ctx=ctx)
-
-    rq = _usp_input_all_to_all(_ref_norm_rope(q, wq, cos, sin, ctx.eps), head_dim=2)
-    rk = _usp_input_all_to_all(_ref_norm_rope(k, wk, cos, sin, ctx.eps), head_dim=2)
-    for name, f, r in (("q", fq, rq), ("k", fk, rk)):
-        diff = (f.float() - r.float()).abs().max().item()
-        if rank == 0:
-            print(f"qk2 {name}: max abs diff vs fp32 ref = {diff:.5f}", flush=True)
-        torch.testing.assert_close(f, r, atol=2e-2, rtol=2e-2)
+    return wq, wk, cos, sin
 
 
 def test_pipelined_parity(rank: int, device: torch.device, world: int) -> None:
@@ -135,6 +120,53 @@ def test_pipelined_parity(rank: int, device: torch.device, world: int) -> None:
     assert fast_ulysses_backend.fast_call_counts["a2a_async"] == base + 9
 
 
+def test_pipelined_split_norm_rope_parity(
+    rank: int, device: torch.device, world: int
+) -> None:
+    """Production-shaped SPLIT sequence (wanvideo._pipelined_qkv_attention):
+    v issued first, then q normed+roped in place (JIT kernel) and issued, then
+    a filler matmul standing in for the k GEMM, then k normed+roped and issued
+    with the shared barrier. Compares against fp32 norm+rope + NCCL a2a."""
+    wq, wk, cos, sin = _make_norm_rope_inputs(device)
+    eps = 1e-6
+    filler = _rand((4096, 4096), 7 + rank, device)
+    base = fast_ulysses_backend.fast_call_counts["a2a_async"]
+    checks: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+    for it in range(3):
+        v = _rand((B, S_LOCAL, H, D), 5000 * it + rank, device)
+        q = _rand((B, S_LOCAL, H, D), 6000 * it + rank, device)
+        k = _rand((B, S_LOCAL, H, D), 7000 * it + rank, device)
+        ref_v = _usp_input_all_to_all(v, head_dim=2)  # no tag -> NCCL
+        ref_q = _usp_input_all_to_all(_ref_norm_rope(q, wq, cos, sin, eps), head_dim=2)
+        ref_k = _usp_input_all_to_all(_ref_norm_rope(k, wk, cos, sin, eps), head_dim=2)
+
+        hv = fast_ulysses_backend.pipelined_input_a2a(v, tag="usp_v", barrier=False)
+        fused_inplace_norm_rope(q, wq, cos, sin, cross_head=True, eps=eps)
+        hq = fast_ulysses_backend.pipelined_input_a2a(q, tag="usp_q", barrier=False)
+        _ = filler @ filler  # stands in for the k GEMM under q's a2a
+        fused_inplace_norm_rope(k, wk, cos, sin, cross_head=True, eps=eps)
+        hk = fast_ulysses_backend.pipelined_input_a2a(k, tag="usp_k", barrier=True)
+        fv = hv.wait()
+        fq = hq.wait()
+        fk = hk.wait()
+        checks.append((f"v(iter {it})", fv.clone(), ref_v))
+        checks.append((f"q(iter {it})", fq.clone(), ref_q))
+        checks.append((f"k(iter {it})", fk.clone(), ref_k))
+        # Close the barrier chain like production's output a2a.
+        _usp_output_all_to_all(fv, head_dim=2, comm_tag="usp_out")
+    for name, fast, ref in checks:
+        if name.startswith("v"):
+            assert torch.equal(ref, fast), f"split pipelined mismatch: {name}"
+        else:
+            diff = (fast.float() - ref.float()).abs().max().item()
+            if rank == 0:
+                print(
+                    f"split {name}: max abs diff vs fp32 ref = {diff:.5f}", flush=True
+                )
+            torch.testing.assert_close(fast, ref, atol=2e-2, rtol=2e-2)
+    assert fast_ulysses_backend.fast_call_counts["a2a_async"] == base + 9
+
+
 def main() -> None:
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=1, sp_size=4, ulysses_degree=4
@@ -150,16 +182,14 @@ def main() -> None:
         fast_ulysses_backend.fast_call_counts["a2a"] == 2
     ), f"fast a2a path not exercised: {fast_ulysses_backend.fast_call_counts}"
 
-    if fast_ulysses_backend.can_use_qk2(num_heads=H, head_dim=D, dtype=torch.bfloat16):
-        test_qk2_parity(rank, device, world)
-        assert fast_ulysses_backend.fast_call_counts["qk2"] >= 1
-    elif rank == 0:
-        print("qk2 disabled; skipped its parity test", flush=True)
-
     if fast_ulysses_backend.can_use_pipelined_qkv(
         num_heads=H, head_dim=D, dtype=torch.bfloat16
     ):
         test_pipelined_parity(rank, device, world)
+        if can_use_fused_inplace_norm_rope(D, H, True, True, torch.bfloat16):
+            test_pipelined_split_norm_rope_parity(rank, device, world)
+        elif rank == 0:
+            print("norm_rope kernel unavailable; skipped the split test", flush=True)
     elif rank == 0:
         print("pipelined qkv disabled; skipped its parity test", flush=True)
 

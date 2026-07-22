@@ -261,16 +261,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # e.g. `/reset_prefix_cache`
     "SGLANG_DIFFUSION_SERVER_DEV_MODE": _lazy_bool("SGLANG_DIFFUSION_SERVER_DEV_MODE"),
     # Experimental: route uniform Ulysses SP all-to-all through the
-    # fast_ulysses (NVSHMEM + NVLink P2P) library when importable, with the
-    # Wan cross-head QK RMSNorm + RoPE fused into the input a2a when eligible.
+    # fast_ulysses (NVSHMEM + NVLink P2P) library when importable.
     "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_FAST_ULYSSES"
     ),
-    # Fully pipelined Wan QKV input a2a instead of the fused QK path: v is
-    # projected and issued first (no norm/rope), q/k follow after the model's
-    # native norm/rope; the three handles are waited together before
-    # attention (requires the flag above; works with an a2a-only
-    # fast_ulysses build).
+    # Fully pipelined Wan QKV input a2a: v is projected and issued first (no
+    # norm/rope); q is normed+roped per tensor (JIT fused kernel) and issued
+    # before the k projection, so q's transfer overlaps k's GEMM; the three
+    # handles are waited together before attention (requires the flag above).
     "SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV": _lazy_bool(
         "SGLANG_DIFFUSION_FAST_ULYSSES_PIPELINE_QKV"
     ),
