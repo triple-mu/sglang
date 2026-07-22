@@ -186,7 +186,14 @@ def main() -> None:
         num_heads=H, head_dim=D, dtype=torch.bfloat16
     ):
         test_pipelined_parity(rank, device, world)
-        if can_use_fused_inplace_norm_rope(D, H, True, True, torch.bfloat16):
+        # The JIT gate can fail on a single rank (e.g. a compile-cache race);
+        # agree across ranks before entering a test that issues collectives.
+        can_split = torch.tensor(
+            [int(can_use_fused_inplace_norm_rope(D, H, True, True, torch.bfloat16))],
+            device=device,
+        )
+        dist.all_reduce(can_split, op=dist.ReduceOp.MIN)
+        if int(can_split.item()):
             test_pipelined_split_norm_rope_parity(rank, device, world)
         elif rank == 0:
             print("norm_rope kernel unavailable; skipped the split test", flush=True)

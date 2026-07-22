@@ -521,7 +521,17 @@ class WanTransformerBlock(nn.Module):
             return None
         cross_head = self.qk_norm == "rms_norm_across_heads"
         cos, sin = freqs_cis
-        if cos.dtype != torch.float32 or cos.size(-1) * 2 != self.dim_head:
+        # The kernel requires exactly [s_local, head_dim//2] fp32; anything else
+        # must fall back BEFORE any a2a is issued (a mid-sequence panic would
+        # strand the in-flight handles).
+        if (
+            cos.dtype != torch.float32
+            or sin.dtype != torch.float32
+            or cos.dim() != 2
+            or cos.shape != sin.shape
+            or cos.size(0) != dtype_probe.size(1)
+            or cos.size(-1) * 2 != self.dim_head
+        ):
             return None
         if not can_use_fused_inplace_norm_rope(
             self.dim_head,
@@ -547,10 +557,8 @@ class WanTransformerBlock(nn.Module):
         )
 
     def _use_pipelined_qkv(self, dtype_probe: torch.Tensor) -> bool:
-        """Rank-uniform gate for the fully pipelined QKV path (native local
-        norm/rope, one async a2a per tensor, v issued first). Takes precedence
-        over the QK fusion in forward.
-        """
+        """Rank-uniform gate for the fully pipelined QKV path (per-tensor
+        norm/rope, one async a2a per tensor, v issued first)."""
         if (
             not isinstance(self.attn1, USPAttention)
             or self.attn1.skip_sequence_parallel
