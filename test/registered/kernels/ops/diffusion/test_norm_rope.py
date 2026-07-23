@@ -13,11 +13,11 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.diffusion.norm_rope import (
+from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.diffusion.norm_rope import (
     can_use_fused_inplace_norm_rope,
     fused_inplace_norm_rope,
 )
-from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")

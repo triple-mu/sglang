@@ -26,7 +26,7 @@ import os
 
 import torch
 
-from sglang.jit_kernel.diffusion.norm_rope import (
+from sglang.kernels.ops.diffusion.norm_rope import (
     can_use_fused_inplace_norm_rope,
     fused_inplace_norm_rope,
 )
