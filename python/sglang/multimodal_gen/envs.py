@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -299,6 +301,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # opt-in until it has more mileage.
     "SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM"
+    ),
+    # MiniMax-H3: project every denoise step's AdaLN rows before the loop, so
+    # the pure-weight-stream adaln_proj GEMM reads its 520MB of weights once
+    # per block instead of once per block per step. Off by default: batching
+    # the steps changes the GEMM's M dimension and therefore cuBLAS kernel
+    # selection, which is not guaranteed bitwise identical.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

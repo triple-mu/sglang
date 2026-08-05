@@ -113,6 +113,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "token_tags",
         "block_token_tags",
         "block_combined_indices",
+        "step_adaln_params",
         "skip_mask_out_condition",
         "prompt_embeds",
         "refined_prompt_embeds_length",
@@ -829,6 +830,13 @@ class MiniMaxH3AdalnProj(nn.Module):
         x, _ = self.linear(adaln_input)
         return x
 
+    def project(self, adaln_input: torch.Tensor) -> torch.Tensor:
+        """Full-width [M, out_features] projection, TP-gathered when sharded."""
+        x = self.project_local(adaln_input)
+        if get_tp_world_size() > 1:
+            x = tensor_model_parallel_all_gather(x)
+        return x
+
     def split_output(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         m = x.shape[0]
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
@@ -836,10 +844,7 @@ class MiniMaxH3AdalnProj(nn.Module):
 
     def forward(self, adaln_input: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """adaln_input: SiLU(t_emb) BF16 -> expand_ratio tensors of [M*modality_num, H]."""
-        x = self.project_local(adaln_input)
-        if get_tp_world_size() > 1:
-            x = tensor_model_parallel_all_gather(x)
-        return self.split_output(x)
+        return self.split_output(self.project(adaln_input))
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -1072,6 +1077,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         *,
         adaln_input: torch.Tensor,
         inverse_indices: torch.Tensor,
+        adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project all rows into TP-local video/audio output shards.
 
@@ -1080,7 +1086,9 @@ class MiniMaxH3FinalLayer(nn.Module):
         The model gathers output columns only after selecting live media rows,
         preserving the GEMM shape while reducing collective payload.
         """
-        shift, scale = self.adaln_proj(adaln_input)
+        if adaln_params is None:
+            adaln_params = self.adaln_proj(adaln_input)
+        shift, scale = adaln_params
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
@@ -1101,15 +1109,65 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
-    def _can_batch_block_adaln(self) -> bool:
+    def _adaln_batchable(self) -> bool:
+        """Whether every block's adaln_proj may be driven outside block.forward."""
         return (
-            get_tp_world_size() > 1
-            and not torch.compiler.is_compiling()
+            not torch.compiler.is_compiling()
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and not hasattr(self, "_sglang_cache_dit_adapter")
             and not is_layerwise_offloaded_module(self)
             and all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
         )
+
+    def _can_batch_block_adaln(self) -> bool:
+        return get_tp_world_size() > 1 and self._adaln_batchable()
+
+    def can_hoist_step_adaln(self) -> bool:
+        """Whether ``build_step_adaln_params`` may replace per-step projection."""
+        return (
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST
+            and self._adaln_batchable()
+        )
+
+    @torch.inference_mode()
+    def build_step_adaln_params(
+        self, step_unique_timesteps: list[torch.Tensor]
+    ) -> list[tuple[tuple[tuple[torch.Tensor, ...], ...], tuple[torch.Tensor, ...]]]:
+        """Project every denoise step's AdaLN rows up front, one GEMM per block.
+
+        ``adaln_proj`` is a pure weight stream (520MB of weights for 1-3 rows
+        of output), so folding all steps into a single [sum(M), t_dim] GEMM
+        turns one weight pass per step into one weight pass per request. The
+        time embedding still runs per step so ``adaln_input`` rows stay bitwise
+        identical; only the projection GEMM's M dimension changes.
+
+        Returns one ``(per_block_params, final_layer_params)`` entry per step.
+        """
+        adaln_input = torch.cat(
+            [
+                nn.functional.silu(self.time_embedder(unique_timesteps.view(-1))).to(
+                    _BF16_DTYPE
+                )
+                for unique_timesteps in step_unique_timesteps
+            ]
+        )
+        block_outputs = [block.adaln_proj.project(adaln_input) for block in self.blocks]
+        final_output = self.final_layer.adaln_proj.project(adaln_input)
+        plan = []
+        start = 0
+        for unique_timesteps in step_unique_timesteps:
+            stop = start + int(unique_timesteps.numel())
+            plan.append(
+                (
+                    tuple(
+                        block.adaln_proj.split_output(output[start:stop])
+                        for block, output in zip(self.blocks, block_outputs)
+                    ),
+                    self.final_layer.adaln_proj.split_output(final_output[start:stop]),
+                )
+            )
+            start = stop
+        return plan
 
     def _validate_tp_config(
         self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int
@@ -1694,8 +1752,13 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
+        # request-level hoist: this step's slice of the pre-projected plan
+        step_adaln_params = kwargs.get("step_adaln_params")
         block_adaln_params = None
-        if self._can_batch_block_adaln():
+        final_adaln_params = None
+        if step_adaln_params is not None:
+            block_adaln_params, final_adaln_params = step_adaln_params
+        elif self._can_batch_block_adaln():
             with maybe_nvtx_range("h3_dit_adaln_tp_allgather", use_nvtx):
                 local_adaln = torch.stack(
                     [
@@ -1733,6 +1796,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 hidden,
                 adaln_input=adaln_input,
                 inverse_indices=block_inverse,
+                adaln_params=final_adaln_params,
             )
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
