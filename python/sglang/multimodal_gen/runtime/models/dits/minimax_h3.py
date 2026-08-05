@@ -57,6 +57,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    layerwise_nvtx_enabled,
+    maybe_nvtx_range,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -475,13 +479,15 @@ def _minimax_h3_attention_core_impl(
     kernel and sequence-parallel collectives execute eagerly.
     """
 
+    use_nvtx = layerwise_nvtx_enabled()
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        with maybe_nvtx_range("h3_attn_ulysses_a2a_in", use_nvtx):
+            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -491,16 +497,18 @@ def _minimax_h3_attention_core_impl(
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
-    out = attention._attention_impl.forward_varlen(
-        q,
-        k,
-        v,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        cu_seqlens_host=cu_seqlens_host,
-    )
+    with maybe_nvtx_range("h3_attn_varlen", use_nvtx):
+        out = attention._attention_impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
     if ulysses_active:
-        out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        with maybe_nvtx_range("h3_attn_ulysses_a2a_out", use_nvtx):
+            out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
 
 
@@ -1571,22 +1579,24 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
 
-        decoder_input, t_emb = self._embed(
-            x=x,
-            audio_x=audio_x,
-            text_embeddings_selected=text_selected,
-            unique_timesteps=unique_timesteps.view(-1).to(device),
-            img_pos=img_pos,
-            audio_pos=audio_pos,
-            text_pos=text_pos,
-            refiner_cu_seqlens=refiner_cu.to(device),
-            refiner_max_seqlen=refiner_max,
-            row_start=row_start,
-            row_stop=row_stop,
-            device=device,
-            refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
-            local_embedding_layout=kwargs.get("local_embedding_layout"),
-        )
+        use_nvtx = layerwise_nvtx_enabled()
+        with maybe_nvtx_range("h3_dit_embed", use_nvtx):
+            decoder_input, t_emb = self._embed(
+                x=x,
+                audio_x=audio_x,
+                text_embeddings_selected=text_selected,
+                unique_timesteps=unique_timesteps.view(-1).to(device),
+                img_pos=img_pos,
+                audio_pos=audio_pos,
+                text_pos=text_pos,
+                refiner_cu_seqlens=refiner_cu.to(device),
+                refiner_max_seqlen=refiner_max,
+                row_start=row_start,
+                row_stop=row_stop,
+                device=device,
+                refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
+                local_embedding_layout=kwargs.get("local_embedding_layout"),
+            )
         # request-step AdaLN input shared by all blocks
         adaln_input = nn.functional.silu(t_emb).to(_BF16_DTYPE)
         inverse_indices = inverse_indices.to(device)
@@ -1614,48 +1624,57 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         cu_seqlens = cu_seqlens.to(device)
         block_adaln_params = None
         if self._can_batch_block_adaln():
-            local_adaln = torch.stack(
-                [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
-            )
-            gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
-            block_adaln_params = tuple(
-                block.adaln_proj.split_output(output)
-                for block, output in zip(self.blocks, gathered_adaln)
-            )
+            with maybe_nvtx_range("h3_dit_adaln_tp_allgather", use_nvtx):
+                local_adaln = torch.stack(
+                    [
+                        block.adaln_proj.project_local(adaln_input)
+                        for block in self.blocks
+                    ]
+                )
+                gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
+                block_adaln_params = tuple(
+                    block.adaln_proj.split_output(output)
+                    for block, output in zip(self.blocks, gathered_adaln)
+                )
         # With Ulysses sequence parallelism, shard rows across the group for
         # the block stack. Attention trades sequence for heads internally;
         # everything else, including the final layer, is row-local.
-        for index, block in enumerate(self.blocks):
-            hidden = block(
+        with maybe_nvtx_range("h3_dit_blocks", use_nvtx):
+            for index, block in enumerate(self.blocks):
+                hidden = block(
+                    hidden,
+                    adaln_input=adaln_input,
+                    combined_indices=block_combined,
+                    rope_cache=rope_cache,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_host=cu_seqlens_host,
+                    max_seqlen=max_seqlen,
+                    ulysses_active=sp_ws > 1,
+                    adaln_params=(
+                        None
+                        if block_adaln_params is None
+                        else block_adaln_params[index]
+                    ),
+                )
+        with maybe_nvtx_range("h3_dit_final_layer", use_nvtx):
+            video_logits, audio_logits = self.final_layer(
                 hidden,
                 adaln_input=adaln_input,
-                combined_indices=block_combined,
-                rope_cache=rope_cache,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_host=cu_seqlens_host,
-                max_seqlen=max_seqlen,
-                ulysses_active=sp_ws > 1,
-                adaln_params=(
-                    None if block_adaln_params is None else block_adaln_params[index]
-                ),
+                inverse_indices=block_inverse,
             )
-        video_logits, audio_logits = self.final_layer(
-            hidden,
-            adaln_input=adaln_input,
-            inverse_indices=block_inverse,
-        )
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
                 get_sp_group,
             )
 
-            video_width = video_logits.shape[-1]
-            logits = get_sp_group().all_gather(
-                torch.cat((video_logits, audio_logits), dim=-1), dim=0
-            )
-            video_logits, audio_logits = logits.split(
-                (video_width, logits.shape[-1] - video_width), dim=-1
-            )
+            with maybe_nvtx_range("h3_dit_sp_allgather", use_nvtx):
+                video_width = video_logits.shape[-1]
+                logits = get_sp_group().all_gather(
+                    torch.cat((video_logits, audio_logits), dim=-1), dim=0
+                )
+                video_logits, audio_logits = logits.split(
+                    (video_width, logits.shape[-1] - video_width), dim=-1
+                )
 
         # Preserve the full-row output GEMM (and therefore its numerical
         # contract), but defer TP column gathers until after dead text/padding
@@ -1664,8 +1683,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
         if get_tp_world_size() > 1:
-            video_logits = tensor_model_parallel_all_gather(video_logits)
-            audio_logits = tensor_model_parallel_all_gather(audio_logits)
+            with maybe_nvtx_range("h3_dit_out_tp_allgather", use_nvtx):
+                video_logits = tensor_model_parallel_all_gather(video_logits)
+                audio_logits = tensor_model_parallel_all_gather(audio_logits)
         if not skip_mask_out_condition:
             update_mask = update_mask.view(-1).to(device)
             if update_mask.shape[0] != video_logits.shape[0]:
