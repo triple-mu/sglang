@@ -16,6 +16,11 @@ import torch.nn as nn
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
+from sglang.kernels.ops.diffusion.indexed_modulation_norm import (
+    can_use_indexed_modulation_norm,
+    indexed_gate_norm_scale_shift,
+    indexed_norm_scale_shift,
+)
 from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
@@ -901,6 +906,13 @@ class MiniMaxH3DiTBlock(nn.Module):
             expand_ratio=6,
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
         )
+        # Bit-exact single-kernel replacement for [norm1 + scale/shift] and
+        # [gate + norm2 + scale/shift]; 14 elementwise tensor passes -> 9.
+        self._use_fused_modulation_norm = (
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM
+            and current_platform.is_cuda()
+            and can_use_indexed_modulation_norm(arch.hidden_size)
+        )
 
     def forward(
         self,
@@ -926,11 +938,19 @@ class MiniMaxH3DiTBlock(nn.Module):
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
 
-        residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
-        )
+        if self._use_fused_modulation_norm:
+            h = indexed_norm_scale_shift(
+                x,
+                self.norm1.weight,
+                scale_msa,
+                shift_msa,
+                combined_indices,
+                self.norm1.eps,
+            )
+        else:
+            h = _modulate_scale_shift(
+                self.norm1(x), shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+            )
         h = self.attn(
             h,
             rope_cache=rope_cache,
@@ -939,17 +959,26 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
 
-        residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
-        )
+        if self._use_fused_modulation_norm:
+            # `x` is updated in place with the gated residual, as in the eager path.
+            h = indexed_gate_norm_scale_shift(
+                x,
+                h,
+                gate_msa,
+                self.norm2.weight,
+                scale_mlp,
+                shift_mlp,
+                combined_indices,
+                self.norm2.eps,
+            )
+        else:
+            x = _modulate_gate(x, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
+            h = _modulate_scale_shift(
+                self.norm2(x), shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+            )
         h = self.mlp(h)
-        return _modulate_gate(
-            residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE
-        )
+        return _modulate_gate(x, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
