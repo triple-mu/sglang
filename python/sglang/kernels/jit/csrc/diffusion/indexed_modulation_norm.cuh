@@ -287,6 +287,11 @@ struct IndexedGateNormScaleShiftKernel {
         .verify(y);
     TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(weight);
     TensorMatcher({rows}).with_dtype<int64_t>().with_device<kDLCUDA>(device).verify(index);
+    // Empty input is a no-op, and its data pointers are all null -- check the
+    // aliasing precondition only once there is something to alias.
+    if (rows.unwrap() == 0) {
+      return;
+    }
     CHECK_HOST(mutable_data(y) != mutable_data(residual)) << "y must not alias residual";
     CHECK_HOST(const_data(y) != const_data(update)) << "y must not alias update";
 
@@ -306,9 +311,6 @@ struct IndexedGateNormScaleShiftKernel {
         .num_rows = rows.unwrap(),
         .eps = static_cast<float>(eps),
     };
-    if (p.num_rows == 0) {
-      return;
-    }
     launch<kHidden, true>(p, device.unwrap());
   }
 };

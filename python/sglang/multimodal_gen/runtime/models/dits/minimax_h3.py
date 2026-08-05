@@ -74,6 +74,18 @@ _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 
+# (block in, block out, final in, final out) adaln GEMM shapes whose batched-M
+# projection is known bitwise identical to the per-step one. See
+# MiniMaxH3DiTModel._adaln_gemm_shapes_verified.
+_ADALN_HOIST_VERIFIED_GEMM_SHAPES = {
+    (
+        _ARCH_DEFAULTS.time_embed_dim,
+        _ARCH_DEFAULTS.adaln_out_features,
+        _ARCH_DEFAULTS.time_embed_dim,
+        _ARCH_DEFAULTS.final_adaln_out_features,
+    ),
+}
+
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
     "video_patch_proj.bias",
@@ -1122,11 +1134,32 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     def _can_batch_block_adaln(self) -> bool:
         return get_tp_world_size() > 1 and self._adaln_batchable()
 
+    def _adaln_gemm_shapes_verified(self) -> bool:
+        """Whether this checkpoint's adaln GEMM shapes are on the tested list.
+
+        Hoisting changes the projection GEMM's M from 1-3 to up to 98, and
+        cuBLAS is free to pick a different kernel -- and therefore a different
+        K-direction accumulation order -- for the larger M. That it does not
+        for the shipped H3 shapes is a measured fact, not a guarantee: moving N
+        or K off their current alignment does break it (N=96786 and K=2689 both
+        produce differing bf16 outputs). Restrict the fast path to the shapes
+        the bitwise-equality test actually covers.
+        """
+        block_linear = self.blocks[0].adaln_proj.linear
+        final_linear = self.final_layer.adaln_proj.linear
+        return (
+            block_linear.input_size,
+            block_linear.output_size,
+            final_linear.input_size,
+            final_linear.output_size,
+        ) in _ADALN_HOIST_VERIFIED_GEMM_SHAPES
+
     def can_hoist_step_adaln(self) -> bool:
         """Whether ``build_step_adaln_params`` may replace per-step projection."""
         return (
             envs.SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST
             and self._adaln_batchable()
+            and self._adaln_gemm_shapes_verified()
         )
 
     @torch.inference_mode()

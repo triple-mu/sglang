@@ -13,9 +13,14 @@
 // arithmetic rather than the integer bit trick, which is what makes the
 // scale-shift kernel DRAM-bound instead of ALU-bound (its 15 integer ops per
 // element cost as much as the memory traffic):
-//   * `round_bf16(1 + scale)` == `add.rn.bf16(1, scale)`. Both operands are
-//     BF16, so the FP32 sum is either exact or already lands on a BF16 value;
-//     there is no double rounding for the FP32 result to disagree about.
+//   * `round_bf16(1 + scale)` == `add.rn.bf16(1, scale)`. The exact sum needs
+//     one bit for the leading 1 plus BF16's 8 significand bits, so for
+//     `scale >= 2^-16` it is representable in FP32 and the FP32 store is a
+//     no-op -- rounding it to BF16 is then the same single rounding the direct
+//     BF16 add performs. Below that the sum is nearer to 1.0 than half the
+//     first BF16 step (2^-9), so both paths return 1.0. Note the FP32 result
+//     itself need not be a BF16 value (1 + 2^-20 is exact in FP32 and is not),
+//     which is fine -- what matters is that no second rounding intervenes.
 //   * `round_bf16(x * one_plus_scale)` == `mul.rn.bf16(x, one_plus_scale)`.
 //     The FP32 product of two BF16 values is exact (16-bit significand), so
 //     rounding it to BF16 is a single round-to-nearest-even step.
