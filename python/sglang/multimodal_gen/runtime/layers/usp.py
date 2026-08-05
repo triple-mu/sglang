@@ -325,6 +325,49 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def _usp_input_all_to_all_qknorm_rope_packed_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-head QKNorm+RoPE fused into the destination-major pack, then one A2A.
+
+    Same result as running the in-place QKNorm+RoPE kernel and then
+    :func:`_usp_input_all_to_all_packed_qkv`, bit for bit, but q/k are read once
+    instead of being rewritten and read back.
+    """
+    from sglang.kernels.ops.diffusion.qknorm_rope_pack_qkv import (
+        fused_qknorm_rope_pack_qkv,
+    )
+
+    world_size = get_ulysses_parallel_world_size()
+    s_local, h_global, head_size = q.shape
+    packed = fused_qknorm_rope_pack_qkv(
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        world_size=world_size,
+        is_neox=True,
+        eps=eps,
+        head_dim=head_size,
+        rope_dim=cos_sin_cache.shape[-1],
+    )
+    packed = _usp_all_to_all_single(packed)
+    packed = packed.reshape(s_local * world_size, h_global // world_size, 3 * head_size)
+    q, k, v = packed.split(head_size, dim=-1)
+    return q, k, v
+
+
 def _usp_input_all_to_all_varlen(
     x: torch.Tensor, seq_lens: list[int], head_dim: int = 1
 ) -> torch.Tensor:

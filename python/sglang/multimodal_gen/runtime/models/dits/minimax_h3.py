@@ -20,6 +20,9 @@ from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
+from sglang.kernels.ops.diffusion.qknorm_rope_pack_qkv import (
+    can_use_fused_qknorm_rope_pack_qkv,
+)
 from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
@@ -468,23 +471,41 @@ def _minimax_h3_attention_core_impl(
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
     ulysses_active: bool,
+    fused_qknorm_rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses collectives.
 
     This is the narrow BCG break point: projections, normalization, RoPE,
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
+
+    ``fused_qknorm_rope_cache`` is the (cos_sin_cache, positions) pair when the
+    caller deferred QKNorm+RoPE so it can be folded into the input pack.
     """
 
     use_nvtx = layerwise_nvtx_enabled()
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_input_all_to_all_packed_qkv,
+            _usp_input_all_to_all_qknorm_rope_packed_qkv,
             _usp_output_all_to_all,
         )
 
         with maybe_nvtx_range("h3_attn_ulysses_a2a_in", use_nvtx):
-            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+            if fused_qknorm_rope_cache is None:
+                q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+            else:
+                cos_sin_cache, positions = fused_qknorm_rope_cache
+                q, k, v = _usp_input_all_to_all_qknorm_rope_packed_qkv(
+                    q,
+                    k,
+                    v,
+                    q_weight=attention.q_norm.weight,
+                    k_weight=attention.k_norm.weight,
+                    cos_sin_cache=cos_sin_cache,
+                    positions=positions,
+                    eps=attention.q_norm.eps,
+                )
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -566,6 +587,20 @@ class MiniMaxH3Attention(nn.Module):
                 round_norm_before_rope=True,
             )
         )
+        # Under Ulysses the same QKNorm+RoPE can instead be folded into the
+        # destination-major pack that feeds the input all-to-all, which drops a
+        # whole read-modify-write pass over q/k. Bit-exact, but opt-in.
+        self._use_fused_qknorm_rope_pack_qkv = (
+            envs.SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV
+            and current_platform.is_cuda()
+            and can_use_fused_qknorm_rope_pack_qkv(
+                arch.attention_head_dim,
+                rope_dim,
+                True,
+                _BF16_DTYPE,
+                _BF16_DTYPE,
+            )
+        )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
             arch.hidden_size,
@@ -644,6 +679,14 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
+        # Under Ulysses the QKNorm+RoPE is deferred into the pack that feeds the
+        # input all-to-all, so q/k reach it unnormalized.
+        fold_qknorm_rope_into_pack = (
+            ulysses_active
+            and rope_cache is not None
+            and self._use_fused_qknorm_rope_pack_qkv
+            and not torch.compiler.is_compiling()
+        )
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -652,7 +695,7 @@ class MiniMaxH3Attention(nn.Module):
                 self.k_norm,
                 self.head_dim,
             )
-        else:
+        elif not fold_qknorm_rope_into_pack:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
                 fused_inplace_qknorm_rope(
@@ -692,6 +735,7 @@ class MiniMaxH3Attention(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
+            fused_qknorm_rope_cache=rope_cache if fold_qknorm_rope_into_pack else None,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)

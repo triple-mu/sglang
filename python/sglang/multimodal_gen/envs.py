@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -286,6 +287,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When disabled, FP8 weights are dequantized to compute dtype before matmul.
     "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
+    ),
+    # Fold the packed-DiT per-head QKNorm+RoPE into the Ulysses destination-major
+    # QKV pack, removing the separate read-modify-write pass over q/k. Bit-exact
+    # with the two-kernel path; opt-in until it has soaked.
+    "SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV": _lazy_bool(
+        "SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
