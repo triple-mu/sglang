@@ -697,6 +697,11 @@ class Envs:
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
 
+    # Diffusion kernels
+    # MiniMax-H3 indexed AdaLN modulation: use the vectorized CUDA JIT kernels
+    # instead of the Triton ones. Bit-exact with Triton; set to 0 to A/B.
+    SGLANG_OPT_USE_JIT_INDEXED_MODULATION = EnvBool(True)
+
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
