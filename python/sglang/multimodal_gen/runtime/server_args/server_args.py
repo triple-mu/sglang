@@ -314,6 +314,9 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
+    # Bracket the real (non-warmup) request with cudaProfilerStart/Stop so
+    # `nsys profile -c cudaProfilerApi` captures only the inference itself.
+    enable_cuda_profiler_range: bool = False
 
     # warmup
     # `warmup_mode` is the canonical knob: one of WARMUP_MODES
@@ -1609,6 +1612,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "Warmup steps are excluded to keep captured traces clean.",
         )
 
+        parser.add_argument(
+            "--enable-cuda-profiler-range",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cuda_profiler_range,
+            help="Call cudaProfilerStart/cudaProfilerStop on world rank 0 around "
+            "each real request's pipeline execution, so "
+            "`nsys profile -c cudaProfilerApi` captures the inference only and "
+            "skips model loading. Warmup requests are excluded.",
+        )
+
         # warmup
         parser.add_argument(
             "--warmup-mode",
@@ -2590,4 +2603,14 @@ def get_global_server_args() -> ServerArgs:
         # config.
         # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
+    return _global_server_args
+
+
+def maybe_get_global_server_args() -> ServerArgs | None:
+    """Global args, or ``None`` when this process never set them.
+
+    Model code that only reads a profiling switch must not depend on a
+    running worker; unit tests that construct modules directly leave the
+    global unset.
+    """
     return _global_server_args
