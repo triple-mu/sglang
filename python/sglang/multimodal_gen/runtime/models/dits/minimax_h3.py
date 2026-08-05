@@ -16,13 +16,13 @@ import torch.nn as nn
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
+from sglang.kernels.ops.diffusion.indexed_modulation import (
+    indexed_gate_bf16_,
+    indexed_scale_shift_bf16_,
+)
 from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
-)
-from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
-    indexed_gate_bf16_,
-    indexed_scale_shift_bf16_,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs

@@ -722,6 +722,11 @@ class Envs:
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
 
+    # Diffusion kernels
+    # MiniMax-H3 indexed AdaLN modulation: use the vectorized CUDA JIT kernels
+    # instead of the Triton ones. Bit-exact with Triton; set to 0 to A/B.
+    SGLANG_OPT_USE_JIT_INDEXED_MODULATION = EnvBool(True)
+
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
