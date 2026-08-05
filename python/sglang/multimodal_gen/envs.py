@@ -287,6 +287,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
     ),
+    # MiniMax-H3: fuse the DiT block's gated residual, RMSNorm and indexed
+    # scale/shift into one CUDA kernel. Bit-exact with the eager chain, but
+    # opt-in until it has more mileage.
+    "SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM"
+    ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
     # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers
