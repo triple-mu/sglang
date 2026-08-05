@@ -286,3 +286,75 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
 
     actual = pack_qkv_destination_major(q.contiguous(), k.contiguous(), v, world_size)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ulysses_qknorm_rope_pack_matches_two_kernel_path():
+    """The folded QKNorm+RoPE pack must feed the all-to-all the same bytes.
+
+    Guards the layout wiring in
+    ``_usp_input_all_to_all_qknorm_rope_packed_qkv``: a wrong world_size,
+    argument order, or post-collective reshape would still produce a
+    plausible-looking tensor, so the collective payload is compared bit for
+    bit against the in-place-norm-then-pack path it replaces.
+    """
+    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+    from sglang.multimodal_gen.runtime.layers.usp import (
+        _usp_input_all_to_all_qknorm_rope_packed_qkv,
+    )
+
+    torch.manual_seed(11)
+    rows, world_size, heads, head_dim, rope_dim = 129, 4, 56, 128, 96
+    qkv = torch.randn(rows, 3 * heads * head_dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = (
+        tensor.view(rows, heads, head_dim)
+        for tensor in qkv.split(heads * head_dim, dim=-1)
+    )
+    q_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    k_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int64)
+    cos_sin_cache = torch.randn(rows, rope_dim, device="cuda", dtype=torch.bfloat16)
+    eps = 1e-5
+
+    payloads = []
+
+    def capture_all_to_all(packed, role=None):
+        payloads.append(packed.clone())
+        return packed
+
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.usp.get_ulysses_parallel_world_size",
+        return_value=world_size,
+    ), patch(
+        "sglang.multimodal_gen.runtime.layers.usp._usp_all_to_all_single",
+        side_effect=capture_all_to_all,
+    ):
+        fused = _usp_input_all_to_all_qknorm_rope_packed_qkv(
+            q,
+            k,
+            v,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            eps=eps,
+        )
+        q_ref, k_ref = q.clone(), k.clone()
+        fused_inplace_qknorm_rope(
+            q_ref,
+            k_ref,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=eps,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+        )
+        reference = _usp_input_all_to_all_packed_qkv(q_ref, k_ref, v)
+
+    assert torch.equal(payloads[0], payloads[1])
+    for actual, expected in zip(fused, reference, strict=True):
+        assert torch.equal(actual, expected)
