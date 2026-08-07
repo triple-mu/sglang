@@ -223,6 +223,7 @@ def maybe_load_fsdp_model(
     pin_cpu_memory: bool = True,
     strict: bool = True,
     weight_load_plan: WeightLoadPlan | None = None,
+    checkpoint_key_filter: Callable[[str], bool] | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -331,6 +332,7 @@ def maybe_load_fsdp_model(
         and use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
+        and checkpoint_key_filter is None
         and not is_bnb_quantized
     ):
         preconverted_state_dict = (
@@ -345,6 +347,7 @@ def maybe_load_fsdp_model(
         and not use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
+        and checkpoint_key_filter is None
         and not is_bnb_quantized
     ):
         preconverted_state_dict = (
@@ -359,10 +362,14 @@ def maybe_load_fsdp_model(
         if weight_load_plan.load_full_state_dict_on_device:
             weight_iterator = safetensors_weights_iterator(
                 weight_dir_list,
+                key_filter=checkpoint_key_filter,
                 weight_load_plan=weight_load_plan,
             )
         else:
-            weight_iterator = safetensors_weights_iterator(weight_dir_list)
+            weight_iterator = safetensors_weights_iterator(
+                weight_dir_list,
+                key_filter=checkpoint_key_filter,
+            )
         if preprocess_loaded_state_dict is not None:
             weight_iterator = preprocess_loaded_state_dict(weight_iterator)
         if is_bnb_quantized:
