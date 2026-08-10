@@ -35,6 +35,8 @@ from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    RESIDENCY_POLICIES,
+    RESIDENCY_POLICY_LEADING,
     cpu_offload_flags_for_layerwise_components,
     layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
@@ -308,8 +310,10 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
-    # If set, keep this many leading DiT layers resident on GPU
+    # If set, keep this many DiT layers resident on GPU
     dit_layerwise_resident_layers: float = 0.0
+    # Which layers those are: the leading ones, or spread evenly over the stack.
+    dit_layerwise_residency_policy: str = "leading"
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -1838,6 +1842,21 @@ class ServerArgs(DisaggServerArgsMixin):
             "once (not re-streamed every step), so this trades VRAM for lower denoise "
             "latency when memory is available.",
         )
+        parser.add_argument(
+            "--dit-layerwise-residency-policy",
+            type=str,
+            choices=RESIDENCY_POLICIES,
+            default=ServerArgs.dit_layerwise_residency_policy,
+            help="Which layers --dit-layerwise-resident-layers keeps resident. "
+            "'leading' (default) keeps the first N and streams the tail, so the "
+            "transfers arrive as one burst in the last part of each step. "
+            "'strided' spreads the streamed layers evenly over the stack: same "
+            "VRAM, same bytes moved, but the peak transfer rate drops by "
+            "num_layers/(num_layers - N) and each transfer gets that many layers "
+            "of compute to hide behind. Prefer 'strided' when the model also "
+            "runs a collective per layer (sequence parallelism), where the burst "
+            "otherwise contends with the all-to-all for host bandwidth.",
+        )
 
         # offload flags
         parser.add_argument(
@@ -2612,6 +2631,23 @@ class ServerArgs(DisaggServerArgsMixin):
                 "layerwise-offloaded. It only applies together with "
                 "--dit-layerwise-offload (or 'dit' in --layerwise-offload-components)."
             )
+
+        if self.dit_layerwise_residency_policy != RESIDENCY_POLICY_LEADING:
+            if not self.is_dit_layerwise_offload_selected:
+                logger.warning(
+                    "--dit-layerwise-residency-policy has no effect because the DiT is "
+                    "not layerwise-offloaded. It only applies together with "
+                    "--dit-layerwise-offload (or 'dit' in "
+                    "--layerwise-offload-components)."
+                )
+            elif self.dit_layerwise_resident_layers <= 0:
+                # With nothing resident every layer streams, so there is no
+                # layout to choose and the policies are the same run.
+                logger.warning(
+                    "--dit-layerwise-residency-policy has no effect because "
+                    "--dit-layerwise-resident-layers is 0: every layer is streamed, "
+                    "so there is no resident set to place."
+                )
 
         # validate layerwise offload conflicts
         if envs.SGLANG_CACHE_DIT_ENABLED and self.use_fsdp_inference:
