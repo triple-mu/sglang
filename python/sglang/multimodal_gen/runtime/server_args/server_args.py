@@ -343,6 +343,15 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
+    # Bracket the non-warmup forward with cudaProfilerStart/Stop, so a profiler
+    # launched with `--capture-range=cudaProfilerApi` records only the timed
+    # request — weight loading, FSDP sharding and warmup all stay outside.
+    enable_cuda_profiler_range: bool = False
+    # Which worker ranks emit that range. The capture range is per-process, so a
+    # rank left out here contributes nothing to the report even though the
+    # profiler followed the fork. Keeping it small is how an 8-rank job produces
+    # a report that is still openable.
+    cuda_profiler_ranks: list[int] = None
 
     # Warmup is controlled by the canonical `warmup_mode` knob: one of WARMUP_MODES.
     #   - "off":     no warmup.
@@ -545,6 +554,17 @@ class ServerArgs(DisaggServerArgsMixin):
             return DEFAULT_BCG_TEXT_BUCKETS
         buckets = sorted({int(b) for b in raw if int(b) > 0})
         return tuple(buckets) or DEFAULT_BCG_TEXT_BUCKETS
+
+    def resolved_cuda_profiler_ranks(self) -> frozenset[int]:
+        """Worker ranks that bracket their timed forward with the profiler range.
+
+        Defaults to rank 0 alone: the range is what makes a profiler start
+        recording, so every extra rank listed here multiplies the report size.
+        """
+        raw = self.cuda_profiler_ranks
+        if not raw:
+            return frozenset({0})
+        return frozenset(int(rank) for rank in raw)
 
     def _validate_breakable_cuda_graph(self):
         if not self.enable_breakable_cuda_graph:
@@ -1737,6 +1757,30 @@ class ServerArgs(DisaggServerArgsMixin):
             "every denoising step, the predict_noise / scheduler_step "
             "sub-operations, and every transformer submodule forward (recursive). "
             "Warmup steps are excluded to keep captured traces clean.",
+        )
+
+        parser.add_argument(
+            "--enable-cuda-profiler-range",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cuda_profiler_range,
+            help="Bracket the timed (non-warmup) forward with "
+            "cudaProfilerStart/Stop. Pair with `nsys profile "
+            "--capture-range=cudaProfilerApi --capture-range-end=stop` to get a "
+            "report that covers the request and nothing else: weight loading, "
+            "FSDP sharding and warmup all happen outside the range, and the "
+            "process still runs on afterwards to write its outputs.",
+        )
+        parser.add_argument(
+            "--cuda-profiler-ranks",
+            type=int,
+            nargs="+",
+            default=ServerArgs.cuda_profiler_ranks,
+            help="Worker ranks that emit the --enable-cuda-profiler-range "
+            "range. Defaults to rank 0 only. The capture range is per-process, "
+            "so a rank omitted here records nothing even though the profiler "
+            "followed the fork — which is how a many-rank job still produces a "
+            "report small enough to open. Pass e.g. `0 4` to keep one rank per "
+            "NUMA domain.",
         )
 
         # warmup
