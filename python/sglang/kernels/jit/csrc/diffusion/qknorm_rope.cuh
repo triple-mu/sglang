@@ -18,15 +18,23 @@ namespace sglang {
 struct QKNormRopeParams {
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;  // pre-offset by -num_qo_heads * head_stride_bytes
+  // The three fields below are only read when kPack is set: V rides along as a
+  // pure relayout (no norm, no RoPE) and every head lands in out_ptr, laid out
+  // [world_size, num_tokens, num_local_heads, 3 * head_dim] so that the Ulysses
+  // input all-to-all can send it without a separate packing pass.
+  void* __restrict__ v_ptr;  // pre-offset by -2 * num_qo_heads * head_stride_bytes
+  void* __restrict__ out_ptr;
   const void* __restrict__ q_weight_ptr;
   const void* __restrict__ k_weight_ptr;
   const void* __restrict__ cos_sin_cache_ptr;
   const void* __restrict__ positions;
   int64_t q_stride_bytes;
   int64_t k_stride_bytes;
+  int64_t v_stride_bytes;
   int64_t head_stride_bytes;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
+  uint32_t num_local_heads;
   uint32_t num_tokens;
   float eps;
 };
@@ -61,6 +69,7 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
+    bool kPack,
     typename IdType>
 __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ params) {
   using namespace device;
@@ -89,14 +98,16 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
   using Packed = packed_t<DType>;
   using Storage = AlignedVector<Packed, kVecSize>;
 
-  const auto& [q_ptr, k_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr, positions, q_stride_bytes, k_stride_bytes, head_stride_bytes, num_qo_heads, num_kv_heads, num_tokens, eps] =
+  const auto& [q_ptr, k_ptr, v_ptr, out_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr, positions, q_stride_bytes, k_stride_bytes, v_stride_bytes, head_stride_bytes, num_qo_heads, num_kv_heads, num_local_heads, num_tokens, eps] =
       params;
 
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
   const uint32_t start_worker_id = blockIdx.x * kWarpsPerBlock + warp_id;
   const uint32_t num_workers = gridDim.x * kWarpsPerBlock;
-  const uint32_t num_qk_heads = num_qo_heads + num_kv_heads;
+  // Packing adds V as a third component; it shares the per-head worker layout
+  // so the q/k arithmetic below is untouched.
+  const uint32_t num_qk_heads = kPack ? 3 * num_qo_heads : num_qo_heads + num_kv_heads;
   const uint32_t num_works = num_qk_heads * num_tokens;
 
   PDLWaitPrimary<kUsePDL>();
@@ -104,12 +115,46 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
   for (uint32_t idx = start_worker_id; idx < num_works; idx += num_workers) {
     const uint32_t token_id = idx / num_qk_heads;
     const uint32_t head_id = idx % num_qk_heads;
-    const bool load_q = head_id < num_qo_heads;
-    const void* input = load_q ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
-                               : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
-    const void* weight_ptr = load_q ? q_weight_ptr : k_weight_ptr;
+    const void* input;
+    const void* weight_ptr;
+    void* store_ptr;
+    [[maybe_unused]] uint32_t component = 0;
+    if constexpr (kPack) {
+      component = head_id / num_qo_heads;
+      void* base = q_ptr;
+      int64_t row_stride_bytes = q_stride_bytes;
+      if (component == 1) {
+        base = k_ptr;
+        row_stride_bytes = k_stride_bytes;
+      } else if (component == 2) {
+        base = v_ptr;
+        row_stride_bytes = v_stride_bytes;
+      }
+      input = pointer::offset(base, token_id * row_stride_bytes, head_id * head_stride_bytes);
+      weight_ptr = component == 0 ? q_weight_ptr : k_weight_ptr;
+      // Destination-major slot, matching pack_qkv_destination_major exactly.
+      const uint32_t global_head = head_id - component * num_qo_heads;
+      const uint32_t destination = global_head / num_local_heads;
+      const uint32_t local_head = global_head % num_local_heads;
+      const int64_t slot = (static_cast<int64_t>(destination) * num_tokens + token_id) * num_local_heads + local_head;
+      const int64_t out_elems = slot * (3 * kHeadDim) + component * kHeadDim;
+      store_ptr = pointer::offset(out_ptr, out_elems * static_cast<int64_t>(sizeof(DType)));
+    } else {
+      const bool load_q = head_id < num_qo_heads;
+      input = load_q ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
+                     : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
+      weight_ptr = load_q ? q_weight_ptr : k_weight_ptr;
+      store_ptr = const_cast<void*>(input);
+    }
 
     auto input_vec = load_as<Storage>(input, lane_id);
+    if constexpr (kPack) {
+      // V carries no norm and no RoPE -- relayout only.
+      if (component == 2) {
+        store_as<Storage>(store_ptr, input_vec, lane_id);
+        continue;
+      }
+    }
     const auto weight_vec = load_as<Storage>(weight_ptr, lane_id);
 
     if constexpr (kRoundNormBeforeRope) {
@@ -155,7 +200,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
           }
         }
       }
-      store_as<Storage>(const_cast<void*>(input), output_vec, lane_id);
+      store_as<Storage>(store_ptr, output_vec, lane_id);
       continue;
     }
 
@@ -224,7 +269,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
     for (uint32_t j = 0; j < kVecSize; ++j) {
       input_vec[j] = cast<Packed, fp32x2_t>({elems[2 * j], elems[2 * j + 1]});
     }
-    store_as<Storage>(const_cast<void*>(input), input_vec, lane_id);
+    store_as<Storage>(store_ptr, input_vec, lane_id);
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -241,8 +286,16 @@ template <
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   template <typename IdType>
-  static constexpr auto kernel =
-      fused_qknorm_rope_warp<kHeadDim, kRopeDim, kIsNeox, kUsePDL, DType, CacheDType, kRoundNormBeforeRope, IdType>;
+  static constexpr auto kernel = fused_qknorm_rope_warp<
+      kHeadDim,
+      kRopeDim,
+      kIsNeox,
+      kUsePDL,
+      DType,
+      CacheDType,
+      kRoundNormBeforeRope,
+      false,
+      IdType>;
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -286,15 +339,19 @@ struct QKNormRopeKernel {
     const auto params = QKNormRopeParams{
         .q_ptr = q.data_ptr(),
         .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
+        .v_ptr = nullptr,
+        .out_ptr = nullptr,
         .q_weight_ptr = q_weight.data_ptr(),
         .k_weight_ptr = k_weight.data_ptr(),
         .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
         .positions = positions.data_ptr(),
         .q_stride_bytes = q_stride_bytes,
         .k_stride_bytes = k_stride_bytes,
+        .v_stride_bytes = 0,
         .head_stride_bytes = head_stride_bytes,
         .num_qo_heads = num_qo_heads,
         .num_kv_heads = num_kv_heads,
+        .num_local_heads = 0,
         .num_tokens = num_tokens,
         .eps = eps,
     };
@@ -308,6 +365,123 @@ struct QKNormRopeKernel {
     };
     const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
+    const auto num_blocks = std::min(max_blocks, needed_blocks);
+    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
+  }
+};
+
+/// QKNorm + RoPE fused with the destination-major QKV pack that the Ulysses
+/// input all-to-all sends. Q/K arithmetic is shared with QKNormRopeKernel, so
+/// the packed bytes are bit-identical to running the in-place kernel followed
+/// by pack_qkv_destination_major -- only the store address differs.
+template <
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    bool kIsNeox,
+    bool kUsePDL,
+    typename DType,
+    typename CacheDType,
+    bool kRoundNormBeforeRope>
+struct QKNormRopePackKernel {
+  static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
+  template <typename IdType>
+  static constexpr auto kernel = fused_qknorm_rope_warp<
+      kHeadDim,
+      kRopeDim,
+      kIsNeox,
+      kUsePDL,
+      DType,
+      CacheDType,
+      kRoundNormBeforeRope,
+      true,
+      IdType>;
+
+  static void
+  run(const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView v,
+      const tvm::ffi::TensorView q_weight,
+      const tvm::ffi::TensorView k_weight,
+      const tvm::ffi::TensorView cos_sin_cache,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out,
+      float eps) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto H = SymbolicSize{"num_heads"};
+    auto L = SymbolicSize{"num_local_heads"};
+    auto W = SymbolicSize{"world_size"};
+    auto D = SymbolicSize{"head_dim"};
+    auto R = SymbolicSize{"rope_dim"};
+    auto Dq = SymbolicSize{"q_stride"};
+    auto Dk = SymbolicSize{"k_stride"};
+    auto Dv = SymbolicSize{"v_stride"};
+    auto Dd = SymbolicSize{"head_stride"};
+    auto device = SymbolicDevice{};
+    auto id_type = SymbolicDType{};
+    D.set_value(kHeadDim);
+    R.set_value(kRopeDim);
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, H, D}).with_strides({Dq, Dd, 1}).with_dtype<DType>().with_device(device).verify(q);
+    TensorMatcher({N, H, D}).with_strides({Dk, Dd, 1}).with_dtype<DType>().with_device(device).verify(k);
+    TensorMatcher({N, H, D}).with_strides({Dv, Dd, 1}).with_dtype<DType>().with_device(device).verify(v);
+    TensorMatcher({D}).with_dtype<DType>().with_device(device).verify(q_weight).verify(k_weight);
+    TensorMatcher({-1, R}).with_dtype<CacheDType>().with_device(device).verify(cos_sin_cache);
+    TensorMatcher({N}).with_dtype<int32_t, int64_t>(id_type).with_device(device).verify(positions);
+    // No with_strides() -- the send buffer must be contiguous.
+    TensorMatcher({W, N, L, 3 * kHeadDim}).with_dtype<DType>().with_device(device).verify(out);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_heads = static_cast<uint32_t>(H.unwrap());
+    const auto num_local_heads = static_cast<uint32_t>(L.unwrap());
+    const auto world_size = static_cast<uint32_t>(W.unwrap());
+    RuntimeCheck(
+        num_heads == world_size * num_local_heads,
+        "out must shard all ",
+        num_heads,
+        " heads, got world_size=",
+        world_size,
+        " x num_local_heads=",
+        num_local_heads);
+    if (num_tokens == 0 || num_heads == 0) return;
+    const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
+    const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
+    const auto v_stride_bytes = static_cast<int64_t>(Dv.unwrap() * sizeof(DType));
+    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
+
+    const int64_t head_block = static_cast<int64_t>(num_heads) * head_stride_bytes;
+    const auto params = QKNormRopeParams{
+        .q_ptr = q.data_ptr(),
+        .k_ptr = pointer::offset(k.data_ptr(), -head_block),
+        .v_ptr = pointer::offset(v.data_ptr(), -2 * head_block),
+        .out_ptr = out.data_ptr(),
+        .q_weight_ptr = q_weight.data_ptr(),
+        .k_weight_ptr = k_weight.data_ptr(),
+        .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
+        .positions = positions.data_ptr(),
+        .q_stride_bytes = q_stride_bytes,
+        .k_stride_bytes = k_stride_bytes,
+        .v_stride_bytes = v_stride_bytes,
+        .head_stride_bytes = head_stride_bytes,
+        .num_qo_heads = num_heads,
+        .num_kv_heads = num_heads,
+        .num_local_heads = num_local_heads,
+        .num_tokens = num_tokens,
+        .eps = eps,
+    };
+
+    const auto is_int32 = id_type.is_type<int32_t>();
+    const auto selected_kernel = is_int32 ? kernel<int32_t> : kernel<int64_t>;
+    const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
+    static const uint32_t kOccupancyTable[2] = {
+        runtime::get_blocks_per_sm(kernel<int32_t>, kThreadsPerBlock),
+        runtime::get_blocks_per_sm(kernel<int64_t>, kThreadsPerBlock),
+    };
+    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
+    const auto num_works = 3 * num_heads * num_tokens;
     const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
     const auto num_blocks = std::min(max_blocks, needed_blocks);
     LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);

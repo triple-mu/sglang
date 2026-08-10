@@ -322,6 +322,42 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+def usp_packed_qkv_send_buffer(
+    rows: int,
+    num_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """The destination-major send buffer `_usp_input_a2a_prepacked_qkv` consumes.
+
+    Exposed so a producer kernel can write the packed layout directly instead of
+    materializing Q/K/V first and packing them in a second pass.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    return _a2a_staging_buffer(
+        "usp_packed_qkv_src",
+        (world_size, rows, num_heads // world_size, 3 * head_size),
+        dtype,
+        device,
+    )
+
+
+def _usp_input_a2a_prepacked_qkv(
+    packed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange an already destination-major [ws, s_local, h_local, 3*d] buffer.
+
+    Sequence is the outer axis of every received chunk, so recovering
+    [s_global, h_local, d] is a free view; Q/K/V come back as strided slices of
+    the receive buffer with no further copy.
+    """
+    world_size, s_local, h_local, packed_dim = packed.shape
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = packed.reshape(s_local * world_size, h_local, packed_dim)
+    return packed.split(packed_dim // 3, dim=-1)
+
+
 def _usp_input_all_to_all_packed_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -349,11 +385,8 @@ def _usp_input_all_to_all_packed_qkv(
             k,
             v,
             world_size,
-            out=_a2a_staging_buffer(
-                "usp_packed_qkv_src",
-                (world_size, s_local, h_local, 3 * head_size),
-                q.dtype,
-                q.device,
+            out=usp_packed_qkv_send_buffer(
+                s_local, h_global, head_size, q.dtype, q.device
             ),
         )
     else:
@@ -368,10 +401,7 @@ def _usp_input_all_to_all_packed_qkv(
             )
             packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
 
-    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
-    packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
-    q, k, v = packed.split(head_size, dim=-1)
-    return q, k, v
+    return _usp_input_a2a_prepacked_qkv(packed)
 
 
 def _can_use_packed_qkv_a2a_4d(

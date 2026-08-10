@@ -18,7 +18,9 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_qknorm_rope_pack_qkv,
     fused_inplace_qknorm_rope,
+    fused_qknorm_rope_pack_qkv,
 )
 from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_gate_bf16_,
@@ -445,21 +447,53 @@ def _minimax_h3_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
     ring_active: bool = False,
+    pending_rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
     This is the narrow BCG break point: projections, normalization, RoPE,
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
+
+    ``pending_rope_cache`` means the caller deliberately left QK-norm and RoPE
+    undone so they can be fused with the destination-major pack of the Ulysses
+    send buffer -- one memory pass instead of an in-place RoPE followed by a
+    separate packing pass. It is only ever set when Ulysses is active, and it
+    runs here rather than in ``forward`` so the send buffer stays an eager
+    allocation (see ``_a2a_staging_buffer``'s capture handling).
     """
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_input_a2a_prepacked_qkv,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
+            usp_packed_qkv_send_buffer,
         )
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if pending_rope_cache is None:
+            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        else:
+            cos_sin_cache, positions = pending_rope_cache
+            packed = usp_packed_qkv_send_buffer(
+                q.shape[0], attention.num_heads, attention.head_dim, q.dtype, q.device
+            )
+            fused_qknorm_rope_pack_qkv(
+                q,
+                k,
+                v,
+                attention.q_norm.weight,
+                attention.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                packed,
+                is_neox=True,
+                eps=attention.q_norm.eps,
+                head_dim=attention.head_dim,
+                rope_dim=cos_sin_cache.shape[-1],
+                round_norm_before_rope=True,
+            )
+            q, k, v = _usp_input_a2a_prepacked_qkv(packed)
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -559,6 +593,19 @@ class MiniMaxH3Attention(nn.Module):
                 round_norm_before_rope=True,
             )
         )
+        # Same kernel, but storing into the Ulysses send buffer instead of in
+        # place, which folds the destination-major pack into the RoPE pass.
+        self._use_fused_qknorm_rope_pack = (
+            current_platform.is_cuda()
+            and can_use_fused_qknorm_rope_pack_qkv(
+                arch.attention_head_dim,
+                rope_dim,
+                True,
+                _BF16_DTYPE,
+                cache_dtype=_BF16_DTYPE,
+                round_norm_before_rope=True,
+            )
+        )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
             arch.hidden_size,
@@ -635,7 +682,9 @@ class MiniMaxH3Attention(nn.Module):
         qkv/norm/RoPE run locally, an all-to-all trades sequence for heads.
         Each rank attends the full sequence with heads/world_size local heads,
         so cu_seqlens retains global packed-document semantics. The inverse
-        all-to-all restores the row shard before the output projection.
+        all-to-all restores the row shard before the output projection. Norm and
+        RoPE then move into the attention core, where one kernel writes the
+        destination-major send buffer the all-to-all needs.
         """
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
@@ -643,6 +692,15 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
+        # Under Ulysses, QK-norm + RoPE are deferred into the attention core so
+        # the same kernel can emit the destination-major all-to-all send buffer,
+        # which removes the separate packing pass over q/k/v.
+        fuse_rope_into_pack = (
+            ulysses_active
+            and rope_cache is not None
+            and self._use_fused_qknorm_rope_pack
+            and not torch.compiler.is_compiling()
+        )
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -651,7 +709,7 @@ class MiniMaxH3Attention(nn.Module):
                 self.k_norm,
                 self.head_dim,
             )
-        else:
+        elif not fuse_rope_into_pack:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
                 fused_inplace_qknorm_rope(
@@ -692,6 +750,7 @@ class MiniMaxH3Attention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            pending_rope_cache=rope_cache if fuse_rope_into_pack else None,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)

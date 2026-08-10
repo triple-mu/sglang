@@ -310,3 +310,89 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
 
     actual = pack_qkv_destination_major(q.contiguous(), k.contiguous(), v, world_size)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@patch(
+    "sglang.multimodal_gen.runtime.layers.usp.get_ulysses_parallel_world_size",
+    return_value=4,
+)
+def test_cuda_fused_qknorm_rope_pack_feeds_the_same_exchange(_):
+    """The H3 fused path must hand the a2a the same bytes as norm+RoPE+pack."""
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        can_use_fused_qknorm_rope_pack_qkv,
+        fused_inplace_qknorm_rope,
+        fused_qknorm_rope_pack_qkv,
+    )
+    from sglang.multimodal_gen.runtime.layers.usp import (
+        _usp_input_a2a_prepacked_qkv,
+        _usp_input_all_to_all_packed_qkv,
+        usp_packed_qkv_send_buffer,
+    )
+
+    rows, heads, head_size, rope_dim = 65, 56, 128, 96
+    if not can_use_fused_qknorm_rope_pack_qkv(
+        head_size,
+        rope_dim,
+        True,
+        torch.bfloat16,
+        cache_dtype=torch.bfloat16,
+        round_norm_before_rope=True,
+    ):
+        pytest.skip("fused QKNorm+RoPE+pack kernel unavailable")
+
+    torch.manual_seed(23)
+    qkv = torch.randn(rows, 3 * heads * head_size, device="cuda", dtype=torch.bfloat16)
+    q_weight = torch.randn(head_size, device="cuda", dtype=torch.bfloat16)
+    k_weight = torch.randn(head_size, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int64)
+    cos_sin_cache = torch.randn(
+        rows, rope_dim, device="cuda", dtype=torch.bfloat16
+    ).clamp_(-1.0, 1.0)
+
+    def split_views(buffer):
+        return [
+            tensor.view(rows, heads, head_size)
+            for tensor in buffer.split(heads * head_size, dim=-1)
+        ]
+
+    # Identity exchange: this pins the send-buffer layout, not the collective.
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.usp._usp_all_to_all_single",
+        side_effect=lambda x, role=None: x.clone(),
+    ):
+        q_ref, k_ref, v_ref = split_views(qkv.clone())
+        fused_inplace_qknorm_rope(
+            q_ref,
+            k_ref,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=1e-5,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+        )
+        expected = _usp_input_all_to_all_packed_qkv(q_ref, k_ref, v_ref)
+
+        q, k, v = split_views(qkv.clone())
+        packed = usp_packed_qkv_send_buffer(rows, heads, head_size, q.dtype, q.device)
+        fused_qknorm_rope_pack_qkv(
+            q,
+            k,
+            v,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            packed,
+            is_neox=True,
+            eps=1e-5,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+        )
+        actual = _usp_input_a2a_prepacked_qkv(packed)
+
+    for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
+        assert torch.equal(actual_tensor, expected_tensor)

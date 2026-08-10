@@ -49,6 +49,33 @@ def _jit_qknorm_rope_module(
     )
 
 
+@cache_once
+def _jit_qknorm_rope_pack_module(
+    head_dim: int,
+    rope_dim: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+    cache_dtype: torch.dtype,
+    round_norm_before_rope: bool,
+) -> Module:
+    args = make_cpp_args(
+        head_dim,
+        rope_dim,
+        is_neox,
+        is_arch_support_pdl(),
+        dtype,
+        cache_dtype,
+        round_norm_before_rope,
+    )
+    # A marker of its own so the in-place module stays exactly as it is today.
+    return load_jit(
+        "qknorm_rope_pack",
+        *args,
+        cuda_files=["diffusion/qknorm_rope.cuh"],
+        cuda_wrappers=[("qknorm_rope_pack", f"QKNormRopePackKernel<{args}>::run")],
+    )
+
+
 @torch.compiler.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm_rope(
@@ -139,3 +166,74 @@ def fused_inplace_qknorm_rope(
         round_norm_before_rope,
     )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
+
+
+@torch.compiler.assume_constant_result
+@cache_once
+def can_use_fused_qknorm_rope_pack_qkv(
+    head_dim: int,
+    rope_dim: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+    cache_dtype: torch.dtype = torch.float32,
+    round_norm_before_rope: bool = False,
+) -> bool:
+    if not can_use_fused_inplace_qknorm_rope(
+        head_dim, rope_dim, is_neox, dtype, cache_dtype, round_norm_before_rope
+    ):
+        return False
+    try:
+        _jit_qknorm_rope_pack_module(
+            head_dim,
+            rope_dim,
+            is_neox,
+            dtype,
+            cache_dtype,
+            round_norm_before_rope,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load JIT fused QKNorm+RoPE+pack kernel: {e}")
+        return False
+
+
+@register_custom_op(mutates_args=["out"])
+def fused_qknorm_rope_pack_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
+) -> None:
+    """QKNorm+RoPE writing straight into the destination-major Ulysses send buffer.
+
+    ``q``/``k``/``v`` are ``[num_tokens, num_heads, head_dim]``; ``out`` is a
+    contiguous ``[world_size, num_tokens, num_heads // world_size, 3 * head_dim]``
+    buffer. Q and K keep the exact arithmetic of
+    :func:`fused_inplace_qknorm_rope` and V is copied verbatim, so ``out`` is
+    bit-identical to packing the in-place result with
+    ``pack_qkv_destination_major`` -- one memory pass instead of two, and
+    ``q``/``k`` are left untouched.
+    """
+    head_dim = head_dim or q.size(-1)
+    rope_dim = rope_dim or cos_sin_cache.size(-1)
+    module = _jit_qknorm_rope_pack_module(
+        head_dim,
+        rope_dim,
+        is_neox,
+        q.dtype,
+        cos_sin_cache.dtype,
+        round_norm_before_rope,
+    )
+    module.qknorm_rope_pack(
+        q, k, v, q_weight, k_weight, cos_sin_cache, positions, out, eps
+    )

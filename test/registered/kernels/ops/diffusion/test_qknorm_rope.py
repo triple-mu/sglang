@@ -8,7 +8,7 @@ import triton
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=44, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")
 
@@ -214,6 +214,142 @@ def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
 
     assert torch.equal(q_ref, q_fused)
     assert torch.equal(k_ref, k_fused)
+
+
+def _packed_qkv_views(
+    num_tokens: int, num_heads: int, head_dim: int, dtype: torch.dtype
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """A fused [tokens, 3 * inner] projection output, split like MiniMax H3 does."""
+    inner_dim = num_heads * head_dim
+    qkv = torch.randn(num_tokens, 3 * inner_dim, device=DEVICE, dtype=dtype)
+    views = tuple(
+        t.view(num_tokens, num_heads, head_dim) for t in qkv.split(inner_dim, dim=-1)
+    )
+    return qkv, views
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("round_norm_before_rope", [False, True])
+def test_qknorm_rope_pack_matches_inplace_then_pack(
+    world_size: int, round_norm_before_rope: bool
+) -> None:
+    """The fused pack must be a pure relayout of the in-place kernel's output."""
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        fused_inplace_qknorm_rope,
+        fused_qknorm_rope_pack_qkv,
+    )
+    from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
+        pack_qkv_destination_major,
+    )
+
+    dtype = DTYPE
+    torch.manual_seed(0)
+    num_tokens, num_heads, head_dim, rope_dim = 257, 4 * world_size, 128, 96
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, num_tokens)
+    if round_norm_before_rope:
+        cos_sin_cache = cos_sin_cache.to(dtype)
+
+    qkv, (q, k, v) = _packed_qkv_views(num_tokens, num_heads, head_dim, dtype)
+    qkv_ref = qkv.clone()
+    inner_dim = num_heads * head_dim
+    q_ref, k_ref, v_ref = (
+        t.view(num_tokens, num_heads, head_dim)
+        for t in qkv_ref.split(inner_dim, dim=-1)
+    )
+
+    fused_inplace_qknorm_rope(
+        q_ref,
+        k_ref,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox=True,
+        eps=1e-5,
+        rope_dim=rope_dim,
+        round_norm_before_rope=round_norm_before_rope,
+    )
+    expected = pack_qkv_destination_major(q_ref, k_ref, v_ref, world_size)
+
+    out = torch.empty(
+        world_size,
+        num_tokens,
+        num_heads // world_size,
+        3 * head_dim,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    fused_qknorm_rope_pack_qkv(
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        out,
+        is_neox=True,
+        eps=1e-5,
+        rope_dim=rope_dim,
+        round_norm_before_rope=round_norm_before_rope,
+    )
+
+    assert torch.equal(out, expected)
+
+
+def test_qknorm_rope_pack_leaves_inputs_untouched() -> None:
+    from sglang.kernels.ops.diffusion.qknorm_rope import fused_qknorm_rope_pack_qkv
+
+    torch.manual_seed(0)
+    world_size, num_tokens, num_heads, head_dim, rope_dim = 2, 33, 8, 128, 96
+    qkv, (q, k, v) = _packed_qkv_views(num_tokens, num_heads, head_dim, DTYPE)
+    qkv_before = qkv.clone()
+    weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, num_tokens).to(DTYPE)
+    out = torch.empty(
+        world_size,
+        num_tokens,
+        num_heads // world_size,
+        3 * head_dim,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
+    fused_qknorm_rope_pack_qkv(
+        q,
+        k,
+        v,
+        weight,
+        weight,
+        cos_sin_cache,
+        positions,
+        out,
+        is_neox=True,
+        eps=1e-5,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+    )
+    assert torch.equal(qkv, qkv_before)
+
+    with pytest.raises(Exception):
+        fused_qknorm_rope_pack_qkv(
+            q,
+            k,
+            v,
+            weight,
+            weight,
+            cos_sin_cache,
+            positions,
+            out[:, :, :, : 2 * head_dim].contiguous(),
+            is_neox=True,
+            eps=1e-5,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+        )
 
 
 def test_qknorm_rope_accepts_empty_token_dimension() -> None:
