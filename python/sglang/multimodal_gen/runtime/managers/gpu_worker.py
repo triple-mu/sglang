@@ -464,17 +464,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         A profiler run with ``--capture-range=cudaProfilerApi`` only starts
         recording once this range opens, so weight loading, FSDP sharding and
-        the warmup requests never reach the report. The range is per-process:
-        ranks outside ``--cuda-profiler-ranks`` stay silent even though the
-        profiler followed the fork.
+        the warmup requests never reach the report.
         """
+        profiler_ranks = self.server_args.resolved_cuda_profiler_ranks()
         enabled = (
             self.server_args.enable_cuda_profiler_range
             and not req.is_warmup
             # cudaProfilerStart/Stop is a CUDA/HIP call; there is no equivalent
             # to bracket on the other platforms.
             and current_platform.is_cuda_alike()
-            and self.rank in self.server_args.resolved_cuda_profiler_ranks()
+            # None = every rank, the default. See resolved_cuda_profiler_ranks:
+            # profiling only some ranks of a collective job has deadlocked NCCL
+            # and left the aborted ranks' GPUs needing a host reboot.
+            and (profiler_ranks is None or self.rank in profiler_ranks)
         )
         if not enabled:
             yield

@@ -555,15 +555,26 @@ class ServerArgs(DisaggServerArgsMixin):
         buckets = sorted({int(b) for b in raw if int(b) > 0})
         return tuple(buckets) or DEFAULT_BCG_TEXT_BUCKETS
 
-    def resolved_cuda_profiler_ranks(self) -> frozenset[int]:
+    def resolved_cuda_profiler_ranks(self) -> frozenset[int] | None:
         """Worker ranks that bracket their timed forward with the profiler range.
 
-        Defaults to rank 0 alone: the range is what makes a profiler start
-        recording, so every extra rank listed here multiplies the report size.
+        ``None`` means every rank, which is the default and the only safe choice
+        for a job with collectives. Restricting the set leaves the other ranks
+        outside the capture range while the profiler attaches to the listed ones,
+        and that asymmetry has been observed to deadlock NCCL: an ALLREDUCE
+        issued just after ``cudaProfilerStart`` never completed, the watchdog
+        took seven of eight ranks down via ``abort()``, and because ``abort()``
+        skips CUDA teardown every one of those seven GPUs was left with the
+        profiler's clock locks applied. The eighth rank exited normally and its
+        GPU was fine. Under persistence mode nothing reclaims the other seven,
+        so the host needs a reboot.
+
+        Restricting also does not buy what it looks like it buys: nsys starts
+        collection session-wide, so every process still lands in the report.
         """
         raw = self.cuda_profiler_ranks
         if not raw:
-            return frozenset({0})
+            return None
         return frozenset(int(rank) for rank in raw)
 
     def _validate_breakable_cuda_graph(self):
@@ -1776,11 +1787,14 @@ class ServerArgs(DisaggServerArgsMixin):
             nargs="+",
             default=ServerArgs.cuda_profiler_ranks,
             help="Worker ranks that emit the --enable-cuda-profiler-range "
-            "range. Defaults to rank 0 only. The capture range is per-process, "
-            "so a rank omitted here records nothing even though the profiler "
-            "followed the fork — which is how a many-rank job still produces a "
-            "report small enough to open. Pass e.g. `0 4` to keep one rank per "
-            "NUMA domain.",
+            "range. Defaults to every rank, which is the only safe setting for "
+            "a job with collectives: leaving some ranks outside the range while "
+            "the profiler attaches to the others has been observed to deadlock "
+            "NCCL, and the resulting abort() skips CUDA teardown and strands "
+            "the profiler's clock locks on those GPUs until the host reboots. "
+            "Restricting the set also does not shrink the report, because nsys "
+            "starts collection session-wide and captures every process either "
+            "way. Only restrict for single-process runs.",
         )
 
         # warmup

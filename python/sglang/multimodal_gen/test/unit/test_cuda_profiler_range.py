@@ -18,11 +18,13 @@ class TestResolvedCudaProfilerRanks(unittest.TestCase):
         args.cuda_profiler_ranks = ranks
         return args
 
-    def test_unset_defaults_to_rank_zero_only(self):
-        self.assertEqual(
-            self._args(None).resolved_cuda_profiler_ranks(), frozenset({0})
-        )
-        self.assertEqual(self._args([]).resolved_cuda_profiler_ranks(), frozenset({0}))
+    def test_unset_means_every_rank(self):
+        # None, not {0}: profiling a strict subset of a collective job left the
+        # unprofiled ranks outside the capture range, deadlocked an ALLREDUCE,
+        # and the watchdog's abort() stranded the profiler's clock locks on
+        # every GPU whose rank died that way.
+        self.assertIsNone(self._args(None).resolved_cuda_profiler_ranks())
+        self.assertIsNone(self._args([]).resolved_cuda_profiler_ranks())
 
     def test_explicit_ranks_are_deduplicated(self):
         self.assertEqual(
@@ -77,9 +79,18 @@ class TestCudaProfilerRange(unittest.TestCase):
         profiler.start.assert_not_called()
         profiler.stop.assert_not_called()
 
-    def test_rank_outside_the_selection_stays_silent(self):
-        # The range is per-process, so an unlisted rank contributes nothing to
-        # the report even though the profiler followed the fork.
+    def test_every_rank_profiles_when_the_set_is_unset(self):
+        # The safe default: no rank is left outside the capture range.
+        for rank in (0, 1, 7):
+            profiler = self._run(
+                self._worker(enabled=True, ranks=None, rank=rank),
+                _FakeReq(is_warmup=False),
+            )
+            profiler.start.assert_called_once_with()
+
+    def test_rank_outside_an_explicit_selection_stays_silent(self):
+        # Restricting still works for single-process runs, where there is no
+        # collective to deadlock.
         profiler = self._run(
             self._worker(enabled=True, ranks=[0, 4], rank=1),
             _FakeReq(is_warmup=False),
