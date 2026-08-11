@@ -103,6 +103,7 @@ class LayerwiseOffloadManager:
         prefetch_size: int = 1,
         resident_layers: int = 0,
         residency_policy: str = RESIDENCY_POLICY_LEADING,
+        tensor_pattern: str | None = None,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
@@ -122,6 +123,9 @@ class LayerwiseOffloadManager:
         self._resident_set = frozenset(range(self.num_layers)) - set(
             self._streamed_order
         )
+        # Restricts streaming to the parameters whose name matches. None streams
+        # every parameter of a selected layer, which is the historical behaviour.
+        self._tensor_filter = re.compile(tensor_pattern) if tensor_pattern else None
         # Armed on the first denoise forward, so that the load-time prefetch below
         # does not pin the whole resident set before the DiT is the active component.
         self._residency_active = False
@@ -233,6 +237,14 @@ class LayerwiseOffloadManager:
         for name, tensor in self._named_parameters.items():
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
+                continue
+            if self._tensor_filter is not None and not self._tensor_filter.search(name):
+                # Selected out: stays resident like a non-layer parameter. Lets a
+                # caller stream one sublayer instead of the whole block, which
+                # matters when the sublayers are not alike. In the MiniMax-H3
+                # DiT, adaln_proj is 24.23 of the 61.73 GiB -- more than mlp or
+                # attn -- and it is a matrix-vector product against a per-step
+                # embedding, so it moves the most bytes for the least compute.
                 continue
             self._has_dtensor_weights = self._has_dtensor_weights or isinstance(
                 tensor, DTensor
@@ -783,6 +795,11 @@ class LayerwiseOffloadableModuleMixin:
                     server_args.dit_layerwise_residency_policy
                     if dit_tuning_enabled
                     else RESIDENCY_POLICY_LEADING
+                ),
+                tensor_pattern=(
+                    server_args.dit_layerwise_tensor_pattern
+                    if dit_tuning_enabled
+                    else None
                 ),
             )
             self.layerwise_offload_managers.append(manager)

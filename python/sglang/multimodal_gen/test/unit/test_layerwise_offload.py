@@ -176,6 +176,7 @@ def _server_args(**kwargs):
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        dit_layerwise_tensor_pattern=None,
         pin_cpu_memory=False,
     )
     defaults.update(kwargs)
@@ -955,3 +956,38 @@ def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
     resident = set(range(8)) - set(manager._streamed_order)
     assert resident <= manager._gpu_layers
     assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
+
+
+def test_tensor_pattern_streams_only_matching_parameters(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    # Blocks whose sublayers are not alike are the reason this exists: in the
+    # MiniMax-H3 DiT the adaln projection is 24.2 of the 61.7 GiB and does a
+    # matrix-vector product, so streaming it while the compute-heavy parameters
+    # stay resident moves the most bytes for the least lost overlap.
+    model = _MultiBlockModel(3)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=3,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+        tensor_pattern="weight",
+    )
+    for layer_idx in range(3):
+        names = set(manager._weight_metadata.get(layer_idx, {}))
+        assert names == {f"blocks.{layer_idx}.weight"}, names
+
+    # The unmatched parameter keeps its real storage rather than a placeholder.
+    assert model.blocks[0].bias.numel() == 3
+
+
+def test_no_tensor_pattern_streams_the_whole_block(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(_MultiBlockModel(3), num_layers=3)
+    for layer_idx in range(3):
+        names = set(manager._weight_metadata.get(layer_idx, {}))
+        assert names == {
+            f"blocks.{layer_idx}.weight",
+            f"blocks.{layer_idx}.bias",
+        }, names
