@@ -239,7 +239,6 @@ class MiniMaxH3DenoiseBranch:
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
         step_timesteps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        step_adaln_params: Any | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
         audio_x = self.audio_x_buffer
@@ -270,8 +269,6 @@ class MiniMaxH3DenoiseBranch:
             "inverse_indices": inverse_indices,
             "block_combined_indices": block_combined_indices,
         }
-        if step_adaln_params is not None:
-            kwargs["step_adaln_params"] = step_adaln_params
         return kwargs
 
     def _expand_step_timesteps(
@@ -379,7 +376,6 @@ def minimax_h3_denoise_loop(
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
-    hoist_step_adaln: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -389,7 +385,7 @@ def minimax_h3_denoise_loop(
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
     ``model_forward`` is the native-stage hook for residency/BCG runners and
     receives the zero-based loop step; the default keeps this helper
-    independently testable with a plain callable. ``hoist_step_adaln`` batches
+    independently testable with a plain callable.
     every step's AdaLN projection into one GEMM per block before the loop.
     """
     if len(sigmas_video) != len(sigmas_audio):
@@ -460,14 +456,6 @@ def minimax_h3_denoise_loop(
         audio_ref_cond_noise_aug=float(audio_cond_noise_aug_for_inference),
     )
     use_nvtx = layerwise_nvtx_enabled()
-    # adaln_proj streams 520MB of weights per block per step for at most three
-    # rows of output; every step's rows are known here, so project them once.
-    adaln_plan = None
-    if hoist_step_adaln:
-        with maybe_nvtx_range("h3_precompute_step_adaln", use_nvtx):
-            adaln_plan = model.build_step_adaln_params(
-                [plan[0] for plan in timestep_plan]
-            )
     # match the scheduler's device-fp32 math once, then reuse one denoised
     # scratch per modality instead of allocating intermediates every step
     video_sigmas = torch.tensor(sigmas_video, dtype=torch.float32, device=device)
@@ -491,9 +479,6 @@ def minimax_h3_denoise_loop(
                     video_rows=video_rows,
                     audio_rows=audio_rows,
                     step_timesteps=timestep_plan[step],
-                    step_adaln_params=(
-                        None if adaln_plan is None else adaln_plan[step]
-                    ),
                 )
             with torch.inference_mode():
                 with maybe_nvtx_range("h3_model_forward", use_nvtx):

@@ -605,11 +605,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     # graph capture and compile both freeze the forward input
                     # signature, so the hoisted per-step tensors cannot be fed
                     # through them.
-                    hoist_step_adaln=(
-                        not server_args.enable_breakable_cuda_graph
-                        and not server_args.enable_torch_compile
-                        and model.can_hoist_step_adaln()
-                    ),
                 )
         finally:
             self._finish_active_component_use()
