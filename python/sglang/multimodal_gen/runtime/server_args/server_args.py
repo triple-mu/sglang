@@ -322,6 +322,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = "leading"
+    # Restrict layerwise streaming to parameters matching this regex.
+    dit_layerwise_tensor_pattern: str | None = None
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -1820,6 +1822,21 @@ class ServerArgs(DisaggServerArgsMixin):
             "every denoising step, the predict_noise / scheduler_step "
             "sub-operations, and every transformer submodule forward (recursive). "
             "Warmup steps are excluded to keep captured traces clean.",
+        )
+
+        parser.add_argument(
+            "--dit-layerwise-tensor-pattern",
+            type=str,
+            default=ServerArgs.dit_layerwise_tensor_pattern,
+            help="Restrict --dit-layerwise-offload to the DiT parameters whose "
+            "name matches this regex; everything else in the block stays "
+            "resident. Unset streams whole blocks, which is the historical "
+            "behaviour and the right default when the sublayers are alike. They "
+            "are not always alike: in the MiniMax-H3 DiT the adaln projection is "
+            "24.2 of the 61.7 GiB, more than the MLP or the attention, and it is "
+            "a matrix-vector product against a per-step embedding -- the most "
+            "bytes moved for the least compute in the block. Streaming only that "
+            "with `adaln_proj` keeps the compute-heavy parameters on the GPU.",
         )
 
         # warmup
