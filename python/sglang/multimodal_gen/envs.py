@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
+    SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -294,6 +296,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory is low or when this flag is disabled.
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
+    ),
+    # MiniMax-H3: project every denoise step's AdaLN rows before the loop, so
+    # the pure-weight-stream adaln_proj GEMM reads its 520MB of weights once
+    # per block instead of once per block per step. Off by default: batching
+    # the steps changes the GEMM's M dimension and therefore cuBLAS kernel
+    # selection, which is not guaranteed bitwise identical.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST"
+    ),
+    # Requires the hoist. Drop the 26GB of adaln_proj weights to host memory
+    # once the plan is built, and rebuild the plan straight from memory while
+    # the schedule repeats. Off by default: it trades 26GB of host RAM per
+    # rank for the device memory, and a schedule change pays a 26GB restore.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
