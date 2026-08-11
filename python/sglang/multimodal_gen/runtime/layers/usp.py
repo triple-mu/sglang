@@ -113,9 +113,10 @@ def _usp_all_to_all_single_varlen(
     return output
 
 
-# (role, shape, dtype) -> symmetric output window for the zero-copy `out=`
-# path. Only the buffers live here; the collective itself belongs to the
-# sequence-parallel group that owns the process group it exchanges over.
+# (role, shape, dtype) -> symmetric output window for the SYNCHRONOUS zero-copy
+# path. The async path does not appear here: the group lends it a window and
+# reclaims it by reference count, which is the same rule enforced rather than
+# left to this module.
 _FAST_ULYSSES_OUT_BUFFERS: dict[tuple, torch.Tensor] = {}
 
 
@@ -127,21 +128,14 @@ def _fast_ulysses_group():
 def _fast_ulysses_out_buffer(group, role: str, x: torch.Tensor, mode: int):
     """A cached symmetric output buffer to pass as ``out=``, or ``None``.
 
-    Writing straight into the window removes the copy-out, which is where most
-    of this transport's advantage over the existing path comes from -- without
-    it the exchange is barely faster than what sglang already runs.
+    Only the synchronous path needs this: its two exchanges never overlap, so
+    one buffer per role is enough and the "read it before reissuing" rule is
+    trivially met. The async path lends its window from the group instead --
+    see :func:`fast_ulysses_async_input_exchange`.
 
-    ``empty_output`` is collective, so a buffer is only ever allocated where
-    every rank arrives together: the first exchange of a given shape, which is
-    the same layer of the same step on every rank. One buffer per role, because
-    a call overwrites the buffer it writes into and roles can be in flight at
-    once.
-
-    Symmetric windows are never released, so the cache is capped: a server
-    rotating through resolutions would otherwise accumulate one window per
-    shape (~180MB per rank at H3's geometry). Past the cap this returns None
-    and the exchange pays its copy-out instead of leaking. The cap is checked
-    against a process-wide count, so every rank crosses it on the same call.
+    Symmetric windows are never released, so the cache is capped; past the cap
+    this returns None and the exchange pays its copy-out rather than leaking.
+    The cap is a process-wide count, so every rank crosses it on the same call.
     """
     # A buffer first allocated during capture would live in the graph's private
     # pool, and the allocation is collective besides.
@@ -161,7 +155,7 @@ def _fast_ulysses_out_buffer(group, role: str, x: torch.Tensor, mode: int):
 
 
 def _fast_ulysses_exchange(group, role: str, x: torch.Tensor, mode: int):
-    """One fast-ulysses exchange, zero-copy when the window is available."""
+    """One synchronous fast-ulysses exchange, zero-copy when a window is free."""
     out = _fast_ulysses_out_buffer(group, role, x, mode)
     if out is None:
         return group.all_to_all_4d(x, mode=mode)
@@ -176,10 +170,12 @@ def fast_ulysses_async_input_exchange(x: torch.Tensor, role: str):
     fast transport is unavailable -- the caller then has to fall back for the
     whole q/k/v group, not per tensor.
 
-    All roles share ONE collective. fast-ulysses pools its staging buffers per
-    shape, so same-shaped exchanges of different roles get different slots and
-    run concurrently; one group per role would only duplicate a comm stream, a
-    window map and a barrier state to get the same thing.
+    ``lend=True`` leaves the output window to the group: it hands out a slot no
+    live result still refers to, so concurrent exchanges cannot land in the same
+    buffer. Doing this with ``out=`` instead would mean holding one buffer per
+    role here and never reading a result after reissuing its call -- a rule
+    nothing could enforce, since reading your own ``out`` touches nothing that
+    would notice.
     """
     group = _fast_ulysses_group()
     if group is None:
@@ -191,11 +187,7 @@ def fast_ulysses_async_input_exchange(x: torch.Tensor, role: str):
     # dispatcher, which for H3 is FlashAttention -- charged to attention, not
     # to the collective.
     with maybe_nvtx_range(f"usp.async_issue_{role}", layerwise_nvtx_enabled()):
-        staged = x.unsqueeze(0)
-        out = _fast_ulysses_out_buffer(group, f"async_{role}", staged, 0)
-        if out is None:
-            return group.all_to_all_4d_async(staged, mode=0)
-        return group.all_to_all_4d_async(staged, mode=0, out=out)
+        return group.all_to_all_4d_async(x.unsqueeze(0), mode=0, lend=True)
 
 
 def fast_ulysses_wait(handle) -> torch.Tensor:
