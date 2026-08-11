@@ -60,6 +60,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln import (
+    AdalnWeightStash,
+    adaln_plan_key,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -1072,6 +1076,22 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             and not torch.compiler.is_compiling()
         )
 
+    def _adaln_linears(self) -> list[nn.Module]:
+        return [block.adaln_proj.linear for block in self.blocks] + [
+            self.final_layer.adaln_proj.linear
+        ]
+
+    def can_offload_step_adaln(self) -> bool:
+        """Whether the AdaLN weights may be dropped once the plan is built.
+
+        Only meaningful on top of the hoist: without it the projection runs
+        every step and the weights are never idle.
+        """
+        return (
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD
+            and self.can_hoist_step_adaln()
+        )
+
     def _project_adaln_per_step(
         self, projection: nn.Module, row_slices: list[torch.Tensor]
     ) -> torch.Tensor:
@@ -1174,23 +1194,36 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         changing a bit. Either way the time embedding still runs per step, so
         ``adaln_input`` is bitwise identical to the loop's.
 
+        The projected rows depend only on the timesteps, so a repeat of the
+        same schedule reuses them and never touches the weights again.
+
         Returns one ``(per_block_params, final_layer_params)`` entry per step.
         """
-        row_counts = [int(t.numel()) for t in step_unique_timesteps]
-        adaln_input = torch.cat(
-            [
-                nn.functional.silu(self.time_embedder(unique_timesteps.view(-1))).to(
-                    _BF16_DTYPE
-                )
-                for unique_timesteps in step_unique_timesteps
-            ]
-        )
-        outputs = self._project_adaln_plan(adaln_input, row_counts)
-        block_outputs, final_output = outputs[:-1], outputs[-1]
+        key = adaln_plan_key(step_unique_timesteps)
+        if self._adaln_plan_memo is not None and self._adaln_plan_memo[0] == key:
+            block_outputs, final_output = self._adaln_plan_memo[1]
+        else:
+            if self._adaln_stash is not None:
+                self._adaln_stash.restore()
+                self._adaln_stash = None
+            row_counts = [int(t.numel()) for t in step_unique_timesteps]
+            adaln_input = torch.cat(
+                [
+                    nn.functional.silu(
+                        self.time_embedder(unique_timesteps.view(-1))
+                    ).to(_BF16_DTYPE)
+                    for unique_timesteps in step_unique_timesteps
+                ]
+            )
+            outputs = self._project_adaln_plan(adaln_input, row_counts)
+            block_outputs, final_output = outputs[:-1], outputs[-1]
+            self._adaln_plan_memo = (key, (block_outputs, final_output))
+            if self.can_offload_step_adaln():
+                self._adaln_stash = AdalnWeightStash(self._adaln_linears())
         plan = []
         start = 0
-        for rows in row_counts:
-            stop = start + rows
+        for unique_timesteps in step_unique_timesteps:
+            stop = start + int(unique_timesteps.numel())
             plan.append(
                 (
                     tuple(
@@ -1353,6 +1386,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self._adaln_hoist_gate = BitExactFusionGate(
             "MiniMax-H3 hoisted AdaLN projection", per_signature=True
         )
+        # hoisted-AdaLN residency: the projected plan for the last schedule,
+        # and host custody of the weights it stands in for.
+        self._adaln_plan_memo: tuple[bytes, tuple] | None = None
+        self._adaln_stash: AdalnWeightStash | None = None
         self._mark_missing_params_required()
 
     def _resolve_attention_backend_once(self) -> None:
