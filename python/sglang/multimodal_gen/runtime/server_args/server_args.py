@@ -344,6 +344,15 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
+    # Bracket the non-warmup forward with cudaProfilerStart/Stop, so a profiler
+    # launched with `--capture-range=cudaProfilerApi` records only the timed
+    # request — weight loading, FSDP sharding and warmup all stay outside.
+    enable_cuda_profiler_range: bool = False
+    # Which worker ranks emit that range. The capture range is per-process, so a
+    # rank left out here contributes nothing to the report even though the
+    # profiler followed the fork. Keeping it small is how an 8-rank job produces
+    # a report that is still openable.
+    cuda_profiler_ranks: list[int] = None
 
     # Warmup is controlled by the canonical `warmup_mode` knob: one of WARMUP_MODES.
     #   - "off":     no warmup.
@@ -549,6 +558,28 @@ class ServerArgs(DisaggServerArgsMixin):
             return DEFAULT_BCG_TEXT_BUCKETS
         buckets = sorted({int(b) for b in raw if int(b) > 0})
         return tuple(buckets) or DEFAULT_BCG_TEXT_BUCKETS
+
+    def resolved_cuda_profiler_ranks(self) -> frozenset[int] | None:
+        """Worker ranks that bracket their timed forward with the profiler range.
+
+        ``None`` means every rank, which is the default and the only safe choice
+        for a job with collectives. Restricting the set leaves the other ranks
+        outside the capture range while the profiler attaches to the listed ones,
+        and that asymmetry has been observed to deadlock NCCL: an ALLREDUCE
+        issued just after ``cudaProfilerStart`` never completed, the watchdog
+        took seven of eight ranks down via ``abort()``, and because ``abort()``
+        skips CUDA teardown every one of those seven GPUs was left with the
+        profiler's clock locks applied. The eighth rank exited normally and its
+        GPU was fine. Under persistence mode nothing reclaims the other seven,
+        so the host needs a reboot.
+
+        Restricting also does not buy what it looks like it buys: nsys starts
+        collection session-wide, so every process still lands in the report.
+        """
+        raw = self.cuda_profiler_ranks
+        if not raw:
+            return None
+        return frozenset(int(rank) for rank in raw)
 
     def _validate_breakable_cuda_graph(self):
         if not self.enable_breakable_cuda_graph:
@@ -1750,6 +1781,33 @@ class ServerArgs(DisaggServerArgsMixin):
             "every denoising step, the predict_noise / scheduler_step "
             "sub-operations, and every transformer submodule forward (recursive). "
             "Warmup steps are excluded to keep captured traces clean.",
+        )
+
+        parser.add_argument(
+            "--enable-cuda-profiler-range",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cuda_profiler_range,
+            help="Bracket the timed (non-warmup) forward with "
+            "cudaProfilerStart/Stop. Pair with `nsys profile "
+            "--capture-range=cudaProfilerApi --capture-range-end=stop` to get a "
+            "report that covers the request and nothing else: weight loading, "
+            "FSDP sharding and warmup all happen outside the range, and the "
+            "process still runs on afterwards to write its outputs.",
+        )
+        parser.add_argument(
+            "--cuda-profiler-ranks",
+            type=int,
+            nargs="+",
+            default=ServerArgs.cuda_profiler_ranks,
+            help="Worker ranks that emit the --enable-cuda-profiler-range "
+            "range. Defaults to every rank, which is the only safe setting for "
+            "a job with collectives: leaving some ranks outside the range while "
+            "the profiler attaches to the others has been observed to deadlock "
+            "NCCL, and the resulting abort() skips CUDA teardown and strands "
+            "the profiler's clock locks on those GPUs until the host reboots. "
+            "Restricting the set also does not shrink the report, because nsys "
+            "starts collection session-wide and captures every process either "
+            "way. Only restrict for single-process runs.",
         )
 
         # warmup

@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, List, Union
 
@@ -458,6 +458,39 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"grouped request {req.request_id}",
         )
 
+    @contextmanager
+    def _maybe_cuda_profiler_range(self, req: Req) -> Iterator[None]:
+        """Bracket the timed forward with cudaProfilerStart/Stop.
+
+        A profiler run with ``--capture-range=cudaProfilerApi`` only starts
+        recording once this range opens, so weight loading, FSDP sharding and
+        the warmup requests never reach the report.
+        """
+        profiler_ranks = self.server_args.resolved_cuda_profiler_ranks()
+        enabled = (
+            self.server_args.enable_cuda_profiler_range
+            and not req.is_warmup
+            # cudaProfilerStart/Stop is a CUDA/HIP call; there is no equivalent
+            # to bracket on the other platforms.
+            and current_platform.is_cuda_alike()
+            # None = every rank, the default. See resolved_cuda_profiler_ranks:
+            # profiling only some ranks of a collective job has deadlocked NCCL
+            # and left the aborted ranks' GPUs needing a host reboot.
+            and (profiler_ranks is None or self.rank in profiler_ranks)
+        )
+        if not enabled:
+            yield
+            return
+
+        torch.cuda.profiler.start()
+        try:
+            yield
+        finally:
+            # `finally`, not a plain trailing call: a forward that raises would
+            # otherwise leave the capture range open and the profiler would keep
+            # recording teardown until the process exits.
+            torch.cuda.profiler.stop()
+
     def _execute_forward_common(
         self,
         req: Req,
@@ -507,6 +540,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
+                stack.enter_context(self._maybe_cuda_profiler_range(req))
                 try:
                     result = forward_fn()
                 except Exception:
