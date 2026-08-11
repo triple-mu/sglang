@@ -113,7 +113,9 @@ def _usp_all_to_all_single_varlen(
     return output
 
 
-_FAST_ULYSSES_GROUP = None
+# role -> UlyssesGroup. Separate groups because staging is a group member keyed
+# by (shape, dtype), so same-shaped concurrent exchanges must not share one.
+_FAST_ULYSSES_GROUPS: dict[str, object] = {}
 _FAST_ULYSSES_PROBED = False
 _FAST_ULYSSES_OUT_BUFFERS: dict[tuple, torch.Tensor] = {}
 
@@ -182,14 +184,15 @@ def fast_ulysses_async_input_exchange(x: torch.Tensor, role: str):
     fast transport is unavailable -- the caller then has to fall back for the
     whole q/k/v group, not per tensor.
 
-    The exchanges do NOT overlap each other: fast-ulysses issues them on one
-    comm stream, so they serialise. What they overlap is the *caller* stream,
-    which is the point -- splitting the packed q/k/v exchange into three lets
-    qk-norm+RoPE for one tensor run while another is still moving. That trade
-    costs two extra barrier pairs per block, so it only pays when the overlapped
-    compute exceeds them.
+    Each role gets its OWN collective, which is what makes the overlap real.
+    fast-ulysses caches one staging buffer per (shape, dtype) *per group*, and
+    q/k/v have identical shapes: sharing a group would make the second issue
+    wait, on the caller's stream, for the first exchange to finish end to end
+    (`stage()` waits on an event the transfer's teardown records on the comm
+    stream). That is the opposite of overlapping -- it serialises the compute
+    behind the transfer it was supposed to hide under.
     """
-    group = _fast_ulysses_group()
+    group = _fast_ulysses_group(role)
     if group is None:
         return None
     staged = x.unsqueeze(0)
@@ -207,8 +210,8 @@ def fast_ulysses_wait(handle) -> torch.Tensor:
     return result.squeeze(0)
 
 
-def _fast_ulysses_group():
-    """The fast-ulysses collective for the Ulysses group, or ``None``.
+def _fast_ulysses_group(role: str = "default"):
+    """The fast-ulysses collective for ``role``, or ``None``.
 
     Built once and cached. Both the construction and the window allocation
     behind every new shape are collective, so eligibility is decided from
@@ -217,15 +220,22 @@ def _fast_ulysses_group():
     tensor being exchanged: a per-tensor condition could let one rank take this
     path while another falls back, and that deadlocks silently, because neither
     side raises and neither side times out.
+
+    One collective per role, because staging is per group and keyed by
+    (shape, dtype): concurrent exchanges of same-shaped tensors would otherwise
+    queue behind each other on the caller's stream. Which roles exist is itself
+    a process-wide decision (the async switch), so every rank builds the same
+    set in the same order -- construction is collective and order matters.
     """
-    global _FAST_ULYSSES_GROUP, _FAST_ULYSSES_PROBED
+    global _FAST_ULYSSES_PROBED
     if _FAST_ULYSSES_PROBED:
-        return _FAST_ULYSSES_GROUP
+        return _FAST_ULYSSES_GROUPS.get(role)
 
     _FAST_ULYSSES_PROBED = True
     # Windows belong to the group that allocated them, so a re-probe (only
     # tests do this) must not hand the next group a stale buffer.
     _FAST_ULYSSES_OUT_BUFFERS.clear()
+    _FAST_ULYSSES_GROUPS.clear()
     world_size = get_ulysses_parallel_world_size()
     # `BarPeers::p[8]` in fast-ulysses caps the group at 8.
     if not envs.SGLANG_DIFFUSION_FAST_ULYSSES or not 2 <= world_size <= 8:
@@ -252,18 +262,28 @@ def _fast_ulysses_group():
         )
         return None
 
+    roles = ["default"]
+    if envs.SGLANG_DIFFUSION_FAST_ULYSSES_ASYNC_QKV:
+        roles += ["q", "k", "v"]
     try:
         # Refuses a group that is not NVLink-joined, which is the case where
         # the existing collective is the faster one anyway. The probe reads the
         # same fabric on every rank, so it refuses everywhere or nowhere -- no
         # second vote needed.
-        _FAST_ULYSSES_GROUP = UlyssesGroup(process_group=pg)
+        for name in roles:
+            _FAST_ULYSSES_GROUPS[name] = UlyssesGroup(process_group=pg)
     except RuntimeError as exc:
+        # Every rank fails on the same role, so no rank is left mid-sequence.
+        _FAST_ULYSSES_GROUPS.clear()
         logger.warning("fast-ulysses refused this topology, using NCCL: %s", exc)
         return None
 
-    logger.info("Ulysses all-to-all is using fast-ulysses (world_size=%d)", world_size)
-    return _FAST_ULYSSES_GROUP
+    logger.info(
+        "Ulysses all-to-all is using fast-ulysses (world_size=%d, groups=%s)",
+        world_size,
+        ",".join(roles),
+    )
+    return _FAST_ULYSSES_GROUPS.get(role)
 
 
 def _ipc_ready_group():

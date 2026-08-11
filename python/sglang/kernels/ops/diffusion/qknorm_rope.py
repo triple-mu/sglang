@@ -45,7 +45,12 @@ def _jit_qknorm_rope_module(
         "qknorm_rope",
         *args,
         cuda_files=["diffusion/qknorm_rope.cuh"],
-        cuda_wrappers=[("qknorm_rope", f"QKNormRopeKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("qknorm_rope", f"QKNormRopeKernel<{args}>::run"),
+            # Same module, same device code: one entry point per q/k tensor for
+            # callers that interleave them with collectives.
+            ("qnorm_rope_single", f"QKNormRopeKernel<{args}>::run_single"),
+        ],
     )
 
 
@@ -139,3 +144,37 @@ def fused_inplace_qknorm_rope(
         round_norm_before_rope,
     )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
+
+
+@register_custom_op(mutates_args=["x"])
+def fused_inplace_qknorm_rope_single(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
+) -> None:
+    """QKNorm+RoPE over one tensor, for callers that handle q and k separately.
+
+    Bit-identical to :func:`fused_inplace_qknorm_rope` on the corresponding
+    side -- same JIT module, same device code, and q and k never interact
+    inside the kernel. Use it when the two are interleaved with something else
+    (a split Ulysses exchange, say); use the pair form otherwise, since one
+    launch for both is cheaper than two.
+    """
+    head_dim = head_dim or x.size(-1)
+    rope_dim = rope_dim or cos_sin_cache.size(-1)
+    module = _jit_qknorm_rope_module(
+        head_dim,
+        rope_dim,
+        is_neox,
+        x.dtype,
+        cos_sin_cache.dtype,
+        round_norm_before_rope,
+    )
+    module.qnorm_rope_single(x, weight, cos_sin_cache, positions, eps)

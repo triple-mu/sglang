@@ -47,7 +47,7 @@ def _worker() -> int:
     def both_paths(fn, *args, **kwargs):
         """Run once on the existing collective, once on fast-ulysses."""
         usp_mod._FAST_ULYSSES_PROBED = False
-        usp_mod._FAST_ULYSSES_GROUP = None
+        usp_mod._FAST_ULYSSES_GROUPS.clear()
         envs.SGLANG_DIFFUSION_FAST_ULYSSES = False
         # The IPC transport is a third path; hold it off so this compares the
         # two arms under test rather than whichever 2-rank fast path won.
@@ -56,10 +56,10 @@ def _worker() -> int:
         baseline = fn(*args, **kwargs)
 
         usp_mod._FAST_ULYSSES_PROBED = False
-        usp_mod._FAST_ULYSSES_GROUP = None
+        usp_mod._FAST_ULYSSES_GROUPS.clear()
         envs.SGLANG_DIFFUSION_FAST_ULYSSES = True
         fast = fn(*args, **kwargs)
-        engaged = usp_mod._FAST_ULYSSES_GROUP is not None
+        engaged = bool(usp_mod._FAST_ULYSSES_GROUPS)
 
         envs.SGLANG_DIFFUSION_FAST_ULYSSES = False
         envs.SGLANG_DIFFUSION_IPC_A2A = ipc_was
@@ -131,7 +131,7 @@ def _worker() -> int:
     # accept. It must stay on the existing collective rather than be reshaped
     # into the fast path, which would cost back the permute this path removes.
     usp_mod._FAST_ULYSSES_PROBED = False
-    usp_mod._FAST_ULYSSES_GROUP = None
+    usp_mod._FAST_ULYSSES_GROUPS.clear()
     envs.SGLANG_DIFFUSION_FAST_ULYSSES = True
     x_hd1 = torch.randn(
         1, 8 // world, 64 * world, 64, dtype=torch.bfloat16, device="cuda"

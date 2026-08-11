@@ -57,7 +57,10 @@ def main() -> None:
     )
     envs.SGLANG_DIFFUSION_FAST_ULYSSES = True
 
-    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        fused_inplace_qknorm_rope,
+        fused_inplace_qknorm_rope_single,
+    )
     from sglang.multimodal_gen.runtime.layers.usp import (
         _usp_input_all_to_all_packed_qkv,
         fast_ulysses_async_input_exchange,
@@ -85,7 +88,6 @@ def main() -> None:
         rope_dim=H3_ROPE_DIM,
         round_norm_before_rope=True,
     )
-    empty = q0.new_empty((s_local, 0, H3_HEAD_DIM))
 
     def reference():
         """Today's path: one fused kernel for q+k, then one packed exchange."""
@@ -97,9 +99,9 @@ def main() -> None:
         """v leaves first, then q's kernel, then q leaves, then k's kernel."""
         q, k, v = q0.clone(), k0.clone(), v0.clone()
         v_h = fast_ulysses_async_input_exchange(v, "v")
-        fused_inplace_qknorm_rope(q, empty, qw, kw, cache, positions, **KW)
+        fused_inplace_qknorm_rope_single(q, qw, cache, positions, **KW)
         q_h = fast_ulysses_async_input_exchange(q, "q")
-        fused_inplace_qknorm_rope(empty, k, qw, kw, cache, positions, **KW)
+        fused_inplace_qknorm_rope_single(k, kw, cache, positions, **KW)
         k_h = fast_ulysses_async_input_exchange(k, "k")
         return (
             fast_ulysses_wait(q_h),

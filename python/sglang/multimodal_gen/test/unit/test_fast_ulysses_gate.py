@@ -26,7 +26,7 @@ class TestFastUlyssesGate(unittest.TestCase):
     @staticmethod
     def _reset_probe() -> None:
         usp_mod._FAST_ULYSSES_PROBED = False
-        usp_mod._FAST_ULYSSES_GROUP = None
+        usp_mod._FAST_ULYSSES_GROUPS.clear()
 
     def test_disabled_by_default(self) -> None:
         self.assertFalse(envs.SGLANG_DIFFUSION_FAST_ULYSSES)
@@ -133,6 +133,34 @@ class TestFastUlyssesGate(unittest.TestCase):
             patch.dict("sys.modules", {"fast_ulysses": fake_module}),
         ):
             self.assertIsNone(usp_mod._fast_ulysses_group())
+
+    def test_async_split_gets_one_group_per_role(self) -> None:
+        # The regression lock for the overlap. fast-ulysses keys its staging
+        # buffer by (shape, dtype) *per group*, and q/k/v are the same shape:
+        # on a shared group the second issue would wait, on the caller's
+        # stream, for the first exchange to finish end to end -- which is
+        # exactly the overlap this path exists to get.
+        for async_on, expected in ((False, ["default"]), (True, ["default", "q", "k", "v"])):
+            with self.subTest(async_on=async_on):
+                self._reset_probe()
+                fake_module = unittest.mock.MagicMock()
+                fake_module.UlyssesGroup.side_effect = lambda **_: unittest.mock.MagicMock()
+                with (
+                    patch.object(envs, "SGLANG_DIFFUSION_FAST_ULYSSES", True),
+                    patch.object(
+                        envs, "SGLANG_DIFFUSION_FAST_ULYSSES_ASYNC_QKV", async_on
+                    ),
+                    patch(f"{_USP}.get_ulysses_parallel_world_size", return_value=4),
+                    patch(f"{_USP}.get_sp_group"),
+                    patch(f"{_USP}._vote_unanimous", return_value=True),
+                    patch.dict("sys.modules", {"fast_ulysses": fake_module}),
+                ):
+                    usp_mod._fast_ulysses_group()
+                self.assertEqual(list(usp_mod._FAST_ULYSSES_GROUPS), expected)
+                # Distinct objects, not the same group handed out four times.
+                groups = list(usp_mod._FAST_ULYSSES_GROUPS.values())
+                self.assertEqual(len({id(g) for g in groups}), len(groups))
+        self._reset_probe()
 
     def test_out_buffer_cache_is_capped(self) -> None:
         # Symmetric windows are never released, so an uncapped cache leaks

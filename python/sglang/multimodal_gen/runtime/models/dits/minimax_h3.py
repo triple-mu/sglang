@@ -7,7 +7,6 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
-import functools
 import math
 from typing import Any
 
@@ -20,6 +19,7 @@ from sglang.kernels.ops.activation.activation import (
 from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
+    fused_inplace_qknorm_rope_single,
 )
 from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_gate_bf16_,
@@ -786,26 +786,35 @@ class MiniMaxH3Attention(nn.Module):
             return None
 
         cos_sin_cache, positions = rope_cache
-        # The kernel dispatches q and k by head id, so a zero-head side is
-        # simply no work: one call does q only, the next does k only. Checked
-        # bit-exact against the combined call.
-        empty = q.new_empty((q.shape[0], 0, self.head_dim))
-        norm_rope = functools.partial(
-            fused_inplace_qknorm_rope,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
-            cos_sin_cache=cos_sin_cache,
-            positions=positions,
+        rope_dim = cos_sin_cache.shape[-1]
+        # One entry point per tensor: the pair form would need a zero-head
+        # tensor for the other side, and would still verify two layouts and
+        # pack two weight pointers on each of the 2450 calls per request.
+        # Spelled out rather than via a partial -- this is the hot path, and
+        # building a closure per call is the kind of overhead it measures.
+        fused_inplace_qknorm_rope_single(
+            q,
+            self.q_norm.weight,
+            cos_sin_cache,
+            positions,
             is_neox=True,
             eps=self.q_norm.eps,
             head_dim=self.head_dim,
-            rope_dim=cos_sin_cache.shape[-1],
+            rope_dim=rope_dim,
             round_norm_before_rope=True,
         )
-
-        norm_rope(q, empty)
         q_handle = fast_ulysses_async_input_exchange(q, "q")
-        norm_rope(empty, k)
+        fused_inplace_qknorm_rope_single(
+            k,
+            self.k_norm.weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=self.k_norm.eps,
+            head_dim=self.head_dim,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+        )
         k_handle = fast_ulysses_async_input_exchange(k, "k")
 
         return (

@@ -312,6 +312,79 @@ struct QKNormRopeKernel {
     const auto num_blocks = std::min(max_blocks, needed_blocks);
     LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
   }
+
+  /// \brief QKNorm+RoPE over one [N, H, D] tensor, for callers that handle q and k separately.
+  ///
+  /// The device kernel splits its work by head id -- heads below num_qo_heads read q, the rest
+  /// read k -- so a single tensor is just the case where num_kv_heads is zero. Reaching that
+  /// through run() means passing a zero-head tensor for the other side, which still verifies two
+  /// layouts, unwraps two strides and packs two weight pointers on every call; a caller that
+  /// interleaves q and k with collectives does this twice per attention block, 2450 times per
+  /// request. This entry point pays for one.
+  ///
+  /// Bit-identical to run(): same device code, same launch shape per head, and the two sides
+  /// never interact (no shared reduction, no cross-head state).
+  static void
+  run_single(const tvm::ffi::TensorView x,
+             const tvm::ffi::TensorView weight,
+             const tvm::ffi::TensorView cos_sin_cache,
+             const tvm::ffi::TensorView positions,
+             float eps) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto H = SymbolicSize{"num_heads"};
+    auto D = SymbolicSize{"head_dim"};
+    auto R = SymbolicSize{"rope_dim"};
+    auto Dx = SymbolicSize{"x_stride"};
+    auto Dd = SymbolicSize{"head_stride"};
+    auto device = SymbolicDevice{};
+    auto id_type = SymbolicDType{};
+    D.set_value(kHeadDim);
+    R.set_value(kRopeDim);
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, H, D}).with_strides({Dx, Dd, 1}).with_dtype<DType>().with_device(device).verify(x);
+    TensorMatcher({D}).with_dtype<DType>().with_device(device).verify(weight);
+    TensorMatcher({-1, R}).with_dtype<CacheDType>().with_device(device).verify(cos_sin_cache);
+    TensorMatcher({N}).with_dtype<int32_t, int64_t>(id_type).with_device(device).verify(positions);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_heads = static_cast<uint32_t>(H.unwrap());
+    if (num_tokens == 0 || num_heads == 0) return;
+    const auto x_stride_bytes = static_cast<int64_t>(Dx.unwrap() * sizeof(DType));
+    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
+
+    // num_kv_heads = 0 collapses the shared head index space onto x alone, so the k_ptr branch is
+    // unreachable; it still has to be a valid pointer, and x's own is the obvious one.
+    const auto params = QKNormRopeParams{
+        .q_ptr = x.data_ptr(),
+        .k_ptr = x.data_ptr(),
+        .q_weight_ptr = weight.data_ptr(),
+        .k_weight_ptr = weight.data_ptr(),
+        .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
+        .positions = positions.data_ptr(),
+        .q_stride_bytes = x_stride_bytes,
+        .k_stride_bytes = x_stride_bytes,
+        .head_stride_bytes = head_stride_bytes,
+        .num_qo_heads = num_heads,
+        .num_kv_heads = 0,
+        .num_tokens = num_tokens,
+        .eps = eps,
+    };
+
+    const auto is_int32 = id_type.is_type<int32_t>();
+    const auto selected_kernel = is_int32 ? kernel<int32_t> : kernel<int64_t>;
+    const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
+    static const uint32_t kOccupancyTable[2] = {
+        runtime::get_blocks_per_sm(kernel<int32_t>, kThreadsPerBlock),
+        runtime::get_blocks_per_sm(kernel<int64_t>, kThreadsPerBlock),
+    };
+    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
+    const auto needed_blocks = div_ceil(num_heads * num_tokens, kWarpsPerBlock);
+    const auto num_blocks = std::min(max_blocks, needed_blocks);
+    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
+  }
 };
 
 }  // namespace sglang
