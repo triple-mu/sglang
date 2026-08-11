@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
+    SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM: bool = False
@@ -297,6 +298,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory is low or when this flag is disabled.
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
+    ),
+    # Fold the packed-DiT per-head QKNorm+RoPE into the Ulysses destination-major
+    # QKV pack, removing the separate read-modify-write pass over q/k. Bit-exact
+    # with the two-kernel path; opt-in until it has soaked.
+    "SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV": _lazy_bool(
+        "SGLANG_DIFFUSION_FUSE_QKNORM_ROPE_PACK_QKV"
     ),
     # MiniMax-H3: project every denoise step's AdaLN rows before the loop, so
     # the pure-weight-stream adaln_proj GEMM reads its 520MB of weights once
