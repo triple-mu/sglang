@@ -195,19 +195,27 @@ def fast_ulysses_async_input_exchange(x: torch.Tensor, role: str):
     group = _fast_ulysses_group(role)
     if group is None:
         return None
-    staged = x.unsqueeze(0)
-    out = _fast_ulysses_out_buffer(group, f"async_{role}", staged, 0)
-    if out is None:
-        return group.all_to_all_4d_async(staged, mode=0)
-    return group.all_to_all_4d_async(staged, mode=0, out=out)
+    # Marks the ISSUE, which is nearly free -- the transfer runs on the comm
+    # stream and is not inside this range. Read it with `usp.async_wait`: an
+    # async exchange's cost shows up where it is waited on, and if nothing
+    # waits explicitly it lands on the first consumer that goes through the
+    # dispatcher, which for H3 is FlashAttention -- charged to attention, not
+    # to the collective.
+    with maybe_nvtx_range(f"usp.async_issue_{role}", layerwise_nvtx_enabled()):
+        staged = x.unsqueeze(0)
+        out = _fast_ulysses_out_buffer(group, f"async_{role}", staged, 0)
+        if out is None:
+            return group.all_to_all_4d_async(staged, mode=0)
+        return group.all_to_all_4d_async(staged, mode=0, out=out)
 
 
 def fast_ulysses_wait(handle) -> torch.Tensor:
     """Block the caller stream on an async exchange and unwrap to 3D."""
     # AsyncCollectiveTensor waits on first aten use; CompletedHandle is already
     # done. `.wait()` covers both and keeps the intent explicit at the call site.
-    result = handle.wait() if hasattr(handle, "wait") else handle
-    return result.squeeze(0)
+    with maybe_nvtx_range("usp.async_wait", layerwise_nvtx_enabled()):
+        result = handle.wait() if hasattr(handle, "wait") else handle
+        return result.squeeze(0)
 
 
 def _fast_ulysses_group(role: str = "default"):
