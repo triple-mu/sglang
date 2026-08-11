@@ -1291,3 +1291,75 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+
+        # The fast-ulysses transport over `ulysses_group`, when one is usable.
+        # Built on first use and owned here, next to the process group it
+        # exchanges over, so its lifetime is the group's rather than a module
+        # global's. `None` means "not probed yet"; the probe records False.
+        self._fast_ulysses_group = None
+        self._fast_ulysses_probed = False
+
+    @property
+    def fast_ulysses_group(self):
+        """The fast-ulysses collective for this group, or ``None``.
+
+        Built once, on the first exchange. Construction is collective and so is
+        every window allocation behind it, so eligibility is decided from
+        process-wide facts only -- the env switch, the group size, and whether
+        the group is NVLink-joined -- never from a property of the tensor being
+        exchanged, which could differ across ranks and hang the collective.
+        """
+        if self._fast_ulysses_probed:
+            return self._fast_ulysses_group
+
+        self._fast_ulysses_probed = True
+        from sglang.multimodal_gen import envs
+
+        # `BarPeers::p[8]` in fast-ulysses caps the group at 8.
+        if (
+            not envs.SGLANG_DIFFUSION_FAST_ULYSSES
+            or not 2 <= self.ulysses_world_size <= 8
+        ):
+            return None
+
+        reason = ""
+        try:
+            from fast_ulysses import UlyssesGroup
+        except ImportError as exc:
+            UlyssesGroup = None
+            reason = f"{type(exc).__name__}: {exc}"
+
+        # Vote BEFORE constructing: the constructor is itself collective, so a
+        # rank that skipped it would leave the others waiting forever -- no
+        # exception, no timeout, just a hang. Whether the package imports is
+        # per-rank, so agreement is established rather than assumed.
+        verdict = torch.tensor(
+            [1 if UlyssesGroup is not None else 0],
+            dtype=torch.int32,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        torch.distributed.all_reduce(
+            verdict, op=torch.distributed.ReduceOp.MIN, group=self.ulysses_group
+        )
+        if not bool(verdict.item()):
+            logger.warning(
+                "fast-ulysses unavailable on at least one rank, using NCCL everywhere%s",
+                f" (this rank: {reason})" if reason else "",
+            )
+            return None
+
+        try:
+            # Refuses a group that is not NVLink-joined, which is the case where
+            # the existing collective is the faster one anyway. The probe reads
+            # the same fabric on every rank, so it refuses everywhere or
+            # nowhere -- no second vote needed.
+            self._fast_ulysses_group = UlyssesGroup(process_group=self.ulysses_group)
+        except RuntimeError as exc:
+            logger.warning("fast-ulysses refused this topology, using NCCL: %s", exc)
+            return None
+
+        logger.info(
+            "Ulysses all-to-all is using fast-ulysses (world_size=%d)",
+            self.ulysses_world_size,
+        )
+        return self._fast_ulysses_group

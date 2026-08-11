@@ -113,26 +113,15 @@ def _usp_all_to_all_single_varlen(
     return output
 
 
-# role -> UlyssesGroup. Separate groups because staging is a group member keyed
-# by (shape, dtype), so same-shaped concurrent exchanges must not share one.
-_FAST_ULYSSES_GROUPS: dict[str, object] = {}
-_FAST_ULYSSES_PROBED = False
+# (role, shape, dtype) -> symmetric output window for the zero-copy `out=`
+# path. Only the buffers live here; the collective itself belongs to the
+# sequence-parallel group that owns the process group it exchanges over.
 _FAST_ULYSSES_OUT_BUFFERS: dict[tuple, torch.Tensor] = {}
 
 
-def _vote_unanimous(pg, ok: bool) -> bool:
-    """True only when every rank in ``pg`` passed ``ok=True``.
-
-    A MIN all-reduce over one int: the cheapest way to turn a per-rank
-    condition into a decision every rank makes identically.
-    """
-    verdict = torch.tensor(
-        [1 if ok else 0],
-        dtype=torch.int32,
-        device=torch.device("cuda", torch.cuda.current_device()),
-    )
-    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=pg)
-    return bool(verdict.item())
+def _fast_ulysses_group():
+    """The fast-ulysses collective for the Ulysses group, or ``None``."""
+    return get_sp_group().fast_ulysses_group
 
 
 def _fast_ulysses_out_buffer(group, role: str, x: torch.Tensor, mode: int):
@@ -144,9 +133,9 @@ def _fast_ulysses_out_buffer(group, role: str, x: torch.Tensor, mode: int):
 
     ``empty_output`` is collective, so a buffer is only ever allocated where
     every rank arrives together: the first exchange of a given shape, which is
-    the same layer of the same step on every rank. The buffer for a role is
-    fully consumed in stream order before the next exchange with that role
-    overwrites it -- the contract ``_a2a_staging_buffer`` already relies on.
+    the same layer of the same step on every rank. One buffer per role, because
+    a call overwrites the buffer it writes into and roles can be in flight at
+    once.
 
     Symmetric windows are never released, so the cache is capped: a server
     rotating through resolutions would otherwise accumulate one window per
@@ -161,7 +150,10 @@ def _fast_ulysses_out_buffer(group, role: str, x: torch.Tensor, mode: int):
     key = (role, tuple(x.shape), x.dtype)
     buffer = _FAST_ULYSSES_OUT_BUFFERS.get(key)
     if buffer is None:
-        if len(_FAST_ULYSSES_OUT_BUFFERS) >= envs.SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS:
+        if (
+            len(_FAST_ULYSSES_OUT_BUFFERS)
+            >= envs.SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS
+        ):
             return None
         buffer = group.empty_output(x, mode=mode)
         _FAST_ULYSSES_OUT_BUFFERS[key] = buffer
@@ -184,15 +176,12 @@ def fast_ulysses_async_input_exchange(x: torch.Tensor, role: str):
     fast transport is unavailable -- the caller then has to fall back for the
     whole q/k/v group, not per tensor.
 
-    Each role gets its OWN collective, which is what makes the overlap real.
-    fast-ulysses caches one staging buffer per (shape, dtype) *per group*, and
-    q/k/v have identical shapes: sharing a group would make the second issue
-    wait, on the caller's stream, for the first exchange to finish end to end
-    (`stage()` waits on an event the transfer's teardown records on the comm
-    stream). That is the opposite of overlapping -- it serialises the compute
-    behind the transfer it was supposed to hide under.
+    All roles share ONE collective. fast-ulysses pools its staging buffers per
+    shape, so same-shaped exchanges of different roles get different slots and
+    run concurrently; one group per role would only duplicate a comm stream, a
+    window map and a barrier state to get the same thing.
     """
-    group = _fast_ulysses_group(role)
+    group = _fast_ulysses_group()
     if group is None:
         return None
     # Marks the ISSUE, which is nearly free -- the transfer runs on the comm
@@ -216,82 +205,6 @@ def fast_ulysses_wait(handle) -> torch.Tensor:
     with maybe_nvtx_range("usp.async_wait", layerwise_nvtx_enabled()):
         result = handle.wait() if hasattr(handle, "wait") else handle
         return result.squeeze(0)
-
-
-def _fast_ulysses_group(role: str = "default"):
-    """The fast-ulysses collective for ``role``, or ``None``.
-
-    Built once and cached. Both the construction and the window allocation
-    behind every new shape are collective, so eligibility is decided from
-    process-wide constants only -- the env switch, the group size, and whether
-    the group is NVLink-joined. It must never depend on a property of the
-    tensor being exchanged: a per-tensor condition could let one rank take this
-    path while another falls back, and that deadlocks silently, because neither
-    side raises and neither side times out.
-
-    One collective per role, because staging is per group and keyed by
-    (shape, dtype): concurrent exchanges of same-shaped tensors would otherwise
-    queue behind each other on the caller's stream. Which roles exist is itself
-    a process-wide decision (the async switch), so every rank builds the same
-    set in the same order -- construction is collective and order matters.
-    """
-    global _FAST_ULYSSES_PROBED
-    if _FAST_ULYSSES_PROBED:
-        return _FAST_ULYSSES_GROUPS.get(role)
-
-    _FAST_ULYSSES_PROBED = True
-    # Windows belong to the group that allocated them, so a re-probe (only
-    # tests do this) must not hand the next group a stale buffer.
-    _FAST_ULYSSES_OUT_BUFFERS.clear()
-    _FAST_ULYSSES_GROUPS.clear()
-    world_size = get_ulysses_parallel_world_size()
-    # `BarPeers::p[8]` in fast-ulysses caps the group at 8.
-    if not envs.SGLANG_DIFFUSION_FAST_ULYSSES or not 2 <= world_size <= 8:
-        return None
-
-    pg = get_sp_group().ulysses_group
-    reason = ""
-    try:
-        from fast_ulysses import UlyssesGroup
-    except ImportError as exc:
-        UlyssesGroup = None
-        reason = f"{type(exc).__name__}: {exc}"
-
-    # Vote BEFORE constructing. The constructor is itself collective, so a rank
-    # that skipped it would leave the ranks that entered it waiting forever --
-    # no exception, no timeout, just a hang. The vote therefore has to happen
-    # while every rank is still outside it. The env switch and the group size
-    # are process-wide, but whether the package imports is per-rank, so
-    # agreement is established rather than assumed.
-    if not _vote_unanimous(pg, UlyssesGroup is not None):
-        logger.warning(
-            "fast-ulysses unavailable on at least one rank, using NCCL everywhere%s",
-            f" (this rank: {reason})" if reason else "",
-        )
-        return None
-
-    roles = ["default"]
-    if envs.SGLANG_DIFFUSION_FAST_ULYSSES_ASYNC_QKV:
-        roles += ["q", "k", "v"]
-    try:
-        # Refuses a group that is not NVLink-joined, which is the case where
-        # the existing collective is the faster one anyway. The probe reads the
-        # same fabric on every rank, so it refuses everywhere or nowhere -- no
-        # second vote needed.
-        for name in roles:
-            _FAST_ULYSSES_GROUPS[name] = UlyssesGroup(process_group=pg)
-    except RuntimeError as exc:
-        # Every rank fails on the same role, so no rank is left mid-sequence.
-        _FAST_ULYSSES_GROUPS.clear()
-        logger.warning("fast-ulysses refused this topology, using NCCL: %s", exc)
-        return None
-
-    logger.info(
-        "Ulysses all-to-all is using fast-ulysses (world_size=%d, groups=%s)",
-        world_size,
-        ",".join(roles),
-    )
-    return _FAST_ULYSSES_GROUPS.get(role)
 
 
 def _ipc_ready_group():

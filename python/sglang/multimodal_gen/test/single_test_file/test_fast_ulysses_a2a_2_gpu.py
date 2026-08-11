@@ -42,12 +42,25 @@ def _worker() -> int:
         tp_size=1, sp_size=world, ulysses_degree=world
     )
 
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
     from sglang.multimodal_gen.runtime.layers import usp as usp_mod
+
+    def _reset_probe() -> None:
+        """Force the next call to re-decide, so both arms are exercised.
+
+        The collective is owned by the sequence-parallel group; clearing the
+        probe there is what a fresh process would see. The output windows go
+        with it, since they belong to the group that allocated them.
+        """
+        sp = get_sp_group()
+        sp._fast_ulysses_probed = False
+        sp._fast_ulysses_group = None
+        usp_mod._FAST_ULYSSES_OUT_BUFFERS.clear()
 
     def both_paths(fn, *args, **kwargs):
         """Run once on the existing collective, once on fast-ulysses."""
         usp_mod._FAST_ULYSSES_PROBED = False
-        usp_mod._FAST_ULYSSES_GROUPS.clear()
+        _reset_probe()
         envs.SGLANG_DIFFUSION_FAST_ULYSSES = False
         # The IPC transport is a third path; hold it off so this compares the
         # two arms under test rather than whichever 2-rank fast path won.
@@ -56,10 +69,10 @@ def _worker() -> int:
         baseline = fn(*args, **kwargs)
 
         usp_mod._FAST_ULYSSES_PROBED = False
-        usp_mod._FAST_ULYSSES_GROUPS.clear()
+        _reset_probe()
         envs.SGLANG_DIFFUSION_FAST_ULYSSES = True
         fast = fn(*args, **kwargs)
-        engaged = bool(usp_mod._FAST_ULYSSES_GROUPS)
+        engaged = get_sp_group()._fast_ulysses_group is not None
 
         envs.SGLANG_DIFFUSION_FAST_ULYSSES = False
         envs.SGLANG_DIFFUSION_IPC_A2A = ipc_was
@@ -131,7 +144,7 @@ def _worker() -> int:
     # accept. It must stay on the existing collective rather than be reshaped
     # into the fast path, which would cost back the permute this path removes.
     usp_mod._FAST_ULYSSES_PROBED = False
-    usp_mod._FAST_ULYSSES_GROUPS.clear()
+    _reset_probe()
     envs.SGLANG_DIFFUSION_FAST_ULYSSES = True
     x_hd1 = torch.randn(
         1, 8 // world, 64 * world, 64, dtype=torch.bfloat16, device="cuda"
