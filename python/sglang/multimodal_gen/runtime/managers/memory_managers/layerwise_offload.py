@@ -1,3 +1,4 @@
+import bisect
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Set, Tuple
@@ -8,6 +9,9 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    RESIDENCY_POLICIES,
+    RESIDENCY_POLICY_LEADING,
+    RESIDENCY_POLICY_STRIDED,
     layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
 )
@@ -16,6 +20,61 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def compute_streamed_layers(
+    *, num_layers: int, resident_layers: int, policy: str
+) -> tuple[int, ...]:
+    """Which layer indices are streamed rather than held on the GPU.
+
+    Both policies stream the same *count* of layers, so they cost the same
+    memory and move the same bytes. They differ only in when those bytes move:
+
+    ``leading``  keeps layers ``0..r-1`` and streams the tail. Every streamed
+                 layer sits next to another streamed layer, so the transfers
+                 arrive as one burst confined to the last ``(n-r)/n`` of the
+                 step, and each has exactly one layer of compute to hide behind.
+
+    ``strided``  spreads the streamed layers evenly across the whole step. The
+                 same bytes now move over ``n`` layers instead of ``n-r``, so
+                 the peak transfer rate drops by ``n/(n-r)`` and each transfer
+                 gets that many layers of compute to hide behind.
+
+    That matters because a sequence-parallel forward issues an all-to-all in
+    *every* layer. Under ``leading`` those collectives contend with the whole
+    weight stream in the tail and with nothing in the head; measured on 8 GPUs,
+    the ulysses SendRecv total went from 2589.7 ms with no streaming to
+    4016.0 ms with it, for identical collective volume.
+
+    Returned sorted, and always exactly ``num_layers - resident_layers`` long.
+    """
+    if policy not in RESIDENCY_POLICIES:
+        raise ValueError(
+            f"unknown residency policy {policy!r}, expected one of {RESIDENCY_POLICIES}"
+        )
+    resident = min(max(0, resident_layers), num_layers)
+    streamed_count = num_layers - resident
+    if streamed_count <= 0:
+        return ()
+    if resident <= 0:
+        return tuple(range(num_layers))
+
+    if policy == RESIDENCY_POLICY_LEADING:
+        return tuple(range(resident, num_layers))
+
+    # Step is num_layers / streamed_count >= 1, so round() of the ramp is
+    # strictly increasing and the indices cannot collide. Assert rather than
+    # silently returning a short set, which would leave layers neither resident
+    # nor streamed.
+    streamed = tuple(
+        round(index * num_layers / streamed_count) for index in range(streamed_count)
+    )
+    if len(set(streamed)) != streamed_count:
+        raise AssertionError(
+            f"strided residency produced {len(set(streamed))} distinct layers, "
+            f"expected {streamed_count} (num_layers={num_layers}, resident={resident})"
+        )
+    return streamed
 
 
 # Adapted from skywork AI Infra diffusion optimize
@@ -43,15 +102,30 @@ class LayerwiseOffloadManager:
         pin_cpu_memory: bool = True,
         prefetch_size: int = 1,
         resident_layers: int = 0,
+        residency_policy: str = RESIDENCY_POLICY_LEADING,
+        tensor_pattern: str | None = None,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
-        # Leading layers held on GPU across denoise steps, instead of being
-        # re-streamed every step like the tail.
+        # Layers held on GPU across denoise steps, instead of being re-streamed
+        # every step. `residency_policy` picks *which* layers those are; see
+        # compute_streamed_layers for why the choice is not cosmetic.
         self.resident_layers = min(max(0, int(resident_layers)), self.num_layers)
+        self.residency_policy = residency_policy
+        self._streamed_order = compute_streamed_layers(
+            num_layers=self.num_layers,
+            resident_layers=self.resident_layers,
+            policy=residency_policy,
+        )
+        self._resident_set = frozenset(range(self.num_layers)) - set(
+            self._streamed_order
+        )
+        # Restricts streaming to the parameters whose name matches. None streams
+        # every parameter of a selected layer, which is the historical behaviour.
+        self._tensor_filter = re.compile(tensor_pattern) if tensor_pattern else None
         # Armed on the first denoise forward, so that the load-time prefetch below
         # does not pin the whole resident set before the DiT is the active component.
         self._residency_active = False
@@ -164,6 +238,14 @@ class LayerwiseOffloadManager:
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
+            if self._tensor_filter is not None and not self._tensor_filter.search(name):
+                # Selected out: stays resident like a non-layer parameter. Lets a
+                # caller stream one sublayer instead of the whole block, which
+                # matters when the sublayers are not alike. In the MiniMax-H3
+                # DiT, adaln_proj is 24.23 of the 61.73 GiB -- more than mlp or
+                # attn -- and it is a matrix-vector product against a per-step
+                # embedding, so it moves the most bytes for the least compute.
+                continue
             self._has_dtensor_weights = self._has_dtensor_weights or isinstance(
                 tensor, DTensor
             )
@@ -263,29 +345,72 @@ class LayerwiseOffloadManager:
         self.register_forward_hooks()
         self._configured = True
         logger.info(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}"
+            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}, residency policy: {self.residency_policy}"
         )
+        if self.residency_policy == RESIDENCY_POLICY_STRIDED and self._streamed_order:
+            # Printed because the layout is the whole point of the policy, and
+            # "did it actually stride?" is otherwise only answerable from a
+            # profile.
+            logger.info(
+                "Strided residency streams layers %s (%d of %d)",
+                list(self._streamed_order),
+                len(self._streamed_order),
+                self.num_layers,
+            )
 
     def prepare_for_next_req(self, non_blocking=True):
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
-        num_prefetch_layers = max(self.prefetch_size, self._retained_layers)
-        for i in range(num_prefetch_layers):
-            self.prefetch_layer(i, non_blocking=non_blocking)
+        # The resident set first: it has to be there for the whole step, and the
+        # caller decides whether to block on it.
+        for layer_idx in sorted(self._retained_set):
+            self.prefetch_layer(layer_idx, non_blocking=non_blocking)
+
+        # Then start the head of the stream, but ALWAYS asynchronously. This
+        # runs once per denoise step (the layer-0 pre-hook calls it), so issuing
+        # it with the caller's non_blocking=False would serialise a full layer
+        # transfer ahead of layer 0 on every step -- measured at +26 ms/step,
+        # ~1% e2e, on the 50-layer H3 DiT. The per-layer wait_event in the
+        # pre-hook already blocks exactly when the weights are needed and no
+        # earlier, so there is nothing to gain by waiting here.
+        for layer_idx in self._next_streamed(-1, self.prefetch_size):
+            self.prefetch_layer(layer_idx, non_blocking=True)
         if not non_blocking and self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
     @property
     def holds_residents(self) -> bool:
-        """True if this manager keeps a resident leading-layer set beyond the
-        streaming prefetch window, so it must be denoise-stage-scoped."""
+        """True if this manager keeps a resident layer set beyond the streaming
+        prefetch window, so it must be denoise-stage-scoped."""
         return self.enabled and self.resident_layers > 0
 
     @property
     def _retained_layers(self) -> int:
-        """Leading layers currently held across denoise steps; 0 until armed."""
+        """How many layers are currently held across denoise steps; 0 until armed."""
         return self.resident_layers if self._residency_active else 0
+
+    @property
+    def _retained_set(self) -> frozenset[int]:
+        """Which layers are currently held across denoise steps; empty until armed."""
+        return self._resident_set if self._residency_active else frozenset()
+
+    def _next_streamed(self, after: int, count: int) -> List[int]:
+        """The next ``count`` streamed layers after ``after``, wrapping around.
+
+        Under ``leading`` this is just the following indices, but under
+        ``strided`` the immediate successor is usually resident, so prefetching
+        ``after + 1`` would be a no-op and the real next transfer would not
+        start until its own layer was already running.
+        """
+        total = len(self._streamed_order)
+        if total == 0:
+            return []
+        start = bisect.bisect_right(self._streamed_order, after)
+        return [
+            self._streamed_order[(start + offset) % total]
+            for offset in range(min(count, total))
+        ]
 
     @torch.compiler.disable
     def _activate_residency(self) -> None:
@@ -372,12 +497,12 @@ class LayerwiseOffloadManager:
         lightweight release layer weights
         Basically set the reference count to the gpu weight tensor to zero. The weights on cpu is untouched
 
-        Leading resident layers are kept across denoise steps
+        Resident layers are kept across denoise steps
         """
         if not self.enabled or self.device is None:
             return
 
-        if not force and layer_idx < self._retained_layers:
+        if not force and layer_idx in self._retained_set:
             return
 
         # clear prefetch event, since it's useless and needs to be reset
@@ -572,8 +697,20 @@ class LayerwiseOffloadManager:
                         self._prefetch_events[i]
                     )
 
+                if self.residency_policy == RESIDENCY_POLICY_STRIDED:
+                    # Top up the stream at every layer rather than in bursts of
+                    # prefetch_size. Under `strided` the next streamed layer can
+                    # be several layers away, so a burst schedule keyed on index
+                    # arithmetic would either skip it or issue it late; asking
+                    # for "the next N streamed layers" is the same request every
+                    # layer and prefetch_layer is idempotent, so the repeats are
+                    # free. This is what buys the wider hiding window: the
+                    # transfer is issued as soon as the previous streamed layer
+                    # is done with, not one layer before it is needed.
+                    for layer_to_prefetch in self._next_streamed(i, self.prefetch_size):
+                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
                 # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                if i % self.prefetch_size == 0:
+                elif i % self.prefetch_size == 0:
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
                         layer_to_prefetch = j % self.num_layers
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
@@ -654,6 +791,16 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
+                residency_policy=(
+                    server_args.dit_layerwise_residency_policy
+                    if dit_tuning_enabled
+                    else RESIDENCY_POLICY_LEADING
+                ),
+                tensor_pattern=(
+                    server_args.dit_layerwise_tensor_pattern
+                    if dit_tuning_enabled
+                    else None
+                ),
             )
             self.layerwise_offload_managers.append(manager)
             configured_layer_names.append(layer_name)
