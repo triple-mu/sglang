@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -311,6 +312,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank for the device memory, and a schedule change pays a 26GB restore.
     "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD"
+    ),
+    # MiniMax-H3: fuse the DiT block's gated residual, RMSNorm and indexed
+    # scale/shift into one CUDA kernel. Bit-exact with the eager chain, but
+    # opt-in until it has more mileage.
+    "SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_FUSE_MODULATION_NORM"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
