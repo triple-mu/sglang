@@ -13,6 +13,7 @@ from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
     pack_qkv_destination_major,
 )
 from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -21,6 +22,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
+)
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    layerwise_nvtx_enabled,
+    maybe_nvtx_range,
 )
 from sglang.srt.utils.common import torch_release
 
@@ -106,6 +111,127 @@ def _usp_all_to_all_single_varlen(
         group=ulysses_pg,
     )
     return output
+
+
+_FAST_ULYSSES_GROUP = None
+_FAST_ULYSSES_PROBED = False
+_FAST_ULYSSES_OUT_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def _vote_unanimous(pg, ok: bool) -> bool:
+    """True only when every rank in ``pg`` passed ``ok=True``.
+
+    A MIN all-reduce over one int: the cheapest way to turn a per-rank
+    condition into a decision every rank makes identically.
+    """
+    verdict = torch.tensor(
+        [1 if ok else 0],
+        dtype=torch.int32,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=pg)
+    return bool(verdict.item())
+
+
+def _fast_ulysses_out_buffer(group, role: str, x: torch.Tensor, mode: int):
+    """A cached symmetric output buffer to pass as ``out=``, or ``None``.
+
+    Writing straight into the window removes the copy-out, which is where most
+    of this transport's advantage over the existing path comes from -- without
+    it the exchange is barely faster than what sglang already runs.
+
+    ``empty_output`` is collective, so a buffer is only ever allocated where
+    every rank arrives together: the first exchange of a given shape, which is
+    the same layer of the same step on every rank. The buffer for a role is
+    fully consumed in stream order before the next exchange with that role
+    overwrites it -- the contract ``_a2a_staging_buffer`` already relies on.
+
+    Symmetric windows are never released, so the cache is capped: a server
+    rotating through resolutions would otherwise accumulate one window per
+    shape (~180MB per rank at H3's geometry). Past the cap this returns None
+    and the exchange pays its copy-out instead of leaking. The cap is checked
+    against a process-wide count, so every rank crosses it on the same call.
+    """
+    # A buffer first allocated during capture would live in the graph's private
+    # pool, and the allocation is collective besides.
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    key = (role, tuple(x.shape), x.dtype)
+    buffer = _FAST_ULYSSES_OUT_BUFFERS.get(key)
+    if buffer is None:
+        if len(_FAST_ULYSSES_OUT_BUFFERS) >= envs.SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS:
+            return None
+        buffer = group.empty_output(x, mode=mode)
+        _FAST_ULYSSES_OUT_BUFFERS[key] = buffer
+    return buffer
+
+
+def _fast_ulysses_exchange(group, role: str, x: torch.Tensor, mode: int):
+    """One fast-ulysses exchange, zero-copy when the window is available."""
+    out = _fast_ulysses_out_buffer(group, role, x, mode)
+    if out is None:
+        return group.all_to_all_4d(x, mode=mode)
+    group.all_to_all_4d(x, mode=mode, out=out)
+    return out
+
+
+def _fast_ulysses_group():
+    """The fast-ulysses collective for the Ulysses group, or ``None``.
+
+    Built once and cached. Both the construction and the window allocation
+    behind every new shape are collective, so eligibility is decided from
+    process-wide constants only -- the env switch, the group size, and whether
+    the group is NVLink-joined. It must never depend on a property of the
+    tensor being exchanged: a per-tensor condition could let one rank take this
+    path while another falls back, and that deadlocks silently, because neither
+    side raises and neither side times out.
+    """
+    global _FAST_ULYSSES_GROUP, _FAST_ULYSSES_PROBED
+    if _FAST_ULYSSES_PROBED:
+        return _FAST_ULYSSES_GROUP
+
+    _FAST_ULYSSES_PROBED = True
+    # Windows belong to the group that allocated them, so a re-probe (only
+    # tests do this) must not hand the next group a stale buffer.
+    _FAST_ULYSSES_OUT_BUFFERS.clear()
+    world_size = get_ulysses_parallel_world_size()
+    # `BarPeers::p[8]` in fast-ulysses caps the group at 8.
+    if not envs.SGLANG_DIFFUSION_FAST_ULYSSES or not 2 <= world_size <= 8:
+        return None
+
+    pg = get_sp_group().ulysses_group
+    reason = ""
+    try:
+        from fast_ulysses import UlyssesGroup
+    except ImportError as exc:
+        UlyssesGroup = None
+        reason = f"{type(exc).__name__}: {exc}"
+
+    # Vote BEFORE constructing. The constructor is itself collective, so a rank
+    # that skipped it would leave the ranks that entered it waiting forever --
+    # no exception, no timeout, just a hang. The vote therefore has to happen
+    # while every rank is still outside it. The env switch and the group size
+    # are process-wide, but whether the package imports is per-rank, so
+    # agreement is established rather than assumed.
+    if not _vote_unanimous(pg, UlyssesGroup is not None):
+        logger.warning(
+            "fast-ulysses unavailable on at least one rank, using NCCL everywhere%s",
+            f" (this rank: {reason})" if reason else "",
+        )
+        return None
+
+    try:
+        # Refuses a group that is not NVLink-joined, which is the case where
+        # the existing collective is the faster one anyway. The probe reads the
+        # same fabric on every rank, so it refuses everywhere or nowhere -- no
+        # second vote needed.
+        _FAST_ULYSSES_GROUP = UlyssesGroup(process_group=pg)
+    except RuntimeError as exc:
+        logger.warning("fast-ulysses refused this topology, using NCCL: %s", exc)
+        return None
+
+    logger.info("Ulysses all-to-all is using fast-ulysses (world_size=%d)", world_size)
+    return _FAST_ULYSSES_GROUP
 
 
 def _ipc_ready_group():
@@ -337,38 +463,77 @@ def _usp_input_all_to_all_packed_qkv(
     assert h_global % world_size == 0
     h_local = h_global // world_size
 
-    if (
-        q.is_cuda
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and q.dtype == k.dtype == v.dtype
-        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
-        and not torch.compiler.is_compiling()
-    ):
-        packed = pack_qkv_destination_major(
-            q,
-            k,
-            v,
-            world_size,
-            out=_a2a_staging_buffer(
-                "usp_packed_qkv_src",
-                (world_size, s_local, h_local, 3 * head_size),
-                q.dtype,
-                q.device,
-            ),
-        )
-    else:
-        packed = torch.empty(
-            (world_size, s_local, h_local, 3 * head_size),
-            dtype=q.dtype,
-            device=q.device,
-        )
-        for index, tensor in enumerate((q, k, v)):
-            head_shards = tensor.view(s_local, world_size, h_local, head_size).permute(
-                1, 0, 2, 3
-            )
-            packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
+    # Split the relayout from the transfer so a trace can attribute each
+    # separately: `usp.relayout_*` is the permute/pack cost a stride-aware
+    # transport would not pay, `usp.transfer_*` is the collective itself.
+    use_nvtx = layerwise_nvtx_enabled()
 
-    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    fast_group = _fast_ulysses_group()
+    if fast_group is not None:
+        # One 4D exchange on a `3 * head_dim` last axis is the same packing
+        # `pack_qkv_destination_major` expresses as a kernel: the destination
+        # ordering is carried by the copy strides, so only the q/k/v concat
+        # remains, and that is a contiguous write rather than a gather.
+        with maybe_nvtx_range("usp.relayout_pack_qkv", use_nvtx):
+            # The same pack kernel the NCCL path uses, at world_size=1: with
+            # one destination it degenerates to a plain [s, h, 3*d] interleave,
+            # which is exactly fast-ulysses' mode-0 input. `torch.cat` here
+            # would instead hit ATen's generic non-contiguous path, because
+            # q/k/v are strided views of the fused QKV projection -- measured
+            # at 2.5x the whole baseline relayout.
+            packed = pack_qkv_destination_major(
+                q,
+                k,
+                v,
+                1,
+                out=_a2a_staging_buffer(
+                    "usp_fast_pack_qkv",
+                    (1, s_local, h_global, 3 * head_size),
+                    q.dtype,
+                    q.device,
+                ),
+            )
+        with maybe_nvtx_range("usp.transfer_in", use_nvtx):
+            packed = _fast_ulysses_exchange(fast_group, "usp_in", packed, 0)
+        q, k, v = packed.squeeze(0).split(head_size, dim=-1)
+        return q, k, v
+
+    with maybe_nvtx_range("usp.relayout_pack_qkv", use_nvtx):
+        if (
+            q.is_cuda
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and q.dtype == k.dtype == v.dtype
+            and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+            and not torch.compiler.is_compiling()
+        ):
+            packed = pack_qkv_destination_major(
+                q,
+                k,
+                v,
+                world_size,
+                out=_a2a_staging_buffer(
+                    "usp_packed_qkv_src",
+                    (world_size, s_local, h_local, 3 * head_size),
+                    q.dtype,
+                    q.device,
+                ),
+            )
+        else:
+            packed = torch.empty(
+                (world_size, s_local, h_local, 3 * head_size),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            for index, tensor in enumerate((q, k, v)):
+                head_shards = tensor.view(
+                    s_local, world_size, h_local, head_size
+                ).permute(1, 0, 2, 3)
+                packed[..., index * head_size : (index + 1) * head_size].copy_(
+                    head_shards
+                )
+
+    with maybe_nvtx_range("usp.transfer_in", use_nvtx):
+        packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
     packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
     q, k, v = packed.split(head_size, dim=-1)
     return q, k, v
@@ -548,6 +713,15 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    # `head_dim == 1` is `[b, h_local, s_global, d]`, which fast-ulysses does not
+    # take; transposing into it would cost one of the two permutes this path
+    # exists to avoid, so that layout stays on the collective below.
+    if head_dim == 2:
+        fast_group = _fast_ulysses_group()
+        if fast_group is not None:
+            with maybe_nvtx_range("usp.transfer_out", layerwise_nvtx_enabled()):
+                return _fast_ulysses_exchange(fast_group, "usp_out", x, 1)
+
     if world_size == 2 and head_dim == 2 and x.shape[1] % 2 == 0:
         half_len = x.shape[1] // 2
         fast = _ipc_varlen_fast(x, [half_len, half_len], 2, "output")
@@ -573,17 +747,22 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
-    x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x, role="usp_output")
+    use_nvtx = layerwise_nvtx_enabled()
+
+    with maybe_nvtx_range("usp.relayout_out_pre", use_nvtx):
+        x = x.permute(permute_order).contiguous()
+    with maybe_nvtx_range("usp.transfer_out", use_nvtx):
+        x = _usp_all_to_all_single(x, role="usp_output")
     x = x.reshape(world_size, s_local, b, h_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'
-    if head_dim == 1:
-        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, world_size, h_local, s_local, d]
-        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
-    else:  # head_dim == 2
-        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
-        x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
+    with maybe_nvtx_range("usp.relayout_out_post", use_nvtx):
+        if head_dim == 1:
+            # Shape transition: [world_size, s_local, b, h_local, d] -> [b, world_size, h_local, s_local, d]
+            x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
+        else:  # head_dim == 2
+            # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
+            x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
 
     return x
 

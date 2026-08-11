@@ -1166,6 +1166,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_fast_ulysses_a2a_2_gpu.py",
     ],
 }
 
@@ -1209,6 +1210,9 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        # no model load; ~50 s measured. Skips itself where fast-ulysses is
+        # not installed, which is most CI images today.
+        "../single_test_file/test_fast_ulysses_a2a_2_gpu.py": 120.0,
     },
 }
 

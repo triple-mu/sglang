@@ -557,16 +557,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 token_tags=tags,
                 device=device,
             )
-            _precompute_refined_prompt_embeds(
-                model,
-                positive,
-                device=device,
-            )
-            _precompute_rope_cache(
-                model,
-                positive,
-                device=device,
-            )
+            with maybe_nvtx_range("h3_precompute_prompt_embeds", self.current_use_nvtx):
+                _precompute_refined_prompt_embeds(
+                    model,
+                    positive,
+                    device=device,
+                )
+            with maybe_nvtx_range("h3_precompute_rope_cache", self.current_use_nvtx):
+                _precompute_rope_cache(
+                    model,
+                    positive,
+                    device=device,
+                )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
@@ -599,6 +601,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     step_profiler=partial(
                         self._profile_denoising_step,
                         batch=batch,
+                    ),
+                    # graph capture and compile both freeze the forward input
+                    # signature, so the hoisted per-step tensors cannot be fed
+                    # through them.
+                    hoist_step_adaln=(
+                        not server_args.enable_breakable_cuda_graph
+                        and not server_args.enable_torch_compile
+                        and model.can_hoist_step_adaln()
                     ),
                 )
         finally:

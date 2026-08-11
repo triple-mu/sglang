@@ -1,0 +1,38 @@
+{
+  "model_path": "MiniMaxAI/MiniMax-H3",
+  "model_variant": "fl2va",
+  "num_gpus": 4,
+  "tp_size": 1,
+  "sp_degree": 4,
+  "ulysses_degree": 4,
+  "ring_degree": 1,
+  "performance_mode": "speed",
+  "use_fsdp_inference": false,
+  "enable_torch_compile": false,
+  "warmup_mode": "off",
+
+  "prompt": "Continue naturally from <Picture 1>. The white cat remains seated on the surfboard wearing sunglasses while gentle ocean waves move around it. Preserve the cat's appearance and the supplied first-frame composition, add subtle natural body movement and sea breeze, and generate synchronized seaside ambience.",
+  "task": "fl2va",
+  "conditions": [
+    {
+      "type": "image",
+      "uri": "file:///workspace/sglang/inputs/minimax_h3_recipes/t2va_first_frame.png",
+      "role": "keyframe",
+      "frame_index": 0
+    }
+  ],
+  "target": {
+    "short_edge": 768,
+    "aspect_ratio": "auto",
+    "duration_seconds": 5.0
+  },
+  "num_inference_steps": 50,
+  "flow_shift": 12.0,
+  "audio_flow_shift": 3.0,
+  "quality": "lossless",
+  "seed": 2101,
+
+  "save_output": true,
+  "output_path": "/workspace/sglang/outputs/minimax_h3_recipes",
+  "output_file_name": "fl2va_first_frame_5s.mp4"
+}

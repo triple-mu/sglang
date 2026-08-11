@@ -43,6 +43,16 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # route the Ulysses all-to-all through fast-ulysses, which moves the
+    # exchange on the copy engines and expresses the relayout as copy strides.
+    # Off by default: it needs the package built against this torch, an
+    # NVLink-joined group of at most 8 ranks, and it is bit-exact with the
+    # existing path, so it is a speed knob rather than a behaviour change.
+    SGLANG_DIFFUSION_FAST_ULYSSES: bool = False
+    # distinct symmetric output windows kept for the `out=` zero-copy path.
+    # They are never released, so multi-resolution serving needs a cap; past it
+    # the exchange pays its copy-out instead of leaking (~180MB/rank/shape).
+    SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS: int = 8
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -70,6 +80,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
+    SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -236,6 +248,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),
+    "SGLANG_DIFFUSION_FAST_ULYSSES": _lazy_bool("SGLANG_DIFFUSION_FAST_ULYSSES"),
+    "SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS": _lazy_int(
+        "SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS", 8
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
     ),
@@ -294,6 +310,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory is low or when this flag is disabled.
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
+    ),
+    # MiniMax-H3: project every denoise step's AdaLN rows before the loop, so
+    # the pure-weight-stream adaln_proj GEMM reads its 520MB of weights once
+    # per block instead of once per block per step. Off by default: batching
+    # the steps changes the GEMM's M dimension and therefore cuBLAS kernel
+    # selection, which is not guaranteed bitwise identical.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST"
+    ),
+    # Requires the hoist. Drop the 26GB of adaln_proj weights to host memory
+    # once the plan is built, and rebuild the plan straight from memory while
+    # the schedule repeats. Off by default: it trades 26GB of host RAM per
+    # rank for the device memory, and a schedule change pays a 26GB restore.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_OFFLOAD"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

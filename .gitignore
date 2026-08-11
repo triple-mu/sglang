@@ -280,3 +280,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+nsight/
+logs/
+outputs/

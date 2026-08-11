@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.cuda_profiler import maybe_cuda_profiler_range
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -105,6 +106,25 @@ class PipelineExecutor(ABC):
             payload
         )
 
+    def _should_bracket_cuda_profiler(
+        self, payload: Any, server_args: ServerArgs
+    ) -> bool:
+        """Whether this rank opens the Nsight capture range for ``payload``.
+
+        Every rank issues the start/stop pair, not just rank 0. The GPU workers
+        are separate spawned processes and nsys tracks a
+        ``--capture-range=cudaProfilerApi`` range per process, so a rank that
+        never calls ``cudaProfilerStart`` contributes nothing to the report --
+        a rank-0-only bracket yields a single-GPU timeline of a multi-GPU run.
+
+        The ranks stay aligned without a broadcast because they execute the same
+        pipeline for the same request and are already synchronized by the
+        sequence-parallel collectives inside it.
+        """
+        return server_args.enable_cuda_profiler_range and not self._is_warmup_payload(
+            payload
+        )
+
     def _run_stage_with_executor_hooks(
         self,
         stage: "PipelineStage",
@@ -135,9 +155,12 @@ class PipelineExecutor(ABC):
         server_args: ServerArgs,
     ) -> OutputBatch:
 
-        with self.profile_execution(batch, dump_rank=0):
-            with current_platform.inference_mode():
-                batch = self.execute(stages, batch, server_args)
+        with maybe_cuda_profiler_range(
+            self._should_bracket_cuda_profiler(batch, server_args)
+        ):
+            with self.profile_execution(batch, dump_rank=0):
+                with current_platform.inference_mode():
+                    batch = self.execute(stages, batch, server_args)
 
         return batch
 
@@ -148,9 +171,12 @@ class PipelineExecutor(ABC):
         server_args: ServerArgs,
     ):
         """Execute a grouped request under the same profiler as a single request."""
-        with self.profile_execution(batches[0], dump_rank=0):
-            with current_platform.inference_mode():
-                batches = self.execute_group(stages, batches, server_args)
+        with maybe_cuda_profiler_range(
+            self._should_bracket_cuda_profiler(batches, server_args)
+        ):
+            with self.profile_execution(batches[0], dump_rank=0):
+                with current_platform.inference_mode():
+                    batches = self.execute_group(stages, batches, server_args)
         return batches
 
     def execute_group_sequentially_with_profiling(
