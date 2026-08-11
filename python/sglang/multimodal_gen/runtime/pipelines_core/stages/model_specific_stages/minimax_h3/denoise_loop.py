@@ -20,6 +20,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    layerwise_nvtx_enabled,
+    maybe_nvtx_range,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -461,49 +465,53 @@ def minimax_h3_denoise_loop(
     audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
+    use_nvtx = layerwise_nvtx_enabled()
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v = sigmas_video[step]
             s_a = sigmas_audio[step]
 
-            fk = positive.forward_kwargs(
-                video_rows=video_rows,
-                audio_rows=audio_rows,
-                step_timesteps=timestep_plan[step],
-            )
+            with maybe_nvtx_range("h3_build_forward_kwargs", use_nvtx):
+                fk = positive.forward_kwargs(
+                    video_rows=video_rows,
+                    audio_rows=audio_rows,
+                    step_timesteps=timestep_plan[step],
+                )
             with torch.inference_mode():
-                if model_forward is None:
-                    v_video, v_audio = model(**fk)
-                else:
-                    v_video, v_audio = model_forward(model, fk, step)
+                with maybe_nvtx_range("h3_model_forward", use_nvtx):
+                    if model_forward is None:
+                        v_video, v_audio = model(**fk)
+                    else:
+                        v_video, v_audio = model_forward(model, fk, step)
                 # The model outputs are inference tensors. Keep their disposable
                 # fp32 velocity updates in the same context so ``out=velocity``
                 # can reuse the output storage without an extra clone.
-                mv_video_t = v_video.float()
-                mv_audio_t = v_audio[audio_target_slice].float()
+                with maybe_nvtx_range("h3_scheduler_update", use_nvtx):
+                    mv_video_t = v_video.float()
+                    mv_audio_t = v_audio[audio_target_slice].float()
 
-                video_target = video_rows[video_target_slice]
-                _minimax_h3_update_target_rows_(
-                    video_target,
-                    mv_video_t,
-                    sigma_t=video_sigma_t[step],
-                    sigma_curr=s_v,
-                    sigma_ratio=video_sigma_ratios[step],
-                    one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
-                    denoised_scratch=video_denoised_scratch,
-                )
+                    video_target = video_rows[video_target_slice]
+                    _minimax_h3_update_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        sigma_t=video_sigma_t[step],
+                        sigma_curr=s_v,
+                        sigma_ratio=video_sigma_ratios[step],
+                        one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
+                        denoised_scratch=video_denoised_scratch,
+                    )
 
-                audio_target = audio_rows[audio_target_slice]
-                _minimax_h3_update_target_rows_(
-                    audio_target,
-                    mv_audio_t,
-                    sigma_t=audio_sigma_t[step],
-                    sigma_curr=s_a,
-                    sigma_ratio=audio_sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
-                    denoised_scratch=audio_denoised_scratch,
-                )
+                    audio_target = audio_rows[audio_target_slice]
+                    _minimax_h3_update_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        sigma_t=audio_sigma_t[step],
+                        sigma_curr=s_a,
+                        sigma_ratio=audio_sigma_ratios[step],
+                        one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
+                        denoised_scratch=audio_denoised_scratch,
+                    )
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
 
