@@ -3008,3 +3008,13 @@ def get_global_server_args() -> ServerArgs:
         # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
     return _global_server_args
+
+
+def maybe_get_global_server_args() -> ServerArgs | None:
+    """Global args, or ``None`` when this process never set them.
+
+    Model code that only reads a profiling switch must not depend on a
+    running worker; unit tests that construct modules directly leave the
+    global unset.
+    """
+    return _global_server_args
