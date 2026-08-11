@@ -175,6 +175,38 @@ def _fast_ulysses_exchange(group, role: str, x: torch.Tensor, mode: int):
     return out
 
 
+def fast_ulysses_async_input_exchange(x: torch.Tensor, role: str):
+    """Start one Ulysses input exchange for a 3D ``[s_local, h_global, d]`` tensor.
+
+    Returns a handle to pass to :func:`fast_ulysses_wait`, or ``None`` when the
+    fast transport is unavailable -- the caller then has to fall back for the
+    whole q/k/v group, not per tensor.
+
+    The exchanges do NOT overlap each other: fast-ulysses issues them on one
+    comm stream, so they serialise. What they overlap is the *caller* stream,
+    which is the point -- splitting the packed q/k/v exchange into three lets
+    qk-norm+RoPE for one tensor run while another is still moving. That trade
+    costs two extra barrier pairs per block, so it only pays when the overlapped
+    compute exceeds them.
+    """
+    group = _fast_ulysses_group()
+    if group is None:
+        return None
+    staged = x.unsqueeze(0)
+    out = _fast_ulysses_out_buffer(group, f"async_{role}", staged, 0)
+    if out is None:
+        return group.all_to_all_4d_async(staged, mode=0)
+    return group.all_to_all_4d_async(staged, mode=0, out=out)
+
+
+def fast_ulysses_wait(handle) -> torch.Tensor:
+    """Block the caller stream on an async exchange and unwrap to 3D."""
+    # AsyncCollectiveTensor waits on first aten use; CompletedHandle is already
+    # done. `.wait()` covers both and keeps the intent explicit at the call site.
+    result = handle.wait() if hasattr(handle, "wait") else handle
+    return result.squeeze(0)
+
+
 def _fast_ulysses_group():
     """The fast-ulysses collective for the Ulysses group, or ``None``.
 

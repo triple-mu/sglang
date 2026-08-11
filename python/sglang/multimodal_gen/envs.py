@@ -53,6 +53,11 @@ if TYPE_CHECKING:
     # They are never released, so multi-resolution serving needs a cap; past it
     # the exchange pays its copy-out instead of leaking (~180MB/rank/shape).
     SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS: int = 8
+    # Split the packed q/k/v Ulysses exchange into three async ones so that
+    # qk-norm+RoPE overlaps a transfer. Off by default: it buys that overlap at
+    # the price of two extra barrier pairs per block, which is only a win when
+    # the overlapped kernel is bigger than they are.
+    SGLANG_DIFFUSION_FAST_ULYSSES_ASYNC_QKV: bool = False
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -251,6 +256,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_FAST_ULYSSES": _lazy_bool("SGLANG_DIFFUSION_FAST_ULYSSES"),
     "SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_FAST_ULYSSES_MAX_BUFFERS", 8
+    ),
+    "SGLANG_DIFFUSION_FAST_ULYSSES_ASYNC_QKV": _lazy_bool(
+        "SGLANG_DIFFUSION_FAST_ULYSSES_ASYNC_QKV"
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16

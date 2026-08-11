@@ -7,6 +7,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Any
 
@@ -467,12 +468,17 @@ def _minimax_h3_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
     ring_active: bool = False,
+    input_exchanged: bool = False,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
     This is the narrow BCG break point: projections, normalization, RoPE,
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
+
+    ``input_exchanged`` says the caller already traded sequence for heads --
+    the async split path does it itself so it can interleave the exchanges with
+    qk-norm+RoPE. The output exchange still happens here either way.
     """
 
     use_nvtx = layerwise_nvtx_enabled()
@@ -482,8 +488,9 @@ def _minimax_h3_attention_core_impl(
             _usp_output_all_to_all,
         )
 
-        with maybe_nvtx_range("h3_attn_ulysses_a2a_in", use_nvtx):
-            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if not input_exchanged:
+            with maybe_nvtx_range("h3_attn_ulysses_a2a_in", use_nvtx):
+                q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -674,7 +681,28 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
-        if rope_cache is None:
+
+        input_exchanged = False
+        if (
+            ulysses_active
+            and rope_cache is not None
+            and self._use_fused_qknorm_rope
+            and envs.SGLANG_DIFFUSION_FAST_ULYSSES_ASYNC_QKV
+            and not torch.compiler.is_compiling()
+            # This runs above the BCG break point, so under graph capture it
+            # would be captured -- and the async transport cannot be: its
+            # staging waits on an event recorded by an earlier uncaptured call.
+            # Capture is collective, so every rank takes this branch together.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            split = self._async_split_qkv_exchange(q, k, v, rope_cache)
+            if split is not None:
+                q, k, v = split
+                input_exchanged = True
+
+        if input_exchanged:
+            pass
+        elif rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
                 k,
@@ -723,10 +751,68 @@ class MiniMaxH3Attention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            input_exchanged=input_exchanged,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
         return out
+
+    def _async_split_qkv_exchange(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Exchange q/k/v as three async collectives, overlapping norm+RoPE.
+
+        ``v`` needs neither norm nor RoPE, so it leaves first and its transfer
+        covers q's kernel; q's transfer then covers k's. The exchanges do not
+        overlap each other -- fast-ulysses serialises them on one comm stream --
+        so this buys compute/transfer overlap at the cost of two extra barrier
+        pairs per block.
+
+        Returns ``None`` when the fast transport is unavailable, leaving the
+        caller on the ordinary fused path. The decision is process-wide (the
+        transport's own gate), so every rank takes the same branch.
+        """
+        from sglang.multimodal_gen.runtime.layers.usp import (
+            fast_ulysses_async_input_exchange,
+            fast_ulysses_wait,
+        )
+
+        v_handle = fast_ulysses_async_input_exchange(v, "v")
+        if v_handle is None:
+            return None
+
+        cos_sin_cache, positions = rope_cache
+        # The kernel dispatches q and k by head id, so a zero-head side is
+        # simply no work: one call does q only, the next does k only. Checked
+        # bit-exact against the combined call.
+        empty = q.new_empty((q.shape[0], 0, self.head_dim))
+        norm_rope = functools.partial(
+            fused_inplace_qknorm_rope,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=True,
+            eps=self.q_norm.eps,
+            head_dim=self.head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+            round_norm_before_rope=True,
+        )
+
+        norm_rope(q, empty)
+        q_handle = fast_ulysses_async_input_exchange(q, "q")
+        norm_rope(empty, k)
+        k_handle = fast_ulysses_async_input_exchange(k, "k")
+
+        return (
+            fast_ulysses_wait(q_handle),
+            fast_ulysses_wait(k_handle),
+            fast_ulysses_wait(v_handle),
+        )
 
 
 class MiniMaxH3MLP(nn.Module):
