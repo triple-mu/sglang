@@ -283,3 +283,7 @@ internal-docs/
 nsight/
 logs/
 outputs/
+
+# local measurement recipes and the a2a reference implementation
+minimax_h3_recipes/
+ref_a2a.py

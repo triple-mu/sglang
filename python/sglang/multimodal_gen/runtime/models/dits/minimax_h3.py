@@ -1021,6 +1021,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         max_seqlen: int,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1290,8 +1291,6 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             prefix="final_layer",
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
-        # hoisted-AdaLN residency: the projected plan for the last schedule,
-        # and host custody of the weights it stands in for.
         self._mark_missing_params_required()
 
     def _resolve_attention_backend_once(self) -> None:
@@ -1754,7 +1753,6 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
-        # request-level hoist: this step's slice of the pre-projected plan
         block_adaln_params = None
         if self._can_batch_block_adaln():
             with maybe_nvtx_range("h3_dit_adaln_tp_allgather", use_nvtx):
