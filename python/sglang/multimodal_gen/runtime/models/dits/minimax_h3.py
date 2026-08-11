@@ -16,6 +16,7 @@ import torch.nn as nn
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
+from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
 from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
@@ -63,9 +64,12 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
+
+logger = init_logger(__name__)
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
@@ -110,6 +114,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "token_tags",
         "block_token_tags",
         "block_combined_indices",
+        "step_adaln_params",
         "skip_mask_out_condition",
         "prompt_embeds",
         "refined_prompt_embeds_length",
@@ -785,6 +790,13 @@ class MiniMaxH3AdalnProj(nn.Module):
         x, _ = self.linear(adaln_input)
         return x
 
+    def project(self, adaln_input: torch.Tensor) -> torch.Tensor:
+        """Full-width [M, out_features] projection, TP-gathered when sharded."""
+        x = self.project_local(adaln_input)
+        if get_tp_world_size() > 1:
+            x = tensor_model_parallel_all_gather(x)
+        return x
+
     def split_output(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         m = x.shape[0]
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
@@ -792,10 +804,7 @@ class MiniMaxH3AdalnProj(nn.Module):
 
     def forward(self, adaln_input: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """adaln_input: SiLU(t_emb) BF16 -> expand_ratio tensors of [M*modality_num, H]."""
-        x = self.project_local(adaln_input)
-        if get_tp_world_size() > 1:
-            x = tensor_model_parallel_all_gather(x)
-        return self.split_output(x)
+        return self.split_output(self.project(adaln_input))
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -1006,6 +1015,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         *,
         adaln_input: torch.Tensor,
         inverse_indices: torch.Tensor,
+        adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project all rows into TP-local video/audio output shards.
 
@@ -1014,7 +1024,9 @@ class MiniMaxH3FinalLayer(nn.Module):
         The model gathers output columns only after selecting live media rows,
         preserving the GEMM shape while reducing collective payload.
         """
-        shift, scale = self.adaln_proj(adaln_input)
+        if adaln_params is None:
+            adaln_params = self.adaln_proj(adaln_input)
+        shift, scale = adaln_params
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
@@ -1034,15 +1046,162 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
-    def _can_batch_block_adaln(self) -> bool:
+    def _adaln_batchable(self) -> bool:
+        """Whether every block's adaln_proj may be driven outside block.forward."""
         return (
-            get_tp_world_size() > 1
-            and not torch.compiler.is_compiling()
+            not torch.compiler.is_compiling()
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and not hasattr(self, "_sglang_cache_dit_adapter")
             and not is_layerwise_offloaded_module(self)
             and all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
         )
+
+    def _can_batch_block_adaln(self) -> bool:
+        return get_tp_world_size() > 1 and self._adaln_batchable()
+
+    def can_hoist_step_adaln(self) -> bool:
+        """Whether ``build_step_adaln_params`` may replace per-step projection.
+
+        The gate only decides whether the plan may be built with one batched
+        GEMM per module; a device that fails it still gets a bit-exact plan
+        from the per-step chain, so it is not consulted here.
+        """
+        return (
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_ENABLE_ADALN_HOIST
+            and self._adaln_batchable()
+            and not torch.compiler.is_compiling()
+        )
+
+    def _project_adaln_per_step(
+        self, projection: nn.Module, row_slices: list[torch.Tensor]
+    ) -> torch.Tensor:
+        """Whole-schedule projection that leaves every GEMM's M untouched.
+
+        Bitwise identical to what the denoise loop computes step by step, since
+        it is the same calls in the same order; the only thing hoisted is
+        *when* they run, which is what lets the weights be read once for the
+        request instead of once per step.
+        """
+        return torch.cat([projection.project(rows) for rows in row_slices])
+
+    def _batched_adaln_is_bit_exact(
+        self,
+        *,
+        sig: tuple,
+        row_slices: list[torch.Tensor],
+        projections: list[nn.Module],
+        batched_outputs: list[torch.Tensor],
+    ) -> bool:
+        """First-sight check of the batched projections against per-step ones.
+
+        Every projection is checked, not a representative one, and the verdict
+        is per model rather than process-wide. Batching M only changes the
+        answer where the wider kernel's accumulation order rounds differently,
+        and whether it does depends on the operand values as well as the shape
+        -- two modules with identical shapes can disagree.
+
+        References are compared and dropped one module at a time so the peak
+        only carries one extra projection rather than a second whole plan.
+        """
+        for projection, batched in zip(projections, batched_outputs, strict=True):
+            reference = self._project_adaln_per_step(projection, row_slices)
+            equal = torch.equal(batched, reference)
+            del reference
+            if not equal:
+                logger.warning_once(
+                    "Batching the MiniMax-H3 AdaLN projection is not bit-exact "
+                    "on this device; building the plan per step instead. The "
+                    "hoist still reads each block's weights once per request."
+                )
+                self._adaln_hoist_gate.disable()
+                return False
+        self._adaln_hoist_gate.mark_verified(sig)
+        return True
+
+    def _project_adaln_plan(
+        self, adaln_input: torch.Tensor, row_counts: list[int]
+    ) -> list[torch.Tensor]:
+        """Whole-schedule output of every adaln_proj, block-major then final.
+
+        Prefers one batched GEMM per module, which is what makes the hoist a
+        speedup and not just a rescheduling, and falls back to the per-step
+        chain where batching would change the result.
+        """
+        row_slices = []
+        start = 0
+        for rows in row_counts:
+            row_slices.append(adaln_input[start : start + rows])
+            start += rows
+        projections = [block.adaln_proj for block in self.blocks]
+        projections.append(self.final_layer.adaln_proj)
+
+        sig = (
+            self.blocks[0].adaln_proj.linear.input_size,
+            self.blocks[0].adaln_proj.linear.output_size,
+            self.final_layer.adaln_proj.linear.output_size,
+            tuple(row_counts),
+        )
+        if self._adaln_hoist_gate.is_verified(sig):
+            return [p.project(adaln_input) for p in projections]
+        if self._adaln_hoist_gate.disabled:
+            return [self._project_adaln_per_step(p, row_slices) for p in projections]
+
+        batched = [p.project(adaln_input) for p in projections]
+        if self._batched_adaln_is_bit_exact(
+            sig=sig,
+            row_slices=row_slices,
+            projections=projections,
+            batched_outputs=batched,
+        ):
+            return batched
+        del batched
+        return [self._project_adaln_per_step(p, row_slices) for p in projections]
+
+    @torch.inference_mode()
+    def build_step_adaln_params(
+        self, step_unique_timesteps: list[torch.Tensor]
+    ) -> list[tuple[tuple[tuple[torch.Tensor, ...], ...], tuple[torch.Tensor, ...]]]:
+        """Project every denoise step's AdaLN rows up front, once per module.
+
+        ``adaln_proj`` is a pure weight stream (520MB of weights for 1-3 rows
+        of output), so the loop pays that read once per block per step. Every
+        step's rows are known before the loop, so the whole schedule can be
+        projected in one pass over each block's weights instead.
+
+        Where the device allows it that pass is a single [sum(M), t_dim] GEMM,
+        which also collapses 49 DRAM-bound launches into one; where it does not
+        it is the per-step chain, which reschedules the same GEMMs without
+        changing a bit. Either way the time embedding still runs per step, so
+        ``adaln_input`` is bitwise identical to the loop's.
+
+        Returns one ``(per_block_params, final_layer_params)`` entry per step.
+        """
+        row_counts = [int(t.numel()) for t in step_unique_timesteps]
+        adaln_input = torch.cat(
+            [
+                nn.functional.silu(self.time_embedder(unique_timesteps.view(-1))).to(
+                    _BF16_DTYPE
+                )
+                for unique_timesteps in step_unique_timesteps
+            ]
+        )
+        outputs = self._project_adaln_plan(adaln_input, row_counts)
+        block_outputs, final_output = outputs[:-1], outputs[-1]
+        plan = []
+        start = 0
+        for rows in row_counts:
+            stop = start + rows
+            plan.append(
+                (
+                    tuple(
+                        block.adaln_proj.split_output(output[start:stop])
+                        for block, output in zip(self.blocks, block_outputs)
+                    ),
+                    self.final_layer.adaln_proj.split_output(final_output[start:stop]),
+                )
+            )
+            start = stop
+        return plan
 
     def _validate_tp_config(
         self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int
@@ -1186,6 +1345,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             prefix="final_layer",
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
+        # Whether batching the AdaLN projection's M dimension keeps it bitwise
+        # identical depends on this model's weights and this device, so the
+        # verdict is per model and per schedule: the shipped H3 shapes batch
+        # exactly on H200 and do not on sm_120 (2504/9386496 BF16 elements
+        # differ, max 1.6e-2).
+        self._adaln_hoist_gate = BitExactFusionGate(
+            "MiniMax-H3 hoisted AdaLN projection", per_signature=True
+        )
         self._mark_missing_params_required()
 
     def _resolve_attention_backend_once(self) -> None:
@@ -1646,8 +1813,13 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
+        # request-level hoist: this step's slice of the pre-projected plan
+        step_adaln_params = kwargs.get("step_adaln_params")
         block_adaln_params = None
-        if self._can_batch_block_adaln():
+        final_adaln_params = None
+        if step_adaln_params is not None:
+            block_adaln_params, final_adaln_params = step_adaln_params
+        elif self._can_batch_block_adaln():
             local_adaln = torch.stack(
                 [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
             )
@@ -1680,6 +1852,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             hidden,
             adaln_input=adaln_input,
             inverse_indices=block_inverse,
+            adaln_params=final_adaln_params,
         )
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
