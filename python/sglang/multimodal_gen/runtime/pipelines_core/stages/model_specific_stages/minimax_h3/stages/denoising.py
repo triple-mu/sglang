@@ -583,6 +583,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         self.step_profile()
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
+                    adaln_precompute=server_args.dit_adaln_precompute,
                     model=model,
                     model_forward=partial(self._forward_dit, batch=batch),
                     positive=positive,

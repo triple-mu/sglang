@@ -8,7 +8,10 @@ contract accepts packed inference keyword arguments and returns packed logits.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 import torch
 import torch.nn as nn
@@ -66,6 +69,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
 )
 
+_LOGGER = init_logger(__name__)
+
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
@@ -103,6 +108,9 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_position_ids",
         "rope_cache",
         "unique_timesteps",
+        # Every timestep the request will use, so AdaLN can be derived
+        # once instead of per step. Absent unless the caller opts in.
+        "all_unique_timesteps",
         "inverse_indices",
         "update_mask",
         "update_audio_mask",
@@ -793,6 +801,99 @@ class MiniMaxH3AdalnProj(nn.Module):
         return self.split_output(x)
 
 
+class MiniMaxH3AdalnCache:
+    """Every AdaLN parameter the request will ever need, computed once.
+
+    ``adaln_proj`` is 24.23 of the DiT's 61.73 GiB -- more than the MLP or the
+    attention -- and it is the one weight in the block whose input is not the
+    token stream: it projects ``SiLU(time_embedder(t))``, a per-step vector. So
+    its output depends on nothing but the timestep, the schedule is known before
+    the loop starts, and a 50-step request re-derives the same fifty answers
+    from 24 GiB of weights fifty times over.
+
+    Computing them all up front costs one pass and a cache of
+    ``num_blocks x num_timesteps x out_features`` (about 1 GiB for a 50-step
+    MiniMax-H3 request), after which the projection weights are dead for the
+    rest of the request. Numerically identical: same weights, same inputs, same
+    kernel, just not repeated.
+    """
+
+    def __init__(self, blocks: nn.ModuleList) -> None:
+        self._blocks = blocks
+        self._timesteps: torch.Tensor | None = None
+        self._table: torch.Tensor | None = None
+
+    @property
+    def warm(self) -> bool:
+        return self._table is not None
+
+    def build(
+        self,
+        *,
+        all_timesteps: torch.Tensor,
+        adaln_input: torch.Tensor,
+        managers: Sequence[Any] = (),
+    ) -> None:
+        """adaln_input: SiLU(t_emb) for every timestep, [T, t_dim].
+
+        The configurations that need this feature are exactly the ones where the
+        weights are not on the GPU to begin with -- that is why they fit -- so
+        each block's parameters have to be pulled in before it can be projected.
+        Sequentially, one block at a time: the point is to avoid ever holding
+        all of them at once.
+        """
+        rows = []
+        for index, block in enumerate(self._blocks):
+            for manager in managers:
+                manager.prefetch_layer(index, non_blocking=False)
+            # One timestep at a time, so the GEMM has the same shape it would
+            # have had in the per-step path. Batching all T into one call picks
+            # a different cuBLAS kernel and rounds differently, which showed up
+            # as a different output file; T tiny matrix-vector products cost
+            # nothing here because this runs once per request.
+            per_step = []
+            for row in range(adaln_input.shape[0]):
+                local = block.adaln_proj.project_local(adaln_input[row : row + 1])
+                if get_tp_world_size() > 1:
+                    local = tensor_model_parallel_all_gather(local)
+                per_step.append(local)
+            rows.append(torch.cat(per_step, dim=0))
+            # Let it go again before pulling in the next one. Without this the
+            # pass ends holding every block at once, which is the state the
+            # caller was trying to avoid.
+            for manager in managers:
+                manager.release_layer(index)
+        self._table = torch.stack(rows)
+        self._timesteps = all_timesteps.detach().clone()
+
+    def covers(self, timesteps: torch.Tensor) -> bool:
+        """True when the table was built for this exact schedule.
+
+        Requests do not share a schedule -- warmup runs two steps and the real
+        request fifty -- so a table built for one is wrong for the next and has
+        to be rebuilt rather than reused.
+        """
+        if self._timesteps is None or self._timesteps.numel() != timesteps.numel():
+            return False
+        return bool(torch.equal(self._timesteps, timesteps.to(self._timesteps.device)))
+
+    def lookup(self, block_index: int, timesteps: torch.Tensor):
+        """AdaLN params for this block at this step's timesteps, or None."""
+        if self._table is None:
+            return None
+        timesteps = timesteps.reshape(-1).to(self._timesteps.device)
+        matches = self._timesteps.view(1, -1) == timesteps.view(-1, 1)
+        found = matches.any(dim=1)
+        if not bool(found.all()):
+            # A timestep outside the schedule the table was built for; fall back
+            # rather than return the wrong modulation.
+            return None
+        indices = matches.float().argmax(dim=1)
+        return self._blocks[block_index].adaln_proj.split_output(
+            self._table[block_index].index_select(0, indices)
+        )
+
+
 class MiniMaxH3TokenRefinerBlock(nn.Module):
     """Standard pre-norm transformer block without AdaLN or RoPE."""
 
@@ -1175,6 +1276,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             ]
         )
         self.layer_names = ["blocks"]
+        # Stays empty unless a caller passes the request's full timestep
+        # schedule, so the model needs no flag of its own: the decision lives
+        # with the loop that owns the schedule.
+        self._adaln_cache = MiniMaxH3AdalnCache(self.blocks)
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
             quant_config,
@@ -1618,6 +1723,27 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         # request-step AdaLN input shared by all blocks
         adaln_input = nn.functional.silu(t_emb).to(_BF16_DTYPE)
+
+        # The whole schedule is known before the loop, and adaln_proj depends on
+        # nothing else, so build every step's parameters once and stop carrying
+        # the 24 GiB of projection weights for the rest of the request.
+        all_timesteps = kwargs.get("all_unique_timesteps")
+        if all_timesteps is not None:
+            all_timesteps = all_timesteps.to(device)
+            if not self._adaln_cache.covers(all_timesteps):
+                all_input = nn.functional.silu(self.time_embedder(all_timesteps)).to(
+                    _BF16_DTYPE
+                )
+                self._adaln_cache.build(
+                    all_timesteps=all_timesteps,
+                    adaln_input=all_input,
+                    managers=getattr(self, "layerwise_offload_managers", ()),
+                )
+                _LOGGER.info(
+                    "AdaLN precompute: %d timesteps x %d blocks cached",
+                    all_timesteps.numel(),
+                    len(self.blocks),
+                )
         inverse_indices = inverse_indices.to(device)
         block_inverse = inverse_indices[row_start:row_stop]
         if block_token_tags is None:
@@ -1642,7 +1768,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         block_adaln_params = None
-        if self._can_batch_block_adaln():
+        if self._adaln_cache.warm:
+            cached = tuple(
+                self._adaln_cache.lookup(index, unique_timesteps)
+                for index in range(len(self.blocks))
+            )
+            if all(entry is not None for entry in cached):
+                block_adaln_params = cached
+        if block_adaln_params is None and self._can_batch_block_adaln():
             local_adaln = torch.stack(
                 [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
             )

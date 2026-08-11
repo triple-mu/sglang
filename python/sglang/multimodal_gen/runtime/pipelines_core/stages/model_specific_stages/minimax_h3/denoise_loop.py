@@ -235,6 +235,7 @@ class MiniMaxH3DenoiseBranch:
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
         step_timesteps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        all_unique_timesteps: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
         audio_x = self.audio_x_buffer
@@ -257,7 +258,7 @@ class MiniMaxH3DenoiseBranch:
                 0, self.audio_target_seq_idx, audio_rows[self.audio_target_slice]
             )
         unique_timesteps, inverse_indices, block_combined_indices = step_timesteps
-        return {
+        kwargs = {
             **self.static_kwargs,
             "x": x,
             "audio_x": audio_x,
@@ -265,6 +266,11 @@ class MiniMaxH3DenoiseBranch:
             "inverse_indices": inverse_indices,
             "block_combined_indices": block_combined_indices,
         }
+        if all_unique_timesteps is not None:
+            # Only present when AdaLN precompute is on, so the
+            # default path's kwargs are byte-for-byte unchanged.
+            kwargs["all_unique_timesteps"] = all_unique_timesteps
+        return kwargs
 
     def _expand_step_timesteps(
         self,
@@ -371,6 +377,7 @@ def minimax_h3_denoise_loop(
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    adaln_precompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -449,6 +456,16 @@ def minimax_h3_denoise_loop(
         imgvid_cond_noise_aug=float(imgvid_cond_noise_aug_for_inference),
         audio_ref_cond_noise_aug=float(audio_cond_noise_aug_for_inference),
     )
+
+    # AdaLN depends on the timestep and nothing else, and every timestep the
+    # request will use is already sitting in the plan. Hand the DiT the union so
+    # it can derive all of them once instead of re-deriving each step's from
+    # 24 GiB of projection weights fifty times.
+    all_unique_timesteps = None
+    if adaln_precompute:
+        all_unique_timesteps = torch.unique(
+            torch.cat([plan[0].reshape(-1) for plan in timestep_plan])
+        )
     # match the scheduler's device-fp32 math once, then reuse one denoised
     # scratch per modality instead of allocating intermediates every step
     video_sigmas = torch.tensor(sigmas_video, dtype=torch.float32, device=device)
@@ -471,6 +488,7 @@ def minimax_h3_denoise_loop(
                 video_rows=video_rows,
                 audio_rows=audio_rows,
                 step_timesteps=timestep_plan[step],
+                all_unique_timesteps=all_unique_timesteps,
             )
             with torch.inference_mode():
                 if model_forward is None:

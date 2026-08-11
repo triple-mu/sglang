@@ -311,6 +311,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_residency_policy: str = "leading"
     # Restrict layerwise streaming to parameters matching this regex.
     dit_layerwise_tensor_pattern: str | None = None
+    # Derive every step's AdaLN parameters once, then drop the weights.
+    dit_adaln_precompute: bool = False
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -1785,6 +1787,21 @@ class ServerArgs(DisaggServerArgsMixin):
             "a matrix-vector product against a per-step embedding -- the most "
             "bytes moved for the least compute in the block. Streaming only that "
             "with `adaln_proj` keeps the compute-heavy parameters on the GPU.",
+        )
+        parser.add_argument(
+            "--dit-adaln-precompute",
+            action=StoreBoolean,
+            default=ServerArgs.dit_adaln_precompute,
+            help="Derive every denoising step's AdaLN modulation once at the "
+            "start of the request and release the projection weights. AdaLN "
+            "projects the timestep embedding and nothing else, so its output is "
+            "a function of the schedule, which is known before the loop begins; "
+            "recomputing it per step re-reads the same weights for the same "
+            "answer. On MiniMax-H3 that weight is 24.2 of the DiT's 61.7 GiB, "
+            "the largest tensor in the block and the one with the least compute "
+            "to hide its transfer behind. The cache costs "
+            "num_blocks x num_timesteps x out_features. Numerically identical: "
+            "same weights, same inputs, computed once instead of per step.",
         )
         parser.add_argument(
             "--enable-cuda-profiler-range",
