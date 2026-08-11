@@ -732,6 +732,11 @@ class Envs:
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
 
+    # Diffusion kernels
+    # MiniMax-H3 indexed AdaLN modulation: use the vectorized CUDA JIT kernels
+    # instead of the Triton ones. Bit-exact with Triton; set to 0 to A/B.
+    SGLANG_OPT_USE_JIT_INDEXED_MODULATION = EnvBool(True)
+
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
