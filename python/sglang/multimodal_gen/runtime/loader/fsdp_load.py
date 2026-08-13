@@ -207,7 +207,6 @@ def _maybe_dequantize_fp8(
     return full_tensor
 
 
-# TODO(PY): add compile option
 def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
     """Let FSDP2 unshard around forward passes that bypass ``__call__``.
 
@@ -221,6 +220,7 @@ def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
         register_fsdp_forward_method(model, name)
 
 
+# TODO(PY): add compile option
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
     init_params: dict[str, Any],
