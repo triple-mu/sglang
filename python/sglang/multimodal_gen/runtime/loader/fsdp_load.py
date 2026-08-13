@@ -215,8 +215,12 @@ def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
     hook therefore never fires for a model driven through a custom method, and
     the first op mixing them with a plain tensor fails. Models declare those
     entry points in ``_fsdp_forward_methods``.
+
+    Declaring it is optional. The DiT and text-encoder base classes do, but this
+    runs for every FSDP-loaded module, and a bridge or VAE is a plain nn.Module
+    driven entirely through ``__call__`` with no entry point to declare.
     """
-    for name in model._fsdp_forward_methods:
+    for name in getattr(type(model), "_fsdp_forward_methods", ()):
         register_fsdp_forward_method(model, name)
 
 
