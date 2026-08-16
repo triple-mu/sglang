@@ -263,8 +263,15 @@ def _copy_grouped_qkv_tp_shard(
     head_dim: int,
     tp_rank: int,
     tp_size: int,
+    interleaved: bool = False,
 ) -> bool:
-    """Copy a dense MHA checkpoint directly into its TP-local Q/K/V rows."""
+    """Copy a dense MHA checkpoint directly into its TP-local Q/K/V rows.
+
+    ``interleaved`` keeps the checkpoint's own per-head [q, k, v] row order
+    instead of restacking it into [q_all, k_all, v_all]. The projection then
+    emits [tokens, heads, 3, head_dim], whose head axis is already the layout
+    the Ulysses exchange splits on.
+    """
     if (
         tp_size <= 0
         or not 0 <= tp_rank < tp_size
@@ -290,6 +297,9 @@ def _copy_grouped_qkv_tp_shard(
 
     grouped = loaded_weight.view(num_query_groups, 3, head_dim, *rest_shape)
     grouped = grouped.narrow(0, tp_rank * local_groups, local_groups)
+    if interleaved:
+        param.data.view(local_groups, 3, head_dim, *rest_shape).copy_(grouped)
+        return True
     target = param.data.view(3, local_groups, head_dim, *rest_shape)
     for index in range(3):
         target[index].copy_(grouped[:, index])
@@ -596,18 +606,24 @@ def _minimax_h3_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
     ring_active: bool = False,
+    fused_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
     This is the narrow BCG break point: projections, normalization, RoPE,
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
+
+    ``fused_qkv`` is the [tokens, heads, 3, head_dim] projection output that
+    ``q``/``k``/``v`` are views of, when the projection emits that layout. It
+    is already the exchange's send layout, so passing it skips the pack.
     """
 
     transport = None
     shape_key = None
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_input_all_to_all_interleaved,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
@@ -620,7 +636,13 @@ def _minimax_h3_attention_core_impl(
             # Declining is a function of rank-identical values, so every rank
             # declines together and the group stays on one path.
             transport = None
-            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+            if fused_qkv is not None and not ring_active:
+                q, k, v = _usp_input_all_to_all_interleaved(fused_qkv)
+            else:
+                q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+    elif ring_active and fused_qkv is not None:
+        # Ring rotates K/V with point-to-point sends, which need contiguity.
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -695,6 +717,18 @@ class MiniMaxH3Attention(nn.Module):
         self.prefix = prefix
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
+        # The Ulysses exchange splits the head axis into world_size contiguous
+        # blocks, so a projection emitting [tokens, heads, 3, head_dim] is
+        # already the destination-major send layout: nothing has to be packed
+        # on the way in, and Q/K/V come back as strided views the norm, RoPE,
+        # and attention kernels all accept. The checkpoint stores its rows in
+        # exactly that per-head [q, k, v] order, so this is a row order the
+        # loader keeps rather than one it has to build.
+        self._qkv_interleaved = bool(
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED
+            and quant_config is None
+            and self.total_num_heads % self.tp_size == 0
+        )
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
         # would instead slice across the concatenated tensor and is incorrect
@@ -786,16 +820,31 @@ class MiniMaxH3Attention(nn.Module):
                 head_dim=arch.attention_head_dim,
                 tp_rank=self.qkv_proj.tp_rank,
                 tp_size=self.tp_size,
+                interleaved=self._qkv_interleaved,
             ):
                 return
+            if self._qkv_interleaved:
+                # forward() splits on the interleaved row order. Falling back
+                # to [q_all, k_all, v_all] here would leave it reading Q out of
+                # K's rows, silently, so refuse instead.
+                raise RuntimeError(
+                    "head-interleaved qkv needs the dense bf16 shard copy, "
+                    "which declined this parameter; unset "
+                    "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED"
+                )
             base_loader(param, _reorder_checkpoint_weight(loaded_weight))
 
         if hasattr(weight, "_weight_loader"):
             weight._weight_loader = _weight_loader
         else:
             weight.weight_loader = _weight_loader
-        # rank-local FSDP must reorder grouped QKV before selecting each shard
-        weight.rank_local_weight_transform = _reorder_checkpoint_weight
+        # rank-local FSDP must reorder grouped QKV before selecting each shard;
+        # the interleaved layout is the checkpoint's own, so it reorders nothing
+        weight.rank_local_weight_transform = (
+            (lambda loaded_weight: loaded_weight)
+            if self._qkv_interleaved
+            else _reorder_checkpoint_weight
+        )
 
         # A quantized checkpoint stores metadata indexed by output row next to the
         # rows themselves (NVFP4 block scales, fp8 per-channel scales). Those rows
@@ -942,10 +991,15 @@ class MiniMaxH3Attention(nn.Module):
 
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_heads, self.head_dim)
-        v = v.view(total, self.num_heads, self.head_dim)
+        fused_qkv = None
+        if self._qkv_interleaved:
+            fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+            q, k, v = fused_qkv[:, :, 0], fused_qkv[:, :, 1], fused_qkv[:, :, 2]
+        else:
+            q, k, v = qkv.split(self.local_inner_dim, dim=-1)
+            q = q.view(total, self.num_heads, self.head_dim)
+            k = k.view(total, self.num_heads, self.head_dim)
+            v = v.view(total, self.num_heads, self.head_dim)
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -954,6 +1008,9 @@ class MiniMaxH3Attention(nn.Module):
                 self.k_norm,
                 self.head_dim,
             )
+            # q and k are fresh tensors now, so the fused buffer no longer
+            # holds the values attention reads.
+            fused_qkv = None
         else:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
@@ -979,6 +1036,7 @@ class MiniMaxH3Attention(nn.Module):
                     self.head_dim,
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
+                fused_qkv = None
 
         attention_core = (
             _minimax_h3_attention_core_bcg
@@ -995,6 +1053,7 @@ class MiniMaxH3Attention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            fused_qkv=fused_qkv,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)

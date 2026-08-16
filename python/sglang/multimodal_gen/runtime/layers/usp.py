@@ -442,6 +442,49 @@ def _usp_input_all_to_all_qkv(
     return q.contiguous(), k.contiguous(), v.contiguous()
 
 
+def _usp_input_all_to_all_interleaved(
+    qkv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ulysses input exchange for a projection that already emits Q/K/V fused.
+
+    ``qkv`` is [tokens, h_global, 3, head_size]. Its head axis is the axis the
+    exchange splits, so the destination-major pack the unfused path needs is
+    gone; what remains is the (tokens, destination) transpose, which stays
+    because all_to_all_single requires a contiguous destination-major send
+    buffer.
+
+    Q, K, and V come back as strided views into the receive staging buffer
+    rather than as copies. That buffer is only overwritten by the next
+    collective of the same role, which is the next block's exchange, and
+    attention consumes these views before it in stream order. Capture and
+    compiled regions get a private buffer from ``_a2a_staging_buffer``, so the
+    sharing never escapes eager execution.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    assert qkv.ndim == 4 and qkv.shape[2] == 3, f"expected [T, H, 3, D], got {qkv.shape}"
+    if world_size <= 1:
+        return qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+    rows, h_global, _, head_size = qkv.shape
+    assert (
+        h_global % world_size == 0
+    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    h_local = h_global // world_size
+
+    send = _a2a_staging_buffer(
+        "usp_interleaved_src",
+        (world_size, rows, h_local, 3 * head_size),
+        qkv.dtype,
+        qkv.device,
+    )
+    send.copy_(qkv.view(rows, world_size, h_local, 3 * head_size).transpose(0, 1))
+    received = _usp_all_to_all_single(send, role="usp_interleaved_recv")
+    # Received chunks are sequence-major: rank j's rows arrive at offset
+    # j * rows, so flattening the leading dims is a free view.
+    merged = received.view(world_size * rows, h_local, 3, head_size)
+    return merged[:, :, 0], merged[:, :, 1], merged[:, :, 2]
+
+
 def _usp_input_all_to_all_varlen(
     x: torch.Tensor, seq_lens: list[int], head_dim: int = 1
 ) -> torch.Tensor:
