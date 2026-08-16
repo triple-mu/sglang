@@ -44,6 +44,11 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # MiniMax-H3 Ulysses layout: emit [tokens, heads, 3, head_dim] from the qkv
+    # projection so the head axis is already the collective's destination-major
+    # split. Q/K/V then reach the norm, RoPE, and attention kernels as strided
+    # views and nothing is relaid out after the exchange.
+    SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED: bool = False
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -242,6 +247,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
+    # Head-interleaved qkv projection output for the MiniMax-H3 Ulysses path
+    "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED"
     ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
