@@ -513,6 +513,40 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+def _project_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
+    """``layer(x)`` written into ``out`` rather than into a fresh tensor.
+
+    fast-ulysses binds an output workspace to one input allocation for the
+    group's lifetime, so the projection has to write where the exchange will
+    read. Callers gate on the case this covers: an unquantized, unbiased,
+    non-gathering column-parallel linear, which is one GEMM.
+    """
+    torch.mm(x, layer.weight.t(), out=out)
+
+
+def _fast_ulysses_qkv(
+    attention: MiniMaxH3Attention, tokens: int
+) -> tuple[object | None, torch.Tensor | None]:
+    """The transport and the qkv buffer to project into, or (None, None)."""
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.fast_ulysses_a2a import (  # noqa: E501
+        get_fast_ulysses_a2a,
+    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+
+    group = get_sp_group().ulysses_group
+    if group is None:
+        return None, None
+    transport = get_fast_ulysses_a2a(
+        group, torch.device("cuda", torch.cuda.current_device()), _BF16_DTYPE
+    )
+    if transport is None:
+        return None, None
+    buffer = transport.qkv_buffer(
+        tokens, attention.num_heads, attention.head_dim, _BF16_DTYPE
+    )
+    return (transport, buffer) if buffer is not None else (None, None)
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -525,6 +559,7 @@ def _minimax_h3_attention_core_impl(
     ulysses_active: bool,
     ring_active: bool = False,
     fused_qkv: torch.Tensor | None = None,
+    transport: object | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -535,6 +570,10 @@ def _minimax_h3_attention_core_impl(
     ``fused_qkv`` is the [tokens, heads, 3, head_dim] projection output that
     ``q``/``k``/``v`` are views of, when the projection emits that layout. It
     is already the exchange's send layout, so passing it skips the pack.
+    ``transport`` carries both exchanges over fast-ulysses instead of NCCL,
+    which additionally folds the relayout into the copy strides. It resolves to
+    None -- returning this to NCCL -- on conditions that are the same on every
+    rank, so the ranks never take different paths.
     """
 
     if ulysses_active:
@@ -544,10 +583,15 @@ def _minimax_h3_attention_core_impl(
             _usp_output_all_to_all,
         )
 
-        if fused_qkv is not None and not ring_active:
-            q, k, v = _usp_input_all_to_all_interleaved(fused_qkv)
+        exchanged = None if transport is None else transport.exchange_input(fused_qkv)
+        if exchanged is not None:
+            q, k, v = exchanged
         else:
-            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+            transport = None
+            if fused_qkv is not None and not ring_active:
+                q, k, v = _usp_input_all_to_all_interleaved(fused_qkv)
+            else:
+                q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
     elif ring_active and fused_qkv is not None:
         # Ring rotates K/V with point-to-point sends, which need contiguity.
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
@@ -587,7 +631,24 @@ def _minimax_h3_attention_core_impl(
             max_seqlen=max_seqlen,
             cu_seqlens_host=cu_seqlens_host,
         )
+        if transport is not None:
+            # The output exchange has to send from a buffer whose address does
+            # not move, and attention allocates its own. FA4's wrapper absorbs
+            # an `out=` request without honouring it, so this stages instead of
+            # asking: one pass over the head-sharded output, against a whole
+            # head-merge relayout on the other side of the exchange.
+            staged = transport.attn_out_buffer(
+                out.shape[0], out.shape[1], attention.head_dim, out.dtype
+            )
+            if staged is None:
+                transport = None
+            else:
+                out = staged.copy_(out)
     if ulysses_active:
+        if transport is not None:
+            merged = transport.exchange_output(out)
+            if merged is not None:
+                return merged
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
 
@@ -629,7 +690,10 @@ class MiniMaxH3Attention(nn.Module):
         # exactly that per-head [q, k, v] order, so this is a row order the
         # loader keeps rather than one it has to build.
         self._qkv_interleaved = bool(
-            envs.SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED
+            (
+                envs.SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED
+                or envs.SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES
+            )
             and quant_config is None
             and self.total_num_heads % self.tp_size == 0
         )
@@ -651,6 +715,17 @@ class MiniMaxH3Attention(nn.Module):
         # packed parameter is `qweight`, so there is nothing to reorder.
         if quant_config is None or quant_config.get_name() != "gguf":
             self._install_qkv_weight_loader(arch)
+        self._install_qkv_weight_loader(arch)
+        # fast-ulysses binds an output workspace to one input allocation for the
+        # group's lifetime, so the projection has to write where the exchange
+        # will read. _project_into does that, and only covers the unquantized,
+        # unbiased, non-gathering case this reduces to.
+        self._fast_ulysses_eligible = bool(
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES
+            and self._qkv_interleaved
+            and getattr(self.qkv_proj, "bias", None) is None
+            and not self.qkv_proj.gather_output
+        )
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
@@ -888,10 +963,17 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        transport = None
         fused_qkv = None
-        if self._qkv_interleaved:
-            fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+        if self._fast_ulysses_eligible and ulysses_active and not ring_active:
+            transport, fused_qkv = _fast_ulysses_qkv(self, total)
+        if fused_qkv is not None:
+            _project_into(self.qkv_proj, x, fused_qkv.view(total, -1))
+        else:
+            qkv, _ = self.qkv_proj(x)
+            if self._qkv_interleaved:
+                fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+        if fused_qkv is not None:
             q, k, v = fused_qkv[:, :, 0], fused_qkv[:, :, 1], fused_qkv[:, :, 2]
         else:
             q, k, v = qkv.split(self.local_inner_dim, dim=-1)
@@ -908,7 +990,7 @@ class MiniMaxH3Attention(nn.Module):
             )
             # q and k are fresh tensors now, so the fused buffer no longer
             # holds the values attention reads.
-            fused_qkv = None
+            fused_qkv = transport = None
         else:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
@@ -934,7 +1016,7 @@ class MiniMaxH3Attention(nn.Module):
                     self.head_dim,
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
-                fused_qkv = None
+                fused_qkv = transport = None
 
         attention_core = (
             _minimax_h3_attention_core_bcg
@@ -952,6 +1034,7 @@ class MiniMaxH3Attention(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
             fused_qkv=fused_qkv,
+            transport=transport,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
