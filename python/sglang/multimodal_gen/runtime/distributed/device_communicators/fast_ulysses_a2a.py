@@ -31,13 +31,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# An interleaved MKey's stride is a 16-bit field, and a wider one is accepted by
-# every verbs call on the way in and then gathers the wrong bytes, with no
-# completion reporting it. fast-ulysses refuses such a shape outright; catching
-# it here keeps the refusal a fallback rather than an exception.
-_MAX_MKEY_STRIDE_BYTES = 65535
-_SUPPORTED_WORLD_SIZES = (2, 4, 8)
-_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 # Distinct token counts that get their own buffers and workspaces. Nothing is
 # ever released -- fast-ulysses holds every registration for the group's
 # lifetime -- so a server that sees unbounded shapes has to stop somewhere.
@@ -47,13 +40,25 @@ _TRANSPORTS: dict[str, "FastUlyssesA2A | None"] = {}
 
 
 def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
-    """Why this exchange cannot use fast-ulysses, or None if it can."""
+    """Why this exchange cannot use fast-ulysses, or None if it can.
+
+    Only the conditions that exist before a group does. Everything that depends
+    on the shape or the transport is asked of the group itself -- a limit
+    transcribed here would be a copy the library cannot see, and copies drift.
+    """
     if not envs.SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES:
         return "disabled"
-    if world_size not in _SUPPORTED_WORLD_SIZES:
-        return f"world size {world_size} is not one of {_SUPPORTED_WORLD_SIZES}"
-    if dtype not in _SUPPORTED_DTYPES:
-        return f"dtype {dtype} is neither float16 nor bfloat16"
+    try:
+        import fast_ulysses
+    except ImportError as error:
+        return f"fast-ulysses is not installed ({error})"
+    if world_size < 2 or not fast_ulysses.supports_world_size(world_size):
+        return (
+            f"world size {world_size} is not one of "
+            f"{tuple(fast_ulysses.SUPPORTED_WORLD_SIZES)}"
+        )
+    if not fast_ulysses.supports_dtype(dtype):
+        return f"dtype {dtype} is unsupported"
     if torch.is_grad_enabled():
         return "autograd is enabled"
     if torch.compiler.is_compiling():
@@ -66,14 +71,12 @@ def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
 class FastUlyssesA2A:
     """One fast-ulysses group, plus the persistent buffers its API requires."""
 
-    def __init__(self, group, device: torch.device) -> None:
-        from fast_ulysses import UlyssesGroup
-
-        self._group = UlyssesGroup(process_group=group, device=device)
+    def __init__(self, native) -> None:
+        self._group = native
+        self.device = native.device
         self.backend = self._group.backend
         self.world_size = self._group.world_size
-        self.device = device
-        self._stream = torch.cuda.current_stream(device)
+        self._stream = self._group.stream
         self._buffers: dict[tuple, torch.Tensor] = {}
         self._workspaces: dict[tuple, torch.Tensor] = {}
         self._budget_spent = False
@@ -111,12 +114,26 @@ class FastUlyssesA2A:
             self._workspaces[key] = workspace
         return workspace
 
+    def _exchangeable(self, mode: int, shape: tuple[int, ...], dtype) -> bool:
+        """Whether the group will carry this exchange, asked rather than assumed.
+
+        The limits differ by transport -- the 16-bit MKey stride is mlx5's and
+        only mlx5's -- so a caller that hardcodes them refuses shapes p2p can
+        carry. The answer is rank-invariant, so branching on it is symmetric.
+        """
+        reason = self._group.unsupported_reason(shape, dtype, mode)
+        if reason is None:
+            return True
+        if not self._budget_spent:
+            logger.info("fast-ulysses declines %s mode=%d: %s", shape, mode, reason)
+        return False
+
     # ---------------------------------------------------------------- input --
     def qkv_buffer(
         self, tokens: int, heads: int, head_dim: int, dtype
     ) -> torch.Tensor | None:
         """The projection's destination, which is also the exchange's source."""
-        if 3 * heads * head_dim * dtype.itemsize > _MAX_MKEY_STRIDE_BYTES:
+        if not self._exchangeable(0, (1, tokens, heads * 3, head_dim), dtype):
             return None
         return self._buffer("qkv", (tokens, heads, 3, head_dim), dtype)
 
@@ -146,7 +163,7 @@ class FastUlyssesA2A:
         self, tokens: int, heads: int, head_dim: int, dtype
     ) -> torch.Tensor | None:
         """Attention's destination, which is also the exchange's source."""
-        if heads * self.world_size * head_dim * dtype.itemsize > _MAX_MKEY_STRIDE_BYTES:
+        if not self._exchangeable(1, (1, tokens, heads, head_dim), dtype):
             return None
         return self._buffer("attn_out", (tokens, heads, head_dim), dtype)
 
@@ -199,12 +216,18 @@ def get_fast_ulysses_a2a(group, device: torch.device, dtype) -> FastUlyssesA2A |
             return None
         return transport
 
-    try:
-        transport = FastUlyssesA2A(group, device)
-    except Exception as error:  # noqa: BLE001 -- anything at all means "use NCCL"
-        logger.warning("fast-ulysses could not start (%s); staying on NCCL", error)
+    from fast_ulysses import UlyssesGroup
+
+    # create(), not the constructor: mlx5 setup fails per rank rather than per
+    # job, and `except: use NCCL` around a constructor is only correct when the
+    # failure is symmetric. create() agrees the outcome before anyone commits,
+    # so None here means None on every rank.
+    native = UlyssesGroup.create(process_group=group, device=device)
+    if native is None:
         _TRANSPORTS[name] = None
+        logger.warning("fast-ulysses could not start on some rank; staying on NCCL")
         return None
+    transport = FastUlyssesA2A(native)
     _TRANSPORTS[name] = transport
     logger.info(
         "fast-ulysses is carrying the Ulysses exchange (backend=%s, world_size=%d)",
