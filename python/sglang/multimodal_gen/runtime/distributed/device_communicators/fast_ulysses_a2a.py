@@ -79,6 +79,7 @@ class FastUlyssesA2A:
         self._stream = self._group.stream
         self._buffers: dict[tuple, torch.Tensor] = {}
         self._workspaces: dict[tuple, torch.Tensor] = {}
+        self._declined: set[tuple] = set()
         self._budget_spent = False
 
     def _over_budget(self, what: str, shape) -> None:
@@ -124,7 +125,12 @@ class FastUlyssesA2A:
         reason = self._group.unsupported_reason(shape, dtype, mode)
         if reason is None:
             return True
-        if not self._budget_spent:
+        # Once per (mode, shape, dtype). This is asked on every layer of every
+        # step, not only on a cold shape, so an unthrottled log would be 5000
+        # identical lines per request.
+        key = (mode, shape, dtype)
+        if key not in self._declined:
+            self._declined.add(key)
             logger.info("fast-ulysses declines %s mode=%d: %s", shape, mode, reason)
         return False
 
