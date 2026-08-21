@@ -41,6 +41,10 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 _TRANSPORTS: dict[str, "FlashInferUlyssesA2A | None"] = {}
+# Rebuilds per group, so a caller whose shapes keep growing gives up on this
+# transport rather than tearing down and re-registering forever.
+_MAX_GROWTHS = 2
+_GROWTHS: dict[str, int] = {}
 
 
 def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
@@ -71,10 +75,11 @@ def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
 class FlashInferUlyssesA2A:
     """One communicator plus its registered output buffers, per shape."""
 
-    def __init__(self, comm, world_size: int, max_shapes: int) -> None:
+    def __init__(self, comm, world_size: int, max_shapes: int, max_elems: int) -> None:
         self._comm = comm
         self.world_size = world_size
         self._max_shapes = max_shapes
+        self.max_elems = max_elems
         # (tokens, heads, head_dim) -> (sends, scattered, gather_out)
         self._buffers: dict[tuple[int, int, int], tuple] = {}
         self._declined: set[tuple[int, int, int]] = set()
@@ -192,7 +197,30 @@ def get_flashinfer_ulysses_a2a(
         return None
 
     if name in _TRANSPORTS:
-        return _TRANSPORTS[name]
+        cached = _TRANSPORTS[name]
+        if cached is None or max_elems <= cached.max_elems:
+            return cached
+        # A bigger operand than anything registered so far. max_elems sizes
+        # every registration and cannot be raised in place, so grow by
+        # rebuilding. Warmup at one resolution followed by requests at a larger
+        # one is the ordinary case, not a pathological one. Shapes are
+        # identical on every rank, so every rank rebuilds here together.
+        if _GROWTHS.get(name, 0) >= _MAX_GROWTHS:
+            logger.info(
+                "flashinfer ulysses: already rebuilt %d times for a larger "
+                "operand; staying on NCCL for %d elements",
+                _MAX_GROWTHS,
+                max_elems,
+            )
+            return None
+        _GROWTHS[name] = _GROWTHS.get(name, 0) + 1
+        logger.info(
+            "flashinfer ulysses: rebuilding for a larger operand (%d -> %d elements)",
+            cached.max_elems,
+            max_elems,
+        )
+        del _TRANSPORTS[name]
+        cached.shutdown()
 
     from flashinfer.comm import UlyssesCommunicator
 
@@ -231,7 +259,10 @@ def get_flashinfer_ulysses_a2a(
         return None
 
     transport = FlashInferUlyssesA2A(
-        comm, world_size, envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES
+        comm,
+        world_size,
+        envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES,
+        max_elems,
     )
     _TRANSPORTS[name] = transport
     logger.info(
@@ -246,6 +277,7 @@ def get_flashinfer_ulysses_a2a(
 
 def shutdown_flashinfer_ulysses_a2a() -> None:
     """Collective: every rank must call this before any rank exits."""
+    _GROWTHS.clear()
     for name in list(_TRANSPORTS):
         transport = _TRANSPORTS.pop(name)
         if transport is None:
