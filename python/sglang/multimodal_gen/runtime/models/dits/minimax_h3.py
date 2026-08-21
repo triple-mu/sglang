@@ -503,6 +503,33 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+def _flashinfer_ulysses(q: torch.Tensor):
+    """This SP group's PCIe transport and the shape key, or ``(None, None)``.
+
+    Called per attention layer. Everything it passes down is identical on every
+    rank -- the group, the dtype, and the operand's element count -- because
+    constructing the communicator and registering an output are both collective.
+    ``max_elems`` is fixed at the first shape a group sees; a larger one later
+    cannot be registered and stays on NCCL.
+    """
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_ulysses_a2a import (
+        get_flashinfer_ulysses_a2a,
+    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+
+    group = get_sp_group().ulysses_group
+    if group is None:
+        return None, None
+    tokens, heads, head_dim = q.shape
+    transport = get_flashinfer_ulysses_a2a(
+        group,
+        torch.device("cuda", torch.cuda.current_device()),
+        q.dtype,
+        max_elems=tokens * heads * head_dim,
+    )
+    return transport, (tokens, heads, head_dim)
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -522,13 +549,23 @@ def _minimax_h3_attention_core_impl(
     kernel and sequence-parallel collectives execute eagerly.
     """
 
+    transport = None
+    shape_key = None
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        transport, shape_key = _flashinfer_ulysses(q)
+        exchanged = None if transport is None else transport.exchange_input(q, k, v)
+        if exchanged is not None:
+            q, k, v = exchanged
+        else:
+            # Declining is a function of rank-identical values, so every rank
+            # declines together and the group stays on one path.
+            transport = None
+            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -566,6 +603,10 @@ def _minimax_h3_attention_core_impl(
             cu_seqlens_host=cu_seqlens_host,
         )
     if ulysses_active:
+        if transport is not None:
+            merged = transport.exchange_output(out, shape_key)
+            if merged is not None:
+                return merged
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
 
@@ -1665,8 +1706,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ):
             if value % tp_size:
                 raise ValueError(
-                    f"MiniMax H3 {name}={value} must be divisible by "
-                    f"TP size {tp_size}."
+                    f"MiniMax H3 {name}={value} must be divisible by TP size {tp_size}."
                 )
 
     @staticmethod
@@ -1725,8 +1765,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             adaln_cache_path is not None or adaln_weight_files is not None
         ):
             raise ValueError(
-                "MiniMax H3 pruned curve checkpoints cannot use a separate "
-                "AdaLN cache"
+                "MiniMax H3 pruned curve checkpoints cannot use a separate AdaLN cache"
             )
         self._adaln_precomputed = (
             adaln_cache_path is not None or adaln_weight_files is not None
