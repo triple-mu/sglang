@@ -748,8 +748,7 @@ def resolve_transformer_quant_load_spec(
             )
         if server_args.nunchaku_config is not None:
             raise ValueError(
-                "Per-layer checkpoint quantization and Nunchaku are mutually "
-                "exclusive"
+                "Per-layer checkpoint quantization and Nunchaku are mutually exclusive"
             )
         quant_config = checkpoint_quant_config
     elif getattr(model_cls, "handles_checkpoint_quantization", False):
@@ -837,6 +836,17 @@ def _resolve_gguf_quant_load_spec(
     )
 
 
+# Which flag a quantization carries to say "the weights on disk are already quantized" is the
+# only thing separating that case from "the weights load in source dtype and are converted after
+# loading". Two callers need the distinction, so the table is written once.
+_SERIALIZED_FLAG_BY_QUANT_NAME = {
+    "fp8": "is_checkpoint_fp8_serialized",
+    "mxfp8": "is_checkpoint_fp8_serialized",
+    "mxfp4": "is_checkpoint_mxfp4_serialized",
+    "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+}
+
+
 def _needs_device_weight_postprocess(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
@@ -845,16 +855,30 @@ def _needs_device_weight_postprocess(
     if quant_name in ("modelopt_fp8", "comfy_fp8"):
         return True
 
-    serialized_flag_by_quant_name = {
-        "fp8": "is_checkpoint_fp8_serialized",
-        "mxfp8": "is_checkpoint_fp8_serialized",
-        "mxfp4": "is_checkpoint_mxfp4_serialized",
-        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
-    }
-    serialized_flag = serialized_flag_by_quant_name.get(quant_name)
+    serialized_flag = _SERIALIZED_FLAG_BY_QUANT_NAME.get(quant_name)
     if serialized_flag is None:
         return False
     return not getattr(quant_config, serialized_flag, False)
+
+
+def checkpoint_is_quantized(quant_config: Optional[QuantizationConfig]) -> bool:
+    """Whether the weights on disk are already quantized.
+
+    A component that reads the safetensors directly rather than through the loaded modules --
+    MiniMax-H3's AdaLN rebuild does -- is only correct when they are not. Online quantization
+    leaves the checkpoint alone and converts after loading, so it is not a reason to refuse.
+
+    A quantization this does not recognise counts as quantized: the permissive answer is only
+    given where the source dtype on disk has actually been established.
+    """
+    if quant_config is None:
+        return False
+    serialized_flag = _SERIALIZED_FLAG_BY_QUANT_NAME.get(
+        _get_quant_config_name(quant_config)
+    )
+    if serialized_flag is None:
+        return True
+    return bool(getattr(quant_config, serialized_flag, False))
 
 
 def _build_transformer_quant_adapters(

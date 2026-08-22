@@ -1876,11 +1876,22 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
+        # The rebuild reads adaln_proj rows out of the safetensors and projects them with a bare
+        # F.linear, so what it needs is that those rows are unquantized *on disk* -- not that the
+        # model is unquantized. Online quantization converts after loading and leaves the
+        # checkpoint alone, and with the cache on there is no adaln_proj module for it to convert
+        # anyway, so refusing it was refusing a case that works.
+        from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+            checkpoint_is_quantized,
+        )
+
         if (
             adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+        ) and checkpoint_is_quantized(quant_config):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 AdaLN cache reads adaln_proj rows straight from the checkpoint, so "
+                "it needs them unquantized there; a checkpoint that is already quantized cannot "
+                "serve it"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None

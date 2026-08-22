@@ -1752,7 +1752,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Rebuild MiniMax H3 AdaLN outputs from the checkpoint per "
                 "request instead of keeping the 24.2 GiB of adaln_proj weights "
                 "resident. Works with any step count or schedule and needs no "
-                "prebuilt artifact. Requires unquantized weights."
+                "prebuilt artifact. Reads adaln_proj rows straight from the "
+                "checkpoint, so it needs those unquantized on disk; online "
+                "quantization is fine, an already-quantized checkpoint is not."
             ),
         )
         parser.add_argument(
@@ -2375,7 +2377,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             choices=[0, 1],
-            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
         )
         parser.add_argument(
             "--kv-cache-quant-sink-keep",
