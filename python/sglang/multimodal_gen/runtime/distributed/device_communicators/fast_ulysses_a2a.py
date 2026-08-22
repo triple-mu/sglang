@@ -8,13 +8,8 @@ head axis afterwards. fast-ulysses folds both into its copy strides and the
 NIC's MKey layout: the projection's own ``[tokens, heads, 3, head_dim]`` buffer
 is sent as it stands, and so is attention's output.
 
-Two of its constraints shape everything here:
+One of its constraints shapes everything here:
 
-- **An output workspace is permanently bound to one input allocation.** The
-  mlx5 backend caches the input memory region, and the MKeys that gather from
-  it, on the bare pointer; a moved input would gather whatever now lives there.
-  Hence the persistent buffers below, which the projection and attention write
-  into instead of allocating their own.
 - **Allocating a workspace is collective.** Every rank must reach it with the
   same shape in the same order. Every gate here is therefore a function of
   values that are identical on every rank -- world size, token count, dtype --
@@ -77,7 +72,6 @@ class FastUlyssesA2A:
         self.backend = self._group.backend
         self.world_size = self._group.world_size
         self._stream = self._group.stream
-        self._buffers: dict[tuple, torch.Tensor] = {}
         self._workspaces: dict[tuple, torch.Tensor] = {}
         self._declined: set[tuple] = set()
         self._budget_spent = False
@@ -93,16 +87,6 @@ class FastUlyssesA2A:
                 shape,
             )
         return None
-
-    def _buffer(self, role: str, shape: tuple[int, ...], dtype) -> torch.Tensor | None:
-        key = (role, shape, dtype)
-        buffer = self._buffers.get(key)
-        if buffer is None:
-            if len(self._buffers) >= 2 * _MAX_SHAPES:
-                return self._over_budget(role, shape)
-            buffer = torch.empty(shape, dtype=dtype, device=self.device)
-            self._buffers[key] = buffer
-        return buffer
 
     def _workspace(self, mode: int, source: torch.Tensor) -> torch.Tensor | None:
         key = (mode, tuple(source.shape), source.dtype)
@@ -135,14 +119,6 @@ class FastUlyssesA2A:
         return False
 
     # ---------------------------------------------------------------- input --
-    def qkv_buffer(
-        self, tokens: int, heads: int, head_dim: int, dtype
-    ) -> torch.Tensor | None:
-        """The projection's destination, which is also the exchange's source."""
-        if not self._exchangeable(0, (1, tokens, heads * 3, head_dim), dtype):
-            return None
-        return self._buffer("qkv", (tokens, heads, 3, head_dim), dtype)
-
     def exchange_input(
         self, qkv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -154,7 +130,9 @@ class FastUlyssesA2A:
         """
         tokens, heads, three, head_dim = qkv.shape
         assert three == 3, f"expected [T, H, 3, D], got {tuple(qkv.shape)}"
-        source = qkv.view(1, tokens, heads * 3, head_dim)
+        source = qkv.reshape(1, tokens, heads * 3, head_dim)
+        if not self._exchangeable(0, tuple(source.shape), source.dtype):
+            return None
         workspace = self._workspace(0, source)
         if workspace is None:
             return None
@@ -165,18 +143,12 @@ class FastUlyssesA2A:
         return merged[:, :, 0], merged[:, :, 1], merged[:, :, 2]
 
     # --------------------------------------------------------------- output --
-    def attn_out_buffer(
-        self, tokens: int, heads: int, head_dim: int, dtype
-    ) -> torch.Tensor | None:
-        """Attention's destination, which is also the exchange's source."""
-        if not self._exchangeable(1, (1, tokens, heads, head_dim), dtype):
-            return None
-        return self._buffer("attn_out", (tokens, heads, head_dim), dtype)
-
     def exchange_output(self, attn_out: torch.Tensor) -> torch.Tensor | None:
         """``[T_global, H/ws, D]`` -> ``[T_local, H, D]``, head axis merged."""
         tokens, heads, head_dim = attn_out.shape
-        source = attn_out.view(1, tokens, heads, head_dim)
+        source = attn_out.reshape(1, tokens, heads, head_dim)
+        if not self._exchangeable(1, tuple(source.shape), source.dtype):
+            return None
         workspace = self._workspace(1, source)
         if workspace is None:
             return None
@@ -195,7 +167,6 @@ class FastUlyssesA2A:
 
     def shutdown(self) -> None:
         self._workspaces.clear()
-        self._buffers.clear()
         self._group.destroy()
 
 

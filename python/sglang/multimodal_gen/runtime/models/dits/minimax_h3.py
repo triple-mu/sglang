@@ -514,10 +514,32 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
-def _flashinfer_qkv(
-    attention: MiniMaxH3Attention, tokens: int
-) -> tuple[object | None, torch.Tensor | None]:
-    """The transport and the qkv buffer to project into, or (None, None).
+def _qkv_row_order_is_free(quant_config: QuantizationConfig | None) -> bool:
+    """Whether the qkv weight's rows may be permuted before quantization.
+
+    The head-interleaved layout is a row permutation of the fused qkv matrix,
+    applied by the weight loader. Unquantized that is trivially safe. Online fp8
+    is safe too, and for a reason worth stating: the conversion is
+    per_token_group_quant_fp8 over the last dimension, one scale per output row,
+    so a permutation carries the scales with the rows and the GEMM accumulates
+    over K only.
+
+    Everything else is refused. A checkpoint that is already fp8 requantizes
+    over [q_all, k_all, v_all] logical widths, boundaries the interleaved order
+    crosses, and block quantization groups rows outright.
+    """
+    if quant_config is None:
+        return True
+    get_name = getattr(type(quant_config), "get_name", None)
+    if not callable(get_name) or get_name() != "fp8":
+        return False
+    return not getattr(quant_config, "is_checkpoint_fp8_serialized", True) and (
+        getattr(quant_config, "weight_block_size", None) is None
+    )
+
+
+def _flashinfer_transport(attention: MiniMaxH3Attention, tokens: int) -> object | None:
+    """The transport for this rank's Ulysses group, or None to stay on NCCL.
 
     Capacity is declared, not discovered: FlashInfer sizes every registration
     from it and cannot raise it in place, and a warmup differs from the request
@@ -530,38 +552,19 @@ def _flashinfer_qkv(
 
     group = get_sp_group().ulysses_group
     if group is None:
-        return None, None
+        return None
     declared = envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN
     local_tokens = max(tokens, declared // dist.get_world_size(group))
-    transport = get_flashinfer_ulysses_a2a(
+    return get_flashinfer_ulysses_a2a(
         group,
         torch.device("cuda", torch.cuda.current_device()),
         _BF16_DTYPE,
         capacity=local_tokens * attention.num_heads * 3 * attention.head_dim,
     )
-    if transport is None:
-        return None, None
-    buffer = transport.qkv_buffer(
-        tokens, attention.num_heads, attention.head_dim, _BF16_DTYPE
-    )
-    return (transport, buffer) if buffer is not None else (None, None)
 
 
-def _project_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
-    """``layer(x)`` written into ``out`` rather than into a fresh tensor.
-
-    fast-ulysses binds an output workspace to one input allocation for the
-    group's lifetime, so the projection has to write where the exchange will
-    read. Callers gate on the case this covers: an unquantized, unbiased,
-    non-gathering column-parallel linear, which is one GEMM.
-    """
-    torch.mm(x, layer.weight.t(), out=out)
-
-
-def _fast_ulysses_qkv(
-    attention: MiniMaxH3Attention, tokens: int
-) -> tuple[object | None, torch.Tensor | None]:
-    """The transport and the qkv buffer to project into, or (None, None)."""
+def _fast_ulysses_transport(attention: MiniMaxH3Attention) -> object | None:
+    """The transport for this rank's Ulysses group, or None to stay on NCCL."""
     from sglang.multimodal_gen.runtime.distributed.device_communicators.fast_ulysses_a2a import (  # noqa: E501
         get_fast_ulysses_a2a,
     )
@@ -569,16 +572,10 @@ def _fast_ulysses_qkv(
 
     group = get_sp_group().ulysses_group
     if group is None:
-        return None, None
-    transport = get_fast_ulysses_a2a(
+        return None
+    return get_fast_ulysses_a2a(
         group, torch.device("cuda", torch.cuda.current_device()), _BF16_DTYPE
     )
-    if transport is None:
-        return None, None
-    buffer = transport.qkv_buffer(
-        tokens, attention.num_heads, attention.head_dim, _BF16_DTYPE
-    )
-    return (transport, buffer) if buffer is not None else (None, None)
 
 
 def _minimax_h3_attention_core_impl(
@@ -666,19 +663,6 @@ def _minimax_h3_attention_core_impl(
             max_seqlen=max_seqlen,
             cu_seqlens_host=cu_seqlens_host,
         )
-        if transport is not None:
-            # The output exchange has to send from a buffer whose address does
-            # not move, and attention allocates its own. FA4's wrapper absorbs
-            # an `out=` request without honouring it, so this stages instead of
-            # asking: one pass over the head-sharded output, against a whole
-            # head-merge relayout on the other side of the exchange.
-            staged = transport.attn_out_buffer(
-                out.shape[0], out.shape[1], attention.head_dim, out.dtype
-            )
-            if staged is None:
-                transport = None
-            else:
-                out = staged.copy_(out)
     if ulysses_active:
         if transport is not None:
             merged = transport.exchange_output(out)
@@ -730,7 +714,7 @@ class MiniMaxH3Attention(nn.Module):
                 or envs.SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES
                 or envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE
             )
-            and quant_config is None
+            and _qkv_row_order_is_free(quant_config)
             and self.total_num_heads % self.tp_size == 0
         )
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
@@ -752,18 +736,10 @@ class MiniMaxH3Attention(nn.Module):
         if quant_config is None or quant_config.get_name() != "gguf":
             self._install_qkv_weight_loader(arch)
         self._install_qkv_weight_loader(arch)
-        # fast-ulysses binds an output workspace to one input allocation for the
-        # group's lifetime, so the projection has to write where the exchange
-        # will read. _project_into does that, and only covers the unquantized,
-        # unbiased, non-gathering case this reduces to.
-        # The FlashInfer transport needs the same thing for the same reason:
-        # one operand per layer means the projection writes the exchange's
-        # source directly.
-        _fusable = bool(
-            self._qkv_interleaved
-            and getattr(self.qkv_proj, "bias", None) is None
-            and not self.qkv_proj.gather_output
-        )
+        # One operand per layer, which the projection already produces in the
+        # interleaved layout. Neither transport tracks the input pointer any
+        # more, so nothing has to be projected into a fixed destination.
+        _fusable = bool(self._qkv_interleaved)
         self._fast_ulysses_eligible = bool(
             envs.SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES and _fusable
         )
@@ -1011,15 +987,12 @@ class MiniMaxH3Attention(nn.Module):
         fused_qkv = None
         if ulysses_active and not ring_active:
             if self._fast_ulysses_eligible:
-                transport, fused_qkv = _fast_ulysses_qkv(self, total)
+                transport = _fast_ulysses_transport(self)
             elif self._flashinfer_eligible:
-                transport, fused_qkv = _flashinfer_qkv(self, total)
-        if fused_qkv is not None:
-            _project_into(self.qkv_proj, x, fused_qkv.view(total, -1))
-        else:
-            qkv, _ = self.qkv_proj(x)
-            if self._qkv_interleaved:
-                fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+                transport = _flashinfer_transport(self, total)
+        qkv, _ = self.qkv_proj(x)
+        if self._qkv_interleaved:
+            fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
         if fused_qkv is not None:
             q, k, v = fused_qkv[:, :, 0], fused_qkv[:, :, 1], fused_qkv[:, :, 2]
         else:
