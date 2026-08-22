@@ -559,15 +559,32 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
-def _project_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
-    """Write the unquantized QKV projection directly into ``out``."""
-    torch.mm(x, layer.weight.t(), out=out)
+def _qkv_row_order_is_free(quant_config: QuantizationConfig | None) -> bool:
+    """Whether the qkv weight's rows may be permuted before quantization.
+
+    The head-interleaved layout is a row permutation of the fused qkv matrix,
+    applied by the weight loader. Unquantized that is trivially safe. Online fp8
+    is safe too, and for a reason worth stating: the conversion is
+    per_token_group_quant_fp8 over the last dimension, one scale per output row,
+    so a permutation carries the scales with the rows and the GEMM accumulates
+    over K only.
+
+    Everything else is refused. A checkpoint that is already fp8 requantizes
+    over [q_all, k_all, v_all] logical widths, boundaries the interleaved order
+    crosses, and block quantization groups rows outright.
+    """
+    if quant_config is None:
+        return True
+    get_name = getattr(type(quant_config), "get_name", None)
+    if not callable(get_name) or get_name() != "fp8":
+        return False
+    return not getattr(quant_config, "is_checkpoint_fp8_serialized", True) and (
+        getattr(quant_config, "weight_block_size", None) is None
+    )
 
 
-def _flashinfer_qkv(
-    attention: MiniMaxH3Attention, tokens: int
-) -> tuple[object | None, torch.Tensor | None]:
-    """The transport and the qkv buffer to project into, or (None, None).
+def _flashinfer_transport(attention: MiniMaxH3Attention, tokens: int) -> object | None:
+    """The transport for this rank's Ulysses group, or None to stay on NCCL.
 
     Capacity is declared, not discovered: FlashInfer sizes every registration
     from it and cannot raise it in place, and a warmup differs from the request
@@ -580,21 +597,15 @@ def _flashinfer_qkv(
 
     group = get_sp_group().ulysses_group
     if group is None:
-        return None, None
+        return None
     declared = envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN
     local_tokens = max(tokens, declared // dist.get_world_size(group))
-    transport = get_flashinfer_ulysses_a2a(
+    return get_flashinfer_ulysses_a2a(
         group,
         torch.device("cuda", torch.cuda.current_device()),
         _BF16_DTYPE,
         capacity=local_tokens * attention.num_heads * 3 * attention.head_dim,
     )
-    if transport is None:
-        return None, None
-    buffer = transport.qkv_buffer(
-        tokens, attention.num_heads, attention.head_dim, _BF16_DTYPE
-    )
-    return (transport, buffer) if buffer is not None else (None, None)
 
 
 def _minimax_h3_attention_core_impl(
@@ -730,7 +741,7 @@ class MiniMaxH3Attention(nn.Module):
                 envs.SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED
                 or envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE
             )
-            and quant_config is None
+            and _qkv_row_order_is_free(quant_config)
             and self.total_num_heads % self.tp_size == 0
         )
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
@@ -757,13 +768,9 @@ class MiniMaxH3Attention(nn.Module):
         )
         if not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
-        # The transport binds a registered operand buffer for its lifetime, so
-        # an eligible projection writes the exchange source directly.
-        _fusable = bool(
-            self._qkv_interleaved
-            and getattr(self.qkv_proj, "bias", None) is None
-            and not self.qkv_proj.gather_output
-        )
+        # One operand per layer, which the projection already produces in the
+        # interleaved layout. The transport does not retain its input pointer.
+        _fusable = bool(self._qkv_interleaved)
         self._flashinfer_eligible = bool(
             envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE and _fusable
         )
@@ -1007,13 +1014,10 @@ class MiniMaxH3Attention(nn.Module):
         transport = None
         fused_qkv = None
         if ulysses_active and not ring_active and self._flashinfer_eligible:
-            transport, fused_qkv = _flashinfer_qkv(self, total)
-        if fused_qkv is not None:
-            _project_into(self.qkv_proj, x, fused_qkv.view(total, -1))
-        else:
-            qkv, _ = self.qkv_proj(x)
-            if self._qkv_interleaved:
-                fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+            transport = _flashinfer_transport(self, total)
+        qkv, _ = self.qkv_proj(x)
+        if self._qkv_interleaved:
+            fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
         if fused_qkv is not None:
             q, k, v = fused_qkv[:, :, 0], fused_qkv[:, :, 1], fused_qkv[:, :, 2]
         else:

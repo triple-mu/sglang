@@ -7,14 +7,16 @@ at world size 8 it routes the cross-NUMA half over each rank's local mlx5 NIC
 while the same-NUMA half stays on CUDA P2P.
 
 This exposes the same surface as the fast-ulysses transport beside it --
-``qkv_buffer`` / ``exchange_input`` / ``attn_out_buffer`` / ``exchange_output``
--- so the attention core does not care which one it is talking to.
+``exchange_input`` and ``exchange_output`` -- so the attention core does not
+care which one it is talking to.
 
-Q/K/V travel as one operand. The projection writes into ``qkv_buffer`` in the
-``[tokens, heads, 3, head_dim]`` layout, so the head axis already carries
-``3 * H`` entries and splitting it across ranks hands each one ``H/ws`` heads
-with their own Q, K and V beside them. Nothing is packed going in and nothing is
-copied coming out, and a layer costs two exchanges rather than four.
+Q/K/V travel as one operand. The projection already emits
+``[tokens, heads, 3, head_dim]``, so the head axis carries ``3 * H`` entries and
+splitting it across ranks hands each one ``H/ws`` heads with their own Q, K and
+V beside them. Nothing is packed going in and nothing is copied coming out, and
+a layer costs two exchanges rather than four. The operands stay the caller's:
+this transport registers only its own output slots, so there is no fixed
+destination to project or stage into.
 
 That last part is the point, and it is not what an isolated benchmark would
 tell you: per byte, this backend is no faster fused than unfused. But the hybrid
@@ -76,8 +78,8 @@ class FlashInferUlyssesA2A:
         self.device = comm.device
         self._max_shapes = max_shapes
         self.max_elems = max_elems
-        # (role, source shape, dtype) -> (send buffer, registered output)
-        self._pairs: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        # (role, source shape, dtype) -> registered exchange output
+        self._outputs: dict[tuple, torch.Tensor] = {}
         self._declined: set[tuple] = set()
 
     @property
@@ -88,20 +90,23 @@ class FlashInferUlyssesA2A:
     def transport(self) -> str | None:
         return self._comm.transport
 
-    def _pair(self, role: str, source_shape: tuple, op: str, dtype):
-        """The send buffer and its registered output for one role and shape.
+    def _output(self, role: str, sample: torch.Tensor, op: str):
+        """The registered exchange output for one role and operand shape.
 
-        Both are allocated on first sight. ``allocate_output`` is collective and
-        the key comes from rank-identical values, so every rank allocates the
-        same pairs in the same order or none of them.
+        Allocated on first sight. ``allocate_output`` is collective and the key
+        comes from rank-identical values, so every rank allocates the same
+        outputs in the same order or none of them. The operand itself stays the
+        caller's -- the transport no longer registers or tracks it, so there is
+        nothing to project or stage into.
         """
+        source_shape, dtype = tuple(sample.shape), sample.dtype
         key = (role, source_shape, dtype)
-        cached = self._pairs.get(key)
+        cached = self._outputs.get(key)
         if cached is not None:
             return cached
         if key in self._declined:
             return None
-        if len(self._pairs) >= self._max_shapes:
+        if len(self._outputs) >= self._max_shapes:
             self._declined.add(key)
             logger.info(
                 "flashinfer ulysses: %d shapes already registered, staying on NCCL for %s",
@@ -121,8 +126,7 @@ class FlashInferUlyssesA2A:
             )
             return None
         try:
-            send = torch.empty(source_shape, dtype=dtype, device=self.device)
-            out = self._comm.allocate_output(send, op)
+            out = self._comm.allocate_output(sample, op)
         except Exception as error:  # noqa: BLE001
             self._declined.add(key)
             logger.warning(
@@ -132,59 +136,33 @@ class FlashInferUlyssesA2A:
                 error,
             )
             return None
-        self._pairs[key] = (send, out)
-        return self._pairs[key]
+        self._outputs[key] = out
+        return out
 
     # -------------------------------------------------------------- input --
-    def qkv_buffer(self, tokens: int, heads: int, head_dim: int, dtype):
-        """The projection's destination, which is also the exchange's source."""
-        pair = self._pair(
-            "qkv", (1, tokens, heads * 3, head_dim), "scatter_heads", dtype
-        )
-        if pair is None:
-            return None
-        # The projection wants [tokens, heads, 3, head_dim] and the exchange
-        # wants [1, tokens, 3 * heads, head_dim]: same memory, same order.
-        return pair[0].view(tokens, heads, 3, head_dim)
-
     def exchange_input(self, qkv: torch.Tensor):
         """``[T_local, H, 3, D]`` -> three ``[T_global, H/ws, D]`` views."""
         tokens, heads, three, head_dim = qkv.shape
         assert three == 3, f"expected [T, H, 3, D], got {tuple(qkv.shape)}"
-        pair = self._pair(
-            "qkv", (1, tokens, heads * 3, head_dim), "scatter_heads", qkv.dtype
-        )
-        if pair is None:
+        source = qkv.view(1, tokens, heads * 3, head_dim)
+        out = self._output("qkv", source, "scatter_heads")
+        if out is None:
             return None
-        exchanged = self._comm.scatter_heads(
-            qkv.view(1, tokens, heads * 3, head_dim), out=pair[1]
-        )
+        exchanged = self._comm.scatter_heads(source, out=out)
         merged = exchanged.view(
             tokens * self.world_size, heads // self.world_size, 3, head_dim
         )
         return merged[:, :, 0], merged[:, :, 1], merged[:, :, 2]
 
     # ------------------------------------------------------------- output --
-    def attn_out_buffer(self, tokens: int, heads: int, head_dim: int, dtype):
-        """Attention's destination, which is also the exchange's source."""
-        pair = self._pair(
-            "attn_out", (1, tokens, heads, head_dim), "gather_heads", dtype
-        )
-        if pair is None:
-            return None
-        return pair[0].view(tokens, heads, head_dim)
-
     def exchange_output(self, attn_out: torch.Tensor):
         """``[T_global, H/ws, D]`` -> ``[T_local, H, D]``, head axis merged."""
         tokens, heads, head_dim = attn_out.shape
-        pair = self._pair(
-            "attn_out", (1, tokens, heads, head_dim), "gather_heads", attn_out.dtype
-        )
-        if pair is None:
+        source = attn_out.view(1, tokens, heads, head_dim)
+        out = self._output("attn_out", source, "gather_heads")
+        if out is None:
             return None
-        exchanged = self._comm.gather_heads(
-            attn_out.view(1, tokens, heads, head_dim), out=pair[1]
-        )
+        exchanged = self._comm.gather_heads(source, out=out)
         return exchanged.view(
             tokens // self.world_size, heads * self.world_size, head_dim
         )
@@ -192,7 +170,7 @@ class FlashInferUlyssesA2A:
     # --------------------------------------------------------------- life --
     def shutdown(self) -> None:
         """Collective: every rank must call this before any rank exits."""
-        self._pairs.clear()
+        self._outputs.clear()
         self._comm.close()
 
 
