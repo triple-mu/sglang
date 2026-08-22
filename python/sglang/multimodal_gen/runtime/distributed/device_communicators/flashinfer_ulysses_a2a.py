@@ -28,6 +28,8 @@ caller must consume them within the layer, which the attention core does.
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.distributed as dist
 
@@ -79,6 +81,9 @@ class FlashInferUlyssesA2A:
         # (tokens, heads, head_dim) -> (sends, scattered, gather_out)
         self._buffers: dict[tuple[int, int, int], tuple] = {}
         self._declined: set[tuple[int, int, int]] = set()
+        self._exchange_seconds = 0.0
+        self._calls = 0
+        self._window_start = 0.0
 
     @property
     def backend(self) -> str:
@@ -138,6 +143,31 @@ class FlashInferUlyssesA2A:
         self._buffers[key] = (sends, scattered, gathered)
         return self._buffers[key]
 
+    def _tick(self, seconds: float) -> None:
+        """Temporary: host time inside the exchange, against host time outside it.
+
+        The ramp is 822 ms per step spread over 200 exchanges, which is more
+        than a whole exchange costs, so it cannot all be inside one. Report both
+        halves rather than assume which.
+        """
+        self._exchange_seconds += seconds
+        self._calls += 1
+        if self._calls % 400:
+            return
+        now = time.perf_counter()
+        window = now - self._window_start
+        if self._window_start and window > 0:
+            logger.info(
+                "flashinfer ulysses timing: calls=%d exchange=%.1f%% of wall "
+                "(%.2f ms/call over the last %d)",
+                self._calls,
+                100.0 * self._exchange_seconds / window,
+                1e3 * self._exchange_seconds / 400,
+                400,
+            )
+        self._window_start = now
+        self._exchange_seconds = 0.0
+
     def exchange_input(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """``[T_local, H, D]`` x3 -> ``[T_global, H/ws, D]`` x3, or None."""
         tokens, heads, head_dim = q.shape
@@ -148,12 +178,15 @@ class FlashInferUlyssesA2A:
         if slots is None:
             return None
         sends, scattered, _ = slots
+        started = time.perf_counter()
         for send, tensor in zip(sends, (q, k, v)):
             send.copy_(tensor[None])
-        return tuple(
+        result = tuple(
             self._comm.scatter_heads(send, out=out)[0]
             for send, out in zip(sends, scattered)
         )
+        self._tick(time.perf_counter() - started)
+        return result
 
     def exchange_output(self, attn_out: torch.Tensor, key: tuple[int, int, int]):
         """``[T_global, H/ws, D]`` -> ``[T_local, H, D]``, or None.
@@ -167,7 +200,10 @@ class FlashInferUlyssesA2A:
         slots = self._buffers.get(key)
         if slots is None:
             return None
-        return self._comm.gather_heads(attn_out[None], out=slots[2])[0]
+        started = time.perf_counter()
+        merged = self._comm.gather_heads(attn_out[None], out=slots[2])[0]
+        self._tick(time.perf_counter() - started)
+        return merged
 
     def shutdown(self) -> None:
         """Collective: every rank must call this before any rank exits."""
