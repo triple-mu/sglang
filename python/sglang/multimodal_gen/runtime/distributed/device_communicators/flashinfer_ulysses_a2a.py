@@ -1,34 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """FlashInfer PCIe transport for the MiniMax-H3 Ulysses exchange.
 
-On a single node without NVLink, ``all_to_all_single`` is not the bottleneck the
-relayout around it is -- it is the link. FlashInfer's PCIe Ulysses backend moves
-the payload with copy engines rather than SM stores, and at world size 8 it
-routes the cross-NUMA half over each rank's local mlx5 NIC while the same-NUMA
-half stays on CUDA P2P.
+On a single node without NVLink the exchange is link-bound. FlashInfer's PCIe
+Ulysses backend moves the payload with copy engines rather than SM stores, and
+at world size 8 it routes the cross-NUMA half over each rank's local mlx5 NIC
+while the same-NUMA half stays on CUDA P2P.
 
-Two properties of that backend shape this file.
+This exposes the same surface as the fast-ulysses transport beside it --
+``qkv_buffer`` / ``exchange_input`` / ``attn_out_buffer`` / ``exchange_output``
+-- so the attention core does not care which one it is talking to.
 
-- **Its layout is the one this model already uses.** ``scatter_heads`` is
-  defined as ``out_r[b, j*S + s, hl, d] = x_j[b, s, r*Hl + hl, d]``, which is
-  what ``_usp_input_all_to_all_packed_qkv`` computes; ``gather_heads`` is the
-  matching inverse of ``_usp_output_all_to_all(head_dim=2)``. So this is a
-  transport swap, not a layout change, and the results are bit-identical. Q/K/V
-  stay three separate exchanges: the backend is link-bound, so fusing them into
-  one operand buys it nothing and costs a pack.
-- **Registration is collective and permanent.** Constructing the communicator
-  and allocating an output both require every rank to arrive together, and an
-  allocation lives until ``close()``. Every gate below is therefore a function
-  of values that are identical on every rank -- world size, token count, dtype
-  -- so ranks never disagree about which transport an exchange uses.
+Q/K/V travel as one operand. The projection writes into ``qkv_buffer`` in the
+``[tokens, heads, 3, head_dim]`` layout, so the head axis already carries
+``3 * H`` entries and splitting it across ranks hands each one ``H/ws`` heads
+with their own Q, K and V beside them. Nothing is packed going in and nothing is
+copied coming out, and a layer costs two exchanges rather than four.
 
-Outputs are registered buffers, reused by the next call at the same shape. A
-caller must consume them within the layer, which the attention core does.
+That last part is the point, and it is not what an isolated benchmark would
+tell you: per byte, this backend is no faster fused than unfused. But the hybrid
+route blocks the calling thread inside every exchange, so the number of
+exchanges is a cost of its own, separate from what each one moves.
+
+Registration is collective and permanent -- constructing the communicator and
+allocating an output both need every rank -- so every gate below is a function
+of values identical on every rank.
 """
 
 from __future__ import annotations
-
-import time
 
 import torch
 import torch.distributed as dist
@@ -38,7 +36,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# FlashInfer's PCIe backend, single node.
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -49,7 +46,7 @@ def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
     """Why this exchange cannot use the PCIe backend, or None if it can.
 
     Only conditions that exist before a group does, and only ones every rank
-    evaluates identically. Anything shape-dependent is checked per call.
+    evaluates identically.
     """
     if not envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE:
         return "disabled"
@@ -71,19 +68,17 @@ def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
 
 
 class FlashInferUlyssesA2A:
-    """One communicator plus its registered output buffers, per shape."""
+    """One communicator, plus per-shape send buffers and registered outputs."""
 
     def __init__(self, comm, world_size: int, max_shapes: int, max_elems: int) -> None:
         self._comm = comm
         self.world_size = world_size
+        self.device = comm.device
         self._max_shapes = max_shapes
         self.max_elems = max_elems
-        # (tokens, heads, head_dim) -> (sends, scattered, gather_out)
-        self._buffers: dict[tuple[int, int, int], tuple] = {}
-        self._declined: set[tuple[int, int, int]] = set()
-        self._exchange_seconds = 0.0
-        self._calls = 0
-        self._window_start = 0.0
+        # (role, source shape, dtype) -> (send buffer, registered output)
+        self._pairs: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._declined: set[tuple] = set()
 
     @property
     def backend(self) -> str:
@@ -93,144 +88,123 @@ class FlashInferUlyssesA2A:
     def transport(self) -> str | None:
         return self._comm.transport
 
-    def _slots(self, key: tuple[int, int, int], sample: torch.Tensor):
-        """Send buffers and registered outputs for one shape, on first sight.
+    def _pair(self, role: str, source_shape: tuple, op: str, dtype):
+        """The send buffer and its registered output for one role and shape.
 
-        The send buffers exist for two reasons. Q/K/V arrive as strided views
-        into the fused projection output -- ``v`` always, ``q`` and ``k``
-        whenever the fused norm/RoPE kernel writes in place -- and the backend
-        needs contiguous operands. And a registered output binds the input
-        memory region to the pointer it was registered with, so a moving input
-        would fall back to a staged copy on the hybrid route for good. One copy
-        into a fixed buffer buys both, and it is the copy the NCCL path already
-        makes to build its destination-major send buffer.
-
-        Allocation is collective, and the key is derived from values identical
-        on every rank, so every rank allocates the same shapes in the same
-        order or none of them.
+        Both are allocated on first sight. ``allocate_output`` is collective and
+        the key comes from rank-identical values, so every rank allocates the
+        same pairs in the same order or none of them.
         """
-        cached = self._buffers.get(key)
+        key = (role, source_shape, dtype)
+        cached = self._pairs.get(key)
         if cached is not None:
             return cached
         if key in self._declined:
             return None
-        if len(self._buffers) >= self._max_shapes:
+        if len(self._pairs) >= self._max_shapes:
             self._declined.add(key)
             logger.info(
-                "flashinfer ulysses: %d registered shapes already, staying on "
-                "NCCL for %s",
+                "flashinfer ulysses: %d shapes already registered, staying on NCCL for %s",
                 self._max_shapes,
                 key,
             )
             return None
-        try:
-            sends = [torch.empty_like(sample) for _ in range(3)]
-            scattered = [
-                self._comm.allocate_output(send, "scatter_heads") for send in sends
-            ]
-            gathered = self._comm.allocate_output(scattered[0], "gather_heads")
-        except Exception as error:  # noqa: BLE001
-            # Allocation is collective and its failure mode is collective too,
-            # so declining here declines on every rank.
+        if torch.Size(source_shape).numel() > self.max_elems:
             self._declined.add(key)
             logger.warning(
-                "flashinfer ulysses: could not register outputs for %s (%s); "
-                "staying on NCCL for this shape",
+                "flashinfer ulysses: %s exceeds the declared capacity of %d elements, "
+                "so this shape stays on NCCL. Set "
+                "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN to the largest packed "
+                "sequence this deployment serves.",
+                key,
+                self.max_elems,
+            )
+            return None
+        try:
+            send = torch.empty(source_shape, dtype=dtype, device=self.device)
+            out = self._comm.allocate_output(send, op)
+        except Exception as error:  # noqa: BLE001
+            self._declined.add(key)
+            logger.warning(
+                "flashinfer ulysses: could not register %s (%s); staying on NCCL "
+                "for this shape",
                 key,
                 error,
             )
             return None
-        self._buffers[key] = (sends, scattered, gathered)
-        return self._buffers[key]
+        self._pairs[key] = (send, out)
+        return self._pairs[key]
 
-    def _tick(self, seconds: float) -> None:
-        """Temporary: host time inside the exchange, against host time outside it.
-
-        The ramp is 822 ms per step spread over 200 exchanges, which is more
-        than a whole exchange costs, so it cannot all be inside one. Report both
-        halves rather than assume which.
-        """
-        self._exchange_seconds += seconds
-        self._calls += 1
-        if self._calls % 400:
-            return
-        now = time.perf_counter()
-        window = now - self._window_start
-        if self._window_start and window > 0:
-            logger.info(
-                "flashinfer ulysses timing: calls=%d exchange=%.1f%% of wall "
-                "(%.2f ms/call over the last %d)",
-                self._calls,
-                100.0 * self._exchange_seconds / window,
-                1e3 * self._exchange_seconds / 400,
-                400,
-            )
-        self._window_start = now
-        self._exchange_seconds = 0.0
-
-    def exchange_input(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        """``[T_local, H, D]`` x3 -> ``[T_global, H/ws, D]`` x3, or None."""
-        tokens, heads, head_dim = q.shape
-        if heads % self.world_size:
-            return None
-        key = (tokens, heads, head_dim)
-        slots = self._slots(key, q[None])
-        if slots is None:
-            return None
-        sends, scattered, _ = slots
-        started = time.perf_counter()
-        for send, tensor in zip(sends, (q, k, v)):
-            send.copy_(tensor[None])
-        result = tuple(
-            self._comm.scatter_heads(send, out=out)[0]
-            for send, out in zip(sends, scattered)
+    # -------------------------------------------------------------- input --
+    def qkv_buffer(self, tokens: int, heads: int, head_dim: int, dtype):
+        """The projection's destination, which is also the exchange's source."""
+        pair = self._pair(
+            "qkv", (1, tokens, heads * 3, head_dim), "scatter_heads", dtype
         )
-        self._tick(time.perf_counter() - started)
-        return result
-
-    def exchange_output(self, attn_out: torch.Tensor, key: tuple[int, int, int]):
-        """``[T_global, H/ws, D]`` -> ``[T_local, H, D]``, or None.
-
-        ``attn_out`` is whatever the attention backend allocated, so on the
-        hybrid route this exchange takes the staged input path unless the
-        caching allocator happens to hand back the registered pointer. That
-        costs one device-to-device copy of the operand, which is why the send
-        buffers above are worth their own copy and this one is not.
-        """
-        slots = self._buffers.get(key)
-        if slots is None:
+        if pair is None:
             return None
-        started = time.perf_counter()
-        merged = self._comm.gather_heads(attn_out[None], out=slots[2])[0]
-        self._tick(time.perf_counter() - started)
-        return merged
+        # The projection wants [tokens, heads, 3, head_dim] and the exchange
+        # wants [1, tokens, 3 * heads, head_dim]: same memory, same order.
+        return pair[0].view(tokens, heads, 3, head_dim)
 
+    def exchange_input(self, qkv: torch.Tensor):
+        """``[T_local, H, 3, D]`` -> three ``[T_global, H/ws, D]`` views."""
+        tokens, heads, three, head_dim = qkv.shape
+        assert three == 3, f"expected [T, H, 3, D], got {tuple(qkv.shape)}"
+        pair = self._pair(
+            "qkv", (1, tokens, heads * 3, head_dim), "scatter_heads", qkv.dtype
+        )
+        if pair is None:
+            return None
+        exchanged = self._comm.scatter_heads(
+            qkv.view(1, tokens, heads * 3, head_dim), out=pair[1]
+        )
+        merged = exchanged.view(
+            tokens * self.world_size, heads // self.world_size, 3, head_dim
+        )
+        return merged[:, :, 0], merged[:, :, 1], merged[:, :, 2]
+
+    # ------------------------------------------------------------- output --
+    def attn_out_buffer(self, tokens: int, heads: int, head_dim: int, dtype):
+        """Attention's destination, which is also the exchange's source."""
+        pair = self._pair(
+            "attn_out", (1, tokens, heads, head_dim), "gather_heads", dtype
+        )
+        if pair is None:
+            return None
+        return pair[0].view(tokens, heads, head_dim)
+
+    def exchange_output(self, attn_out: torch.Tensor):
+        """``[T_global, H/ws, D]`` -> ``[T_local, H, D]``, head axis merged."""
+        tokens, heads, head_dim = attn_out.shape
+        pair = self._pair(
+            "attn_out", (1, tokens, heads, head_dim), "gather_heads", attn_out.dtype
+        )
+        if pair is None:
+            return None
+        exchanged = self._comm.gather_heads(
+            attn_out.view(1, tokens, heads, head_dim), out=pair[1]
+        )
+        return exchanged.view(
+            tokens // self.world_size, heads * self.world_size, head_dim
+        )
+
+    # --------------------------------------------------------------- life --
     def shutdown(self) -> None:
         """Collective: every rank must call this before any rank exits."""
-        self._buffers.clear()
+        self._pairs.clear()
         self._comm.close()
 
 
 def get_flashinfer_ulysses_a2a(
-    group,
-    device: torch.device,
-    dtype: torch.dtype,
-    needed: int,
-    capacity: int,
+    group, device: torch.device, dtype: torch.dtype, capacity: int
 ) -> FlashInferUlyssesA2A | None:
     """The transport for this process group, constructing it once.
 
-    ``capacity`` is the declared maximum and sizes every registration;
-    ``needed`` is this operand. An operand larger than the capacity a group was
-    built with stays on NCCL. It does not rebuild: capacity cannot be raised in
-    place, and every other communication workspace in both trees declines
-    rather than re-registering -- measured here, rebuilding cost more than the
-    fallback it was avoiding.
-
-    Over-declaring costs device memory and one cold-path registration. It costs
-    nothing per exchange: the transport derives its copy widths and RDMA
-    payload from the call's own geometry, and reads the capacity only to
-    allocate, to register, and to bounds-check.
+    ``capacity`` is the declared maximum and sizes every registration. It cannot
+    be raised in place, so an operand beyond it stays on NCCL rather than
+    forcing a rebuild -- which is what every other communication workspace in
+    both trees does, and measurably cheaper than the alternative.
     """
     world_size = dist.get_world_size(group)
     reason = _unusable(world_size, dtype)
@@ -242,36 +216,19 @@ def get_flashinfer_ulysses_a2a(
         return None
 
     if name in _TRANSPORTS:
-        cached = _TRANSPORTS[name]
-        if cached is None or needed <= cached.max_elems:
-            return cached
-        logger.warning(
-            "flashinfer ulysses: %d elements exceeds the declared capacity of "
-            "%d, so this shape stays on NCCL. Set "
-            "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN to the largest "
-            "packed sequence this deployment serves.",
-            needed,
-            cached.max_elems,
-        )
-        return None
-
-    max_elems = max(capacity, needed)
+        return _TRANSPORTS[name]
 
     from flashinfer.comm import UlyssesCommunicator
 
     # The constructor raises rather than returning None, and FlashInfer makes
-    # topology failures collective. Vote anyway: a rank-local failure that it
-    # did not classify as collective would otherwise leave some ranks on the
-    # PCIe path and some on NCCL, which is a hang rather than a slowdown.
+    # topology failures collective. Vote anyway: a rank-local failure it did not
+    # classify as collective would otherwise split the group across two paths,
+    # which is a hang rather than a slowdown.
     comm = None
     error: BaseException | None = None
     try:
         comm = UlyssesCommunicator(
-            group,
-            max_elems=max_elems,
-            dtype=dtype,
-            backend="pcie",
-            device=device,
+            group, max_elems=capacity, dtype=dtype, backend="pcie", device=device
         )
     except BaseException as exc:  # noqa: BLE001
         error = exc
@@ -297,15 +254,16 @@ def get_flashinfer_ulysses_a2a(
         comm,
         world_size,
         envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES,
-        max_elems,
+        capacity,
     )
     _TRANSPORTS[name] = transport
     logger.info(
         "flashinfer ulysses is carrying this group's exchanges "
-        "(backend=%s, transport=%s, world_size=%d)",
+        "(backend=%s, transport=%s, world_size=%d, capacity=%d)",
         transport.backend,
         transport.transport,
         world_size,
+        capacity,
     )
     return transport
 
