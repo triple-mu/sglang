@@ -521,17 +521,11 @@ def _flashinfer_ulysses(q: torch.Tensor):
     if group is None:
         return None, None
     tokens, heads, head_dim = q.shape
-    # Size with headroom rather than at exactly this operand. Warmup and the
-    # request it warms for differ by their text length alone -- measured, 16
-    # tokens per rank out of 4736 -- and sizing at the first shape makes that
-    # 0.34% force a teardown and re-registration of the whole transport. The
-    # rebuild path stays as a backstop for a genuinely larger request.
-    slack = envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_HEADROOM
     transport = get_flashinfer_ulysses_a2a(
         group,
         torch.device("cuda", torch.cuda.current_device()),
         q.dtype,
-        max_elems=int(tokens * heads * head_dim * slack),
+        needed=tokens * heads * head_dim,
     )
     return transport, (tokens, heads, head_dim)
 
