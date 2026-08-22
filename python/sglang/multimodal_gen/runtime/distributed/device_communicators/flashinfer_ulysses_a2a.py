@@ -78,6 +78,11 @@ class FlashInferUlyssesA2A:
         self.device = comm.device
         self._max_shapes = max_shapes
         self.max_elems = max_elems
+        # Constructing a transport says nothing about whether anything routes
+        # through it. An integration that silently keeps calling NCCL looks
+        # exactly like one that works, so say so the first time it carries a
+        # real exchange rather than at construction.
+        self._carried = False
         # (role, source shape, dtype) -> registered exchange output
         self._outputs: dict[tuple, torch.Tensor] = {}
         self._declined: set[tuple] = set()
@@ -149,6 +154,15 @@ class FlashInferUlyssesA2A:
         if out is None:
             return None
         exchanged = self._comm.scatter_heads(source, out=out)
+        if not self._carried:
+            self._carried = True
+            logger.info(
+                "flashinfer ulysses carried its first exchange (backend=%s, "
+                "transport=%s, operand=%s)",
+                self.backend,
+                self.transport,
+                tuple(source.shape),
+            )
         merged = exchanged.view(
             tokens * self.world_size, heads // self.world_size, 3, head_dim
         )
@@ -236,7 +250,7 @@ def get_flashinfer_ulysses_a2a(
     )
     _TRANSPORTS[name] = transport
     logger.info(
-        "flashinfer ulysses is carrying this group's exchanges "
+        "flashinfer ulysses started for this group "
         "(backend=%s, transport=%s, world_size=%d, capacity=%d)",
         transport.backend,
         transport.transport,
