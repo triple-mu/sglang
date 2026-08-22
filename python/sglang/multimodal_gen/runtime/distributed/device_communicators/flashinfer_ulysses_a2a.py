@@ -41,10 +41,6 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 _TRANSPORTS: dict[str, "FlashInferUlyssesA2A | None"] = {}
-# Rebuilds per group, so a caller whose shapes keep growing gives up on this
-# transport rather than tearing down and re-registering forever.
-_MAX_GROWTHS = 2
-_GROWTHS: dict[str, int] = {}
 
 
 def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
@@ -180,15 +176,25 @@ class FlashInferUlyssesA2A:
 
 
 def get_flashinfer_ulysses_a2a(
-    group, device: torch.device, dtype: torch.dtype, needed: int
+    group,
+    device: torch.device,
+    dtype: torch.dtype,
+    needed: int,
+    capacity: int,
 ) -> FlashInferUlyssesA2A | None:
     """The transport for this process group, constructing it once.
 
-    ``needed`` is this operand's element count. Capacity is sized from it with
-    headroom, because it cannot be raised afterwards and a warmup differing
-    from its request by a few tokens must not force a rebuild. The headroom
-    belongs to the capacity only -- comparing a headroomed request against a
-    headroomed capacity would cancel out and rebuild anyway.
+    ``capacity`` is the declared maximum and sizes every registration;
+    ``needed`` is this operand. An operand larger than the capacity a group was
+    built with stays on NCCL. It does not rebuild: capacity cannot be raised in
+    place, and every other communication workspace in both trees declines
+    rather than re-registering -- measured here, rebuilding cost more than the
+    fallback it was avoiding.
+
+    Over-declaring costs device memory and one cold-path registration. It costs
+    nothing per exchange: the transport derives its copy widths and RDMA
+    payload from the call's own geometry, and reads the capacity only to
+    allocate, to register, and to bounds-check.
     """
     world_size = dist.get_world_size(group)
     reason = _unusable(world_size, dtype)
@@ -203,29 +209,17 @@ def get_flashinfer_ulysses_a2a(
         cached = _TRANSPORTS[name]
         if cached is None or needed <= cached.max_elems:
             return cached
-        # A bigger operand than anything registered so far. max_elems sizes
-        # every registration and cannot be raised in place, so grow by
-        # rebuilding. Warmup at one resolution followed by requests at a larger
-        # one is the ordinary case, not a pathological one. Shapes are
-        # identical on every rank, so every rank rebuilds here together.
-        if _GROWTHS.get(name, 0) >= _MAX_GROWTHS:
-            logger.info(
-                "flashinfer ulysses: already rebuilt %d times for a larger "
-                "operand; staying on NCCL for %d elements",
-                _MAX_GROWTHS,
-                needed,
-            )
-            return None
-        _GROWTHS[name] = _GROWTHS.get(name, 0) + 1
-        logger.info(
-            "flashinfer ulysses: rebuilding for a larger operand (%d -> %d elements)",
-            cached.max_elems,
+        logger.warning(
+            "flashinfer ulysses: %d elements exceeds the declared capacity of "
+            "%d, so this shape stays on NCCL. Set "
+            "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN to the largest "
+            "packed sequence this deployment serves.",
             needed,
+            cached.max_elems,
         )
-        del _TRANSPORTS[name]
-        cached.shutdown()
+        return None
 
-    max_elems = int(needed * envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_HEADROOM)
+    max_elems = max(capacity, needed)
 
     from flashinfer.comm import UlyssesCommunicator
 
@@ -282,7 +276,6 @@ def get_flashinfer_ulysses_a2a(
 
 def shutdown_flashinfer_ulysses_a2a() -> None:
     """Collective: every rank must call this before any rank exits."""
-    _GROWTHS.clear()
     for name in list(_TRANSPORTS):
         transport = _TRANSPORTS.pop(name)
         if transport is None:
