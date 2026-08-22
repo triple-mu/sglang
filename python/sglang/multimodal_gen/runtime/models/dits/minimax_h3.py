@@ -607,7 +607,6 @@ def _minimax_h3_attention_core_impl(
     rank, so the ranks never take different paths.
     """
 
-    transport = None
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_input_all_to_all_interleaved,
