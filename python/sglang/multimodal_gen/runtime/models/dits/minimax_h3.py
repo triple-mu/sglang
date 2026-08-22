@@ -614,6 +614,27 @@ def _flashinfer_transport(attention: MiniMaxH3Attention, tokens: int) -> object 
     )
 
 
+_ULYSSES_FALLBACKS: set[str] = set()
+
+
+def _transport_unused(why: str) -> None:
+    """Say once that a transport was built and then not used.
+
+    A run that falls back to NCCL produces correct output at NCCL speed and
+    looks exactly like one that worked, which is how a shadowed parameter went
+    unnoticed across a week of A/B runs. Any comparison whose log contains this
+    line is a comparison of NCCL against NCCL.
+    """
+    if why in _ULYSSES_FALLBACKS:
+        return
+    _ULYSSES_FALLBACKS.add(why)
+    logger.warning(
+        "MiniMax H3 Ulysses: a transport was available but this exchange is "
+        "going over NCCL (%s); any transport comparison from this run is void",
+        why,
+    )
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -654,6 +675,8 @@ def _minimax_h3_attention_core_impl(
         else:
             # Declining is a function of rank-identical values, so every rank
             # declines together and the group stays on one path.
+            if transport is not None:
+                _transport_unused("the input exchange declined this operand")
             transport = None
             if fused_qkv is not None and not ring_active:
                 q, k, v = _usp_input_all_to_all_interleaved(fused_qkv)
@@ -736,6 +759,7 @@ def _minimax_h3_attention_core_impl(
             merged = transport.exchange_output(out)
             if merged is not None:
                 return merged
+            _transport_unused("the output exchange declined this operand")
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
 
@@ -1076,7 +1100,9 @@ class MiniMaxH3Attention(nn.Module):
             )
             # q and k are fresh tensors now, so the fused buffer no longer
             # holds the values attention reads.
-            fused_qkv = None
+            if transport is not None:
+                _transport_unused("qk-norm ran without a rope cache")
+            fused_qkv = transport = None
         else:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
@@ -1102,7 +1128,9 @@ class MiniMaxH3Attention(nn.Module):
                     self.head_dim,
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
-                fused_qkv = None
+                if transport is not None:
+                    _transport_unused("qk-norm and rope ran unfused")
+                fused_qkv = transport = None
 
         attention_core = (
             _minimax_h3_attention_core_bcg

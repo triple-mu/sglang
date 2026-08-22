@@ -80,9 +80,10 @@ class FlashInferUlyssesA2A:
         self.max_elems = max_elems
         # Constructing a transport says nothing about whether anything routes
         # through it. An integration that silently keeps calling NCCL looks
-        # exactly like one that works, so say so the first time it carries a
-        # real exchange rather than at construction.
-        self._carried = False
+        # exactly like one that works, so count what is actually carried and
+        # say so on the first one and again at teardown. A benchmark run whose
+        # log has no such line measured NCCL, whatever it was labelled.
+        self._exchanges = 0
         # (role, source shape, dtype) -> registered exchange output
         self._outputs: dict[tuple, torch.Tensor] = {}
         self._declined: set[tuple] = set()
@@ -154,15 +155,7 @@ class FlashInferUlyssesA2A:
         if out is None:
             return None
         exchanged = self._comm.scatter_heads(source, out=out)
-        if not self._carried:
-            self._carried = True
-            logger.info(
-                "flashinfer ulysses carried its first exchange (backend=%s, "
-                "transport=%s, operand=%s)",
-                self.backend,
-                self.transport,
-                tuple(source.shape),
-            )
+        self._count(source)
         merged = exchanged.view(
             tokens * self.world_size, heads // self.world_size, 3, head_dim
         )
@@ -177,13 +170,29 @@ class FlashInferUlyssesA2A:
         if out is None:
             return None
         exchanged = self._comm.gather_heads(source, out=out)
+        self._count(source)
         return exchanged.view(
             tokens // self.world_size, heads * self.world_size, head_dim
         )
 
     # --------------------------------------------------------------- life --
+    def _count(self, source: torch.Tensor) -> None:
+        self._exchanges += 1
+        if self._exchanges == 1:
+            logger.info(
+                "flashinfer ulysses carried its first exchange "
+                "(backend=%s, transport=%s, operand=%s)",
+                self.backend,
+                self.transport,
+                tuple(source.shape),
+            )
+
     def shutdown(self) -> None:
         """Collective: every rank must call this before any rank exits."""
+        logger.info(
+            "flashinfer ulysses carried %d exchanges over its lifetime",
+            self._exchanges,
+        )
         self._outputs.clear()
         self._comm.close()
 
