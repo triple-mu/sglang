@@ -180,12 +180,15 @@ class FlashInferUlyssesA2A:
 
 
 def get_flashinfer_ulysses_a2a(
-    group, device: torch.device, dtype: torch.dtype, max_elems: int
+    group, device: torch.device, dtype: torch.dtype, needed: int
 ) -> FlashInferUlyssesA2A | None:
     """The transport for this process group, constructing it once.
 
-    ``max_elems`` sizes every registration and cannot be raised afterwards, so
-    the caller passes the largest operand it intends to exchange.
+    ``needed`` is this operand's element count. Capacity is sized from it with
+    headroom, because it cannot be raised afterwards and a warmup differing
+    from its request by a few tokens must not force a rebuild. The headroom
+    belongs to the capacity only -- comparing a headroomed request against a
+    headroomed capacity would cancel out and rebuild anyway.
     """
     world_size = dist.get_world_size(group)
     reason = _unusable(world_size, dtype)
@@ -198,7 +201,7 @@ def get_flashinfer_ulysses_a2a(
 
     if name in _TRANSPORTS:
         cached = _TRANSPORTS[name]
-        if cached is None or max_elems <= cached.max_elems:
+        if cached is None or needed <= cached.max_elems:
             return cached
         # A bigger operand than anything registered so far. max_elems sizes
         # every registration and cannot be raised in place, so grow by
@@ -210,17 +213,19 @@ def get_flashinfer_ulysses_a2a(
                 "flashinfer ulysses: already rebuilt %d times for a larger "
                 "operand; staying on NCCL for %d elements",
                 _MAX_GROWTHS,
-                max_elems,
+                needed,
             )
             return None
         _GROWTHS[name] = _GROWTHS.get(name, 0) + 1
         logger.info(
             "flashinfer ulysses: rebuilding for a larger operand (%d -> %d elements)",
             cached.max_elems,
-            max_elems,
+            needed,
         )
         del _TRANSPORTS[name]
         cached.shutdown()
+
+    max_elems = int(needed * envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_HEADROOM)
 
     from flashinfer.comm import UlyssesCommunicator
 
