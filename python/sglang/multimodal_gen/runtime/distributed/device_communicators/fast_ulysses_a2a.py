@@ -78,7 +78,7 @@ class FastUlyssesA2A:
         # Constructing a transport says nothing about whether anything routes
         # through it; an integration that silently keeps calling NCCL looks
         # exactly like one that works.
-        self._carried = False
+        self._exchanges = 0
 
     def _over_budget(self, what: str, shape) -> None:
         if not self._budget_spent:
@@ -141,12 +141,7 @@ class FastUlyssesA2A:
         if workspace is None:
             return None
         exchanged = self._group.all_to_all_4d(source, mode=0, out=workspace)
-        if not self._carried:
-            self._carried = True
-            logger.info(
-                "fast-ulysses carried its first exchange (operand=%s)",
-                tuple(source.shape),
-            )
+        self._count(source)
         merged = exchanged.view(
             tokens * self.world_size, heads // self.world_size, 3, head_dim
         )
@@ -163,6 +158,7 @@ class FastUlyssesA2A:
         if workspace is None:
             return None
         exchanged = self._group.all_to_all_4d(source, mode=1, out=workspace)
+        self._count(source)
         return exchanged.view(
             tokens // self.world_size, heads * self.world_size, head_dim
         )
@@ -175,7 +171,18 @@ class FastUlyssesA2A:
             == self._stream.cuda_stream
         )
 
+    def _count(self, source: torch.Tensor) -> None:
+        self._exchanges += 1
+        if self._exchanges == 1:
+            logger.info(
+                "fast-ulysses carried its first exchange (operand=%s)",
+                tuple(source.shape),
+            )
+
     def shutdown(self) -> None:
+        logger.info(
+            "fast-ulysses carried %d exchanges over its lifetime", self._exchanges
+        )
         self._workspaces.clear()
         self._group.destroy()
 
