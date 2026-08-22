@@ -563,6 +563,18 @@ def _flashinfer_transport(attention: MiniMaxH3Attention, tokens: int) -> object 
     )
 
 
+def _project_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
+    """``layer(x)`` written into ``out`` rather than into a fresh tensor.
+
+    The hybrid PCIe route reads its operand out of a buffer the transport owns,
+    so an operand produced anywhere else is copied there first. Writing the
+    projection straight into that buffer removes the copy. Callers gate on the
+    case this covers: an unquantized, unbiased, non-gathering column-parallel
+    linear, which is one GEMM.
+    """
+    torch.mm(x, layer.weight.t(), out=out)
+
+
 def _fast_ulysses_transport(attention: MiniMaxH3Attention) -> object | None:
     """The transport for this rank's Ulysses group, or None to stay on NCCL."""
     from sglang.multimodal_gen.runtime.distributed.device_communicators.fast_ulysses_a2a import (  # noqa: E501
@@ -699,6 +711,9 @@ _minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core
 
 
 class MiniMaxH3Attention(nn.Module):
+    # Class-level so the line appears once per process, not once per block.
+    _said_projects_into_buffer = False
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -760,14 +775,25 @@ class MiniMaxH3Attention(nn.Module):
             self._install_qkv_weight_loader(arch)
         self._install_qkv_weight_loader(arch)
         # One operand per layer, which the projection already produces in the
-        # interleaved layout. Neither transport tracks the input pointer any
-        # more, so nothing has to be projected into a fixed destination.
+        # interleaved layout.
         _fusable = bool(self._qkv_interleaved)
         self._fast_ulysses_eligible = bool(
             envs.SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES and _fusable
         )
         self._flashinfer_eligible = bool(
             envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE and _fusable
+        )
+        # The FlashInfer transport can additionally hand the projection its own
+        # registered buffer, which removes a 203.7 MB copy per layer. That needs
+        # the projection to be one plain GEMM: quantized weights are not, so an
+        # fp8 run keeps the copy rather than losing the transport. fast-ulysses
+        # pins the caller's pointer instead and has no buffer to hand out.
+        self._projects_into_buffer = bool(
+            self._flashinfer_eligible
+            and not envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER
+            and quant_config is None
+            and getattr(self.qkv_proj, "bias", None) is None
+            and not self.qkv_proj.gather_output
         )
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
@@ -1013,9 +1039,22 @@ class MiniMaxH3Attention(nn.Module):
                 transport = _fast_ulysses_transport(self)
             elif self._flashinfer_eligible:
                 transport = _flashinfer_transport(self, total)
-        qkv, _ = self.qkv_proj(x)
-        if self._qkv_interleaved:
-            fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+        if transport is not None and self._projects_into_buffer:
+            fused_qkv = transport.qkv_buffer(
+                total, self.num_heads, self.head_dim, _BF16_DTYPE
+            )
+            if fused_qkv is not None and not self._said_projects_into_buffer:
+                type(self)._said_projects_into_buffer = True
+                logger.info(
+                    "MiniMax H3 Ulysses: projects into the transport buffer, "
+                    "so the exchange stages nothing on the way in"
+                )
+        if fused_qkv is not None:
+            _project_into(self.qkv_proj, x, fused_qkv.view(total, -1))
+        else:
+            qkv, _ = self.qkv_proj(x)
+            if self._qkv_interleaved:
+                fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
         if fused_qkv is not None:
             q, k, v = fused_qkv[:, :, 0], fused_qkv[:, :, 1], fused_qkv[:, :, 2]
         else:
