@@ -16,6 +16,7 @@ from contextlib import ExitStack
 from typing import Any, Callable
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import safe_open
 
@@ -566,11 +567,20 @@ def _flashinfer_ulysses(q: torch.Tensor):
     if group is None:
         return None, None
     tokens, heads, head_dim = q.shape
+    # FlashInfer sizes a workspace from a declared maximum, not from a problem
+    # size, and its capacity cannot be raised in place. Declare it from the
+    # largest packed sequence this deployment serves, so that a warmup and the
+    # request it warms for -- which differ by their text length alone -- share
+    # one transport. Falling back to this operand is only right when every
+    # request has the same geometry.
+    declared_seq = envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN
+    local_tokens = max(tokens, declared_seq // dist.get_world_size(group))
     transport = get_flashinfer_ulysses_a2a(
         group,
         torch.device("cuda", torch.cuda.current_device()),
         q.dtype,
         needed=tokens * heads * head_dim,
+        capacity=local_tokens * heads * head_dim,
     )
     return transport, (tokens, heads, head_dim)
 
