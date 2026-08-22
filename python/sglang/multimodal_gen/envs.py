@@ -59,6 +59,16 @@ if TYPE_CHECKING:
     # a warmup differs from its own request by its text length alone, and a
     # capacity that does not cover both leaves the request on NCCL
     SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN: int = 0
+    # MiniMax-H3 Ulysses layout: emit [tokens, heads, 3, head_dim] from the qkv
+    # projection so the head axis is already the collective's destination-major
+    # split. Q/K/V then reach the norm, RoPE, and attention kernels as strided
+    # views and nothing is relaid out after the exchange.
+    SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED: bool = False
+    # Carry that exchange over fast-ulysses instead of NCCL: CUDA IPC pitched
+    # copies inside a quad and mlx5 RDMA across quads, with the relayout folded
+    # into the copy strides. Implies the interleaved layout. Falls back to NCCL
+    # whenever it cannot apply.
+    SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES: bool = False
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -266,6 +276,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
+    # Head-interleaved qkv projection output for the MiniMax-H3 Ulysses path
+    "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED"
+    ),
+    # fast-ulysses transport for that exchange (implies the layout above)
+    "SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_FAST_ULYSSES"
     ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
