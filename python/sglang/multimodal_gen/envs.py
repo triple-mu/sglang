@@ -58,10 +58,12 @@ if TYPE_CHECKING:
     # four registrations held until teardown, so multi-resolution serving
     # needs a cap, exactly as the IPC A2A staging pairs above do
     SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES: int = 4
-    # capacity headroom over the first operand a group sees, so that a
-    # warmup differing from the request only by its text length does not
-    # force the whole transport to be torn down and re-registered
-    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_HEADROOM: float = 1.25
+    # largest packed sequence this deployment will serve, which sizes the
+    # transport's registrations once. 0 means "size from the first operand
+    # seen", which is only right when every request has the same geometry --
+    # a warmup differs from its own request by its text length alone, and a
+    # capacity that does not cover both leaves the request on NCCL
+    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN: int = 0
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -304,8 +306,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES": _lazy_int(
         "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES", 4
     ),
-    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_HEADROOM": _lazy_float(
-        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_HEADROOM", 1.25
+    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN", 0
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
