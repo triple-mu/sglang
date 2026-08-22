@@ -7,16 +7,20 @@ at world size 8 it routes the cross-NUMA half over each rank's local mlx5 NIC
 while the same-NUMA half stays on CUDA P2P.
 
 This exposes the same surface as the fast-ulysses transport beside it --
-``exchange_input`` and ``exchange_output`` -- so the attention core does not
-care which one it is talking to.
+``qkv_buffer`` / ``exchange_input`` / ``exchange_output`` -- so the attention
+core does not care which one it is talking to.
 
 Q/K/V travel as one operand. The projection already emits
 ``[tokens, heads, 3, head_dim]``, so the head axis carries ``3 * H`` entries and
 splitting it across ranks hands each one ``H/ws`` heads with their own Q, K and
 V beside them. Nothing is packed going in and nothing is copied coming out, and
-a layer costs two exchanges rather than four. The operands stay the caller's:
-this transport registers only its own output slots, so there is no fixed
-destination to project or stage into.
+a layer costs two exchanges rather than four.
+
+``qkv_buffer`` hands the projection the buffer the NIC reads, so the hybrid
+route stages nothing on the way in. The way back keeps its staging copy: the
+attention backend allocates its own output and will not be told to write
+elsewhere, so staging it here and staging it inside FlashInfer cost the same
+single pass.
 
 That last part is the point, and it is not what an isolated benchmark would
 tell you: per byte, this backend is no faster fused than unfused. But the hybrid
@@ -86,6 +90,8 @@ class FlashInferUlyssesA2A:
         self._exchanges = 0
         # (role, source shape, dtype) -> registered exchange output
         self._outputs: dict[tuple, torch.Tensor] = {}
+        # Same key -> the operand buffer that output reads with no staging copy.
+        self._sends: dict[tuple, torch.Tensor] = {}
         self._declined: set[tuple] = set()
 
     @property
@@ -146,6 +152,46 @@ class FlashInferUlyssesA2A:
         return out
 
     # -------------------------------------------------------------- input --
+    def qkv_buffer(self, tokens: int, heads: int, head_dim: int, dtype):
+        """The projection's destination, which is also the exchange's source.
+
+        On the hybrid route the NIC reads out of a buffer the transport owns,
+        so an operand that arrives anywhere else is copied there first --
+        203.7 MB per layer at this model's sizes. Projecting straight in here
+        removes that copy. Returns None when the shape is not registrable, in
+        which case the caller projects wherever it likes and the exchange
+        stages as usual.
+
+        The other routes have no such buffer and hand back an ordinary tensor,
+        so the caller has one code path either way.
+        """
+        shape = (1, tokens, heads * 3, head_dim)
+        key = ("qkv", shape, dtype)
+        send = self._sends.get(key)
+        if send is None:
+            # allocate_output wants an operand to take its geometry from, and
+            # this is the cold path, so a throwaway is cheaper than plumbing a
+            # shape-only variant through the whole stack.
+            sample = torch.empty(shape, dtype=dtype, device=self.device)
+            out = self._output("qkv", sample, "scatter_heads")
+            del sample
+            if out is None:
+                return None
+            try:
+                send = self._comm.allocate_input(out, "scatter_heads")
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "flashinfer ulysses: no operand buffer for %s (%s); this "
+                    "shape keeps its staging copy",
+                    key,
+                    error,
+                )
+                return None
+            self._sends[key] = send
+        # The projection wants [tokens, heads, 3, head_dim] and the exchange
+        # wants [1, tokens, 3 * heads, head_dim]: same memory, same order.
+        return send.view(tokens, heads, 3, head_dim)
+
     def exchange_input(self, qkv: torch.Tensor):
         """``[T_local, H, 3, D]`` -> three ``[T_global, H/ws, D]`` views."""
         tokens, heads, three, head_dim = qkv.shape
@@ -193,6 +239,7 @@ class FlashInferUlyssesA2A:
             "flashinfer ulysses carried %d exchanges over its lifetime",
             self._exchanges,
         )
+        self._sends.clear()
         self._outputs.clear()
         self._comm.close()
 

@@ -64,6 +64,10 @@ if TYPE_CHECKING:
     # a warmup differs from its own request by its text length alone, and a
     # capacity that does not cover both leaves the request on NCCL
     SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN: int = 0
+    # keep the qkv projection out of the transport's own operand buffer, so the
+    # exchange stages the operand as it would for any caller. Measurement knob:
+    # the only difference between the two arms is one 203.7 MB copy per layer
+    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER: bool = False
     # MiniMax-H3 Ulysses layout: emit [tokens, heads, 3, head_dim] from the qkv
     # projection so the head axis is already the collective's destination-major
     # split. Q/K/V then reach the norm, RoPE, and attention kernels as strided
@@ -313,6 +317,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN": _lazy_int(
         "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN", 0
+    ),
+    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER"
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
