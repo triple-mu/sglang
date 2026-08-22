@@ -565,16 +565,21 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
-def _flashinfer_ulysses(q: torch.Tensor):
-    """This SP group's PCIe transport and the shape key, or ``(None, None)``.
+def _project_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
+    """Write the unquantized QKV projection directly into ``out``."""
+    torch.mm(x, layer.weight.t(), out=out)
 
-    Called per attention layer. Everything it passes down is identical on every
-    rank -- the group, the dtype, and the operand's element count -- because
-    constructing the communicator and registering an output are both collective.
-    ``max_elems`` is fixed at the first shape a group sees; a larger one later
-    cannot be registered and stays on NCCL.
+
+def _flashinfer_qkv(
+    attention: MiniMaxH3Attention, tokens: int
+) -> tuple[object | None, torch.Tensor | None]:
+    """The transport and the qkv buffer to project into, or (None, None).
+
+    Capacity is declared, not discovered: FlashInfer sizes every registration
+    from it and cannot raise it in place, and a warmup differs from the request
+    it warms for by its text length alone.
     """
-    from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_ulysses_a2a import (
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_ulysses_a2a import (  # noqa: E501
         get_flashinfer_ulysses_a2a,
     )
     from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
@@ -582,23 +587,20 @@ def _flashinfer_ulysses(q: torch.Tensor):
     group = get_sp_group().ulysses_group
     if group is None:
         return None, None
-    tokens, heads, head_dim = q.shape
-    # FlashInfer sizes a workspace from a declared maximum, not from a problem
-    # size, and its capacity cannot be raised in place. Declare it from the
-    # largest packed sequence this deployment serves, so that a warmup and the
-    # request it warms for -- which differ by their text length alone -- share
-    # one transport. Falling back to this operand is only right when every
-    # request has the same geometry.
-    declared_seq = envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN
-    local_tokens = max(tokens, declared_seq // dist.get_world_size(group))
+    declared = envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN
+    local_tokens = max(tokens, declared // dist.get_world_size(group))
     transport = get_flashinfer_ulysses_a2a(
         group,
         torch.device("cuda", torch.cuda.current_device()),
-        q.dtype,
-        needed=tokens * heads * head_dim,
-        capacity=local_tokens * heads * head_dim,
+        _BF16_DTYPE,
+        capacity=local_tokens * attention.num_heads * 3 * attention.head_dim,
     )
-    return transport, (tokens, heads, head_dim)
+    if transport is None:
+        return None, None
+    buffer = transport.qkv_buffer(
+        tokens, attention.num_heads, attention.head_dim, _BF16_DTYPE
+    )
+    return (transport, buffer) if buffer is not None else (None, None)
 
 
 def _minimax_h3_attention_core_impl(
@@ -614,6 +616,7 @@ def _minimax_h3_attention_core_impl(
     subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
     fused_qkv: torch.Tensor | None = None,
+    transport: object | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -624,10 +627,9 @@ def _minimax_h3_attention_core_impl(
     ``fused_qkv`` is the [tokens, heads, 3, head_dim] projection output that
     ``q``/``k``/``v`` are views of, when the projection emits that layout. It
     is already the exchange's send layout, so passing it skips the pack.
+    ``transport`` carries both exchanges over FlashInfer instead of NCCL.
     """
 
-    transport = None
-    shape_key = None
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_input_all_to_all_interleaved,
@@ -635,8 +637,7 @@ def _minimax_h3_attention_core_impl(
             _usp_output_all_to_all,
         )
 
-        transport, shape_key = _flashinfer_ulysses(q)
-        exchanged = None if transport is None else transport.exchange_input(q, k, v)
+        exchanged = None if transport is None else transport.exchange_input(fused_qkv)
         if exchanged is not None:
             q, k, v = exchanged
         else:
@@ -721,7 +722,7 @@ def _minimax_h3_attention_core_impl(
             )
     if ulysses_active:
         if transport is not None:
-            merged = transport.exchange_output(out, shape_key)
+            merged = transport.exchange_output(out)
             if merged is not None:
                 return merged
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
@@ -765,7 +766,10 @@ class MiniMaxH3Attention(nn.Module):
         # exactly that per-head [q, k, v] order, so this is a row order the
         # loader keeps rather than one it has to build.
         self._qkv_interleaved = bool(
-            envs.SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED
+            (
+                envs.SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED
+                or envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE
+            )
             and quant_config is None
             and self.total_num_heads % self.tp_size == 0
         )
@@ -793,6 +797,16 @@ class MiniMaxH3Attention(nn.Module):
         )
         if not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
+        # The transport binds a registered operand buffer for its lifetime, so
+        # an eligible projection writes the exchange source directly.
+        _fusable = bool(
+            self._qkv_interleaved
+            and getattr(self.qkv_proj, "bias", None) is None
+            and not self.qkv_proj.gather_output
+        )
+        self._flashinfer_eligible = bool(
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE and _fusable
+        )
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
@@ -1031,10 +1045,17 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        transport = None
         fused_qkv = None
-        if self._qkv_interleaved:
-            fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+        if ulysses_active and not ring_active and self._flashinfer_eligible:
+            transport, fused_qkv = _flashinfer_qkv(self, total)
+        if fused_qkv is not None:
+            _project_into(self.qkv_proj, x, fused_qkv.view(total, -1))
+        else:
+            qkv, _ = self.qkv_proj(x)
+            if self._qkv_interleaved:
+                fused_qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+        if fused_qkv is not None:
             q, k, v = fused_qkv[:, :, 0], fused_qkv[:, :, 1], fused_qkv[:, :, 2]
         else:
             q, k, v = qkv.split(self.local_inner_dim, dim=-1)
@@ -1096,6 +1117,7 @@ class MiniMaxH3Attention(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
             fused_qkv=fused_qkv,
+            transport=transport,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
