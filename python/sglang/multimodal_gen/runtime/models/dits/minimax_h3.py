@@ -1430,25 +1430,8 @@ class MiniMaxH3AdalnCache(nn.Module):
         of ``lookup``: a real plan always has at least one timestep, so a zero
         length can never match. Breakable CUDA graph keys its replay signature
         on tensor pointers, so this is allocated once and only written in place.
-
-        Allocated outside InferenceMode on purpose. Model loading runs inside
-        it, which would make these inference tensors, and the rebuild that
-        writes them runs outside it whenever a stage needs version counters --
-        which is what a served run with cpu-offloaded components does. Mutating
-        an inference tensor there is an error, so the slab has to be an ordinary
-        tensor from the start.
         """
         width = self.max_plan_width
-        with torch.inference_mode(False):
-            self._allocate_slab(device, width)
-        logger.info(
-            "MiniMax H3 AdaLN rebuild slab: %d plans x %d timesteps = %.2f GiB",
-            self.max_plans,
-            width,
-            self.block_params.numel() * 2 / 2**30,
-        )
-
-    def _allocate_slab(self, device: torch.device, width: int) -> None:
         self.register_buffer(
             "plan_timesteps",
             torch.zeros((self.max_plans, width), dtype=_FP32_DTYPE, device=device),
@@ -1472,6 +1455,12 @@ class MiniMaxH3AdalnCache(nn.Module):
                 dtype=_BF16_DTYPE,
                 device=device,
             ),
+        )
+        logger.info(
+            "MiniMax H3 AdaLN rebuild slab: %d plans x %d timesteps = %.2f GiB",
+            self.max_plans,
+            width,
+            self.block_params.numel() * 2 / 2**30,
         )
 
     def build(
@@ -1998,7 +1987,20 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         def embed(timesteps: torch.Tensor) -> torch.Tensor:
             return nn.functional.silu(self.time_embedder(timesteps)).to(_BF16_DTYPE)
 
-        self.adaln_cache.build(step_timesteps, embed=embed)
+        # The rebuild writes the plan slab in place, and whether that is legal
+        # depends on whether the slab is an inference tensor -- which is not
+        # this call's to decide. Model loading runs inside InferenceMode, and a
+        # cpu-offloaded DiT round-trips its buffers through .to(), rebuilding
+        # them there, so on a served run the slab is one. Meanwhile the stage
+        # around us may be running *outside* InferenceMode:
+        # PipelineExecutor._stage_execution_context disables it for fsdp and for
+        # cpu-offloaded components, because their hooks need version counters.
+        # Mutating an inference tensor there raises. Re-entering InferenceMode
+        # for the rebuild is legal whichever kind of tensor the slab turned out
+        # to be, and safe: build() reads checkpoint shards and runs GEMMs on raw
+        # tensors, so no offload hook fires inside it.
+        with torch.inference_mode():
+            self.adaln_cache.build(step_timesteps, embed=embed)
 
     def _can_batch_block_adaln(self) -> bool:
         return (
