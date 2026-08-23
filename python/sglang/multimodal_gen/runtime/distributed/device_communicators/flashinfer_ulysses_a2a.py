@@ -276,7 +276,12 @@ def get_flashinfer_ulysses_a2a(
     error: BaseException | None = None
     try:
         comm = UlyssesCommunicator(
-            group, max_elems=capacity, dtype=dtype, backend="pcie", device=device
+            group,
+            max_elems=capacity,
+            dtype=dtype,
+            backend="pcie",
+            device=device,
+            pcie_engine=envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE_ENGINE,
         )
     except BaseException as exc:  # noqa: BLE001
         error = exc
@@ -307,9 +312,10 @@ def get_flashinfer_ulysses_a2a(
     _TRANSPORTS[name] = transport
     logger.info(
         "flashinfer ulysses started for this group "
-        "(backend=%s, transport=%s, world_size=%d, capacity=%d)",
+        "(backend=%s, transport=%s, engine=%s, world_size=%d, capacity=%d)",
         transport.backend,
         transport.transport,
+        comm.pcie_engine,
         world_size,
         capacity,
     )

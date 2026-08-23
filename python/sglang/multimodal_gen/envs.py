@@ -49,6 +49,9 @@ if TYPE_CHECKING:
     # islands. For single nodes without NVLink. Falls back to NCCL whenever it
     # cannot apply, and never changes the result -- both paths are bit-exact.
     SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE: bool = False
+    # FlashInfer PCIe engine: legacy is the production-safe synchronous path;
+    # pipeline uses GPU-visible RDMA arrival epochs and asynchronous verbs.
+    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE_ENGINE: str = "legacy"
     # distinct sequence lengths that get registered output buffers; each is
     # four registrations held until teardown, so multi-resolution serving
     # needs a cap, exactly as the IPC A2A staging pairs above do
@@ -271,6 +274,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE"
+    ),
+    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE_ENGINE": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE_ENGINE", "legacy"
     ),
     "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES": _lazy_int(
         "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES", 4
