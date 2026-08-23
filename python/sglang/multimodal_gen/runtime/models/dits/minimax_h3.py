@@ -1430,8 +1430,25 @@ class MiniMaxH3AdalnCache(nn.Module):
         of ``lookup``: a real plan always has at least one timestep, so a zero
         length can never match. Breakable CUDA graph keys its replay signature
         on tensor pointers, so this is allocated once and only written in place.
+
+        Allocated outside InferenceMode on purpose. Model loading runs inside
+        it, which would make these inference tensors, and the rebuild that
+        writes them runs outside it whenever a stage needs version counters --
+        which is what a served run with cpu-offloaded components does. Mutating
+        an inference tensor there is an error, so the slab has to be an ordinary
+        tensor from the start.
         """
         width = self.max_plan_width
+        with torch.inference_mode(False):
+            self._allocate_slab(device, width)
+        logger.info(
+            "MiniMax H3 AdaLN rebuild slab: %d plans x %d timesteps = %.2f GiB",
+            self.max_plans,
+            width,
+            self.block_params.numel() * 2 / 2**30,
+        )
+
+    def _allocate_slab(self, device: torch.device, width: int) -> None:
         self.register_buffer(
             "plan_timesteps",
             torch.zeros((self.max_plans, width), dtype=_FP32_DTYPE, device=device),
@@ -1455,12 +1472,6 @@ class MiniMaxH3AdalnCache(nn.Module):
                 dtype=_BF16_DTYPE,
                 device=device,
             ),
-        )
-        logger.info(
-            "MiniMax H3 AdaLN rebuild slab: %d plans x %d timesteps = %.2f GiB",
-            self.max_plans,
-            width,
-            self.block_params.numel() * 2 / 2**30,
         )
 
     def build(
