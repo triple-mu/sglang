@@ -352,6 +352,23 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
+    # MiniMax-H3 Ulysses data plane. NCCL retains the head-interleaved layout
+    # whenever the checkpoint format permits the row permutation.
+    minimax_h3_ulysses_transport: str = "nccl"
+    # Refuse every FlashInfer import/topology/capacity/geometry fallback.
+    minimax_h3_ulysses_strict: bool = False
+    # Global packed sequence capacity shared by warmup and all request tasks.
+    minimax_h3_ulysses_max_seq_len: int = 82368
+    # Number of distinct paired scatter/gather geometries registered per group.
+    minimax_h3_ulysses_max_sequence_geometries: int = 4
+    # Let the QKV projection write into FlashInfer's registered landing buffer.
+    minimax_h3_ulysses_direct_input_buffer: bool = True
+    # Per-component transformer weight overrides (key = model_index.json component name).
+    # Pipelines use this when a checkpoint ships separate quantized weights for
+    # secondary DiT components; the generic loader consumes it without model-specific
+    # filename logic.
+    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
+
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -615,7 +632,29 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self._validate_minimax_h3_ulysses()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_minimax_h3_ulysses(self) -> None:
+        transports = ("nccl", "flashinfer-pcie")
+        if self.minimax_h3_ulysses_transport not in transports:
+            raise ValueError(
+                "--minimax-h3-ulysses-transport must be one of "
+                f"{transports}, got {self.minimax_h3_ulysses_transport!r}"
+            )
+        if self.minimax_h3_ulysses_strict and (
+            self.minimax_h3_ulysses_transport != "flashinfer-pcie"
+        ):
+            raise ValueError(
+                "--minimax-h3-ulysses-strict requires "
+                "--minimax-h3-ulysses-transport=flashinfer-pcie"
+            )
+        if self.minimax_h3_ulysses_max_seq_len <= 0:
+            raise ValueError("--minimax-h3-ulysses-max-seq-len must be positive")
+        if self.minimax_h3_ulysses_max_sequence_geometries <= 0:
+            raise ValueError(
+                "--minimax-h3-ulysses-max-sequence-geometries must be positive"
+            )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
@@ -1944,6 +1983,54 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Path to a precomputed MiniMax H3 AdaLN cache. This only "
                 "supports the matching unquantized H3 checkpoint and rejects "
                 "requests whose timestep embeddings are not present in the cache."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-transport",
+            choices=("nccl", "flashinfer-pcie"),
+            default=ServerArgs.minimax_h3_ulysses_transport,
+            help=(
+                "Transport for MiniMax-H3 Ulysses scatter/gather. 'nccl' keeps "
+                "the interleaved NCCL baseline; 'flashinfer-pcie' uses "
+                "FlashInfer's explicit PCIe P2P/hybrid backend."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-strict",
+            action=StoreBoolean,
+            default=ServerArgs.minimax_h3_ulysses_strict,
+            help=(
+                "Fail MiniMax-H3 startup or the request on any FlashInfer "
+                "import, topology, capacity, geometry, registration, or "
+                "fallback problem instead of continuing on NCCL."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-max-seq-len",
+            type=int,
+            default=ServerArgs.minimax_h3_ulysses_max_seq_len,
+            help=(
+                "Largest global packed sequence registered by the MiniMax-H3 "
+                "FlashInfer transport. The default 82368 covers t2va, fl2va, "
+                "and ref2va campaign geometries."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-max-sequence-geometries",
+            type=int,
+            default=ServerArgs.minimax_h3_ulysses_max_sequence_geometries,
+            help=(
+                "Maximum distinct paired scatter/gather sequence geometries "
+                "registered for one MiniMax-H3 Ulysses group."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-direct-input-buffer",
+            action=StoreBoolean,
+            default=ServerArgs.minimax_h3_ulysses_direct_input_buffer,
+            help=(
+                "Write the MiniMax-H3 QKV projection directly into "
+                "FlashInfer's registered input buffer, avoiding its staging copy."
             ),
         )
         parser.add_argument(

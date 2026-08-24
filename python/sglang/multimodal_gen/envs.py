@@ -50,30 +50,6 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
-    # Carry the MiniMax-H3 Ulysses exchange over FlashInfer's PCIe transport
-    # instead of NCCL: copy engines inside a NUMA island, mlx5 RDMA across
-    # islands. For single nodes without NVLink. Falls back to NCCL whenever it
-    # cannot apply, and never changes the result -- both paths are bit-exact.
-    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE: bool = False
-    # distinct sequence lengths that get registered output buffers; each is
-    # four registrations held until teardown, so multi-resolution serving
-    # needs a cap, exactly as the IPC A2A staging pairs above do
-    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES: int = 4
-    # largest packed sequence this deployment will serve, which sizes the
-    # transport's registrations once. 0 means "size from the first operand
-    # seen", which is only right when every request has the same geometry --
-    # a warmup differs from its own request by its text length alone, and a
-    # capacity that does not cover both leaves the request on NCCL
-    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN: int = 0
-    # keep the qkv projection out of the transport's own operand buffer, so the
-    # exchange stages the operand as it would for any caller. Measurement knob:
-    # the only difference between the two arms is one 203.7 MB copy per layer
-    SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER: bool = False
-    # MiniMax-H3 Ulysses layout: emit [tokens, heads, 3, head_dim] from the qkv
-    # projection so the head axis is already the collective's destination-major
-    # split. Q/K/V then reach the norm, RoPE, and attention kernels as strided
-    # views and nothing is relaid out after the exchange.
-    SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED: bool = False
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -315,24 +291,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),
-    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE": _lazy_bool(
-        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE"
-    ),
-    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES": _lazy_int(
-        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES", 4
-    ),
-    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN": _lazy_int(
-        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN", 0
-    ),
-    "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER": _lazy_bool(
-        "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER"
-    ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
-    ),
-    # Head-interleaved qkv projection output for the MiniMax-H3 Ulysses path
-    "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED": _lazy_bool(
-        "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED"
     ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
