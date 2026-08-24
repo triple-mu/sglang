@@ -109,6 +109,10 @@ class FlashInferUlyssesA2A:
     def transport(self) -> str | None:
         return self._comm.transport
 
+    @property
+    def pcie_engine(self) -> str:
+        return self._comm.pcie_engine
+
     def _output(self, role: str, sample: torch.Tensor, op: str):
         """The registered exchange output for one role and operand shape.
 
@@ -314,9 +318,10 @@ class FlashInferUlyssesA2A:
         if self._exchanges == 1:
             logger.info(
                 "flashinfer ulysses carried its first exchange "
-                "(backend=%s, transport=%s, operand=%s)",
+                "(backend=%s, transport=%s, pcie_engine=%s, operand=%s)",
                 self.backend,
                 self.transport,
+                self.pcie_engine,
                 tuple(source.shape),
             )
 
@@ -340,6 +345,7 @@ def get_flashinfer_ulysses_a2a(
     *,
     strict: bool,
     max_shapes: int,
+    pcie_engine: str,
 ) -> FlashInferUlyssesA2A | None:
     """The transport for this process group, constructing it once.
 
@@ -372,7 +378,12 @@ def get_flashinfer_ulysses_a2a(
     error: BaseException | None = None
     try:
         comm = UlyssesCommunicator(
-            group, max_elems=capacity, dtype=dtype, backend="pcie", device=device
+            group,
+            max_elems=capacity,
+            dtype=dtype,
+            backend="pcie",
+            device=device,
+            pcie_engine=pcie_engine,
         )
     except BaseException as exc:  # noqa: BLE001
         error = exc
@@ -416,9 +427,10 @@ def get_flashinfer_ulysses_a2a(
     _TRANSPORTS[name] = transport
     logger.info(
         "flashinfer ulysses started for this group "
-        "(backend=%s, transport=%s, world_size=%d, capacity=%d)",
+        "(backend=%s, transport=%s, pcie_engine=%s, world_size=%d, capacity=%d)",
         transport.backend,
         transport.transport,
+        transport.pcie_engine,
         world_size,
         capacity,
     )

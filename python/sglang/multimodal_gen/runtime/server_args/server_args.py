@@ -355,6 +355,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # MiniMax-H3 Ulysses data plane. NCCL retains the head-interleaved layout
     # whenever the checkpoint format permits the row permutation.
     minimax_h3_ulysses_transport: str = "nccl"
+    # FlashInfer's PCIe execution engine. Keep legacy as the compatibility
+    # default; pipeline must be selected explicitly for auditable experiments.
+    minimax_h3_ulysses_pcie_engine: str = "legacy"
     # Refuse every FlashInfer import/topology/capacity/geometry fallback.
     minimax_h3_ulysses_strict: bool = False
     # Global packed sequence capacity shared by warmup and all request tasks.
@@ -641,6 +644,20 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "--minimax-h3-ulysses-transport must be one of "
                 f"{transports}, got {self.minimax_h3_ulysses_transport!r}"
+            )
+        pcie_engines = ("legacy", "pipeline", "auto")
+        if self.minimax_h3_ulysses_pcie_engine not in pcie_engines:
+            raise ValueError(
+                "--minimax-h3-ulysses-pcie-engine must be one of "
+                f"{pcie_engines}, got {self.minimax_h3_ulysses_pcie_engine!r}"
+            )
+        if (
+            self.minimax_h3_ulysses_pcie_engine != "legacy"
+            and self.minimax_h3_ulysses_transport != "flashinfer-pcie"
+        ):
+            raise ValueError(
+                "--minimax-h3-ulysses-pcie-engine other than 'legacy' requires "
+                "--minimax-h3-ulysses-transport=flashinfer-pcie"
             )
         if self.minimax_h3_ulysses_strict and (
             self.minimax_h3_ulysses_transport != "flashinfer-pcie"
@@ -1993,6 +2010,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Transport for MiniMax-H3 Ulysses scatter/gather. 'nccl' keeps "
                 "the interleaved NCCL baseline; 'flashinfer-pcie' uses "
                 "FlashInfer's explicit PCIe P2P/hybrid backend."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-pcie-engine",
+            choices=("legacy", "pipeline", "auto"),
+            default=ServerArgs.minimax_h3_ulysses_pcie_engine,
+            help=(
+                "FlashInfer PCIe execution engine for MiniMax-H3 Ulysses. "
+                "'legacy' is the compatibility path, 'pipeline' overlaps the "
+                "hybrid P2P/RDMA legs, and 'auto' lets FlashInfer select."
             ),
         )
         parser.add_argument(

@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_ulysses_a2a import (
     FlashInferUlyssesA2A,
     _TRANSPORTS,
+    get_flashinfer_ulysses_a2a,
     reset_flashinfer_ulysses_request_stats,
     validate_flashinfer_ulysses_request,
 )
@@ -13,6 +17,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_u
 class _FakeCommunicator:
     backend = "pcie"
     transport = "hybrid"
+    pcie_engine = "pipeline"
     device = torch.device("cpu")
 
     def __init__(self, world_size: int = 2):
@@ -67,6 +72,15 @@ class _FakeCommunicator:
             self.exchanges = 0
         return result
 
+    def preflight(self, *, strict: bool = False):
+        return {
+            "ok": True,
+            "strict": strict,
+            "backend": self.backend,
+            "transport": self.transport,
+            "pcie_engine": self.pcie_engine,
+        }
+
     def close(self):
         self.closed = True
 
@@ -99,6 +113,43 @@ def test_prepare_geometry_registers_pair_once_and_reuses_direct_input():
         ("gather_heads", (1, 8, 4, 4)),
     ]
     assert transport.stats()["registered_geometries"] == 1
+    assert transport.pcie_engine == "pipeline"
+
+
+def test_constructor_receives_explicit_pcie_engine(monkeypatch):
+    import flashinfer.comm as flashinfer_comm
+
+    captured = {}
+
+    class _FakeNativeCommunicator(_FakeCommunicator):
+        def __init__(self, group, **kwargs):
+            super().__init__(world_size=2)
+            self.device = kwargs["device"]
+            self.pcie_engine = kwargs["pcie_engine"]
+            captured.update(kwargs)
+
+    monkeypatch.setattr(flashinfer_comm, "UlyssesCommunicator", _FakeNativeCommunicator)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    group = SimpleNamespace(group_name="explicit-pipeline-engine")
+    _TRANSPORTS.clear()
+    try:
+        with torch.inference_mode():
+            transport = get_flashinfer_ulysses_a2a(
+                group,
+                torch.device("cpu"),
+                torch.float16,
+                capacity=4096,
+                strict=True,
+                max_shapes=4,
+                pcie_engine="pipeline",
+            )
+        assert transport is not None
+        assert transport.pcie_engine == "pipeline"
+        assert captured["pcie_engine"] == "pipeline"
+    finally:
+        _TRANSPORTS.clear()
 
 
 def test_exchange_pair_is_counted_and_preserves_contract_shapes():

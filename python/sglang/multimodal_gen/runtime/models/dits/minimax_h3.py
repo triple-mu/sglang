@@ -600,6 +600,7 @@ def _minimax_h3_ulysses_args():
         # a scheduler. Match ServerArgs defaults without mutating process env.
         return SimpleNamespace(
             minimax_h3_ulysses_transport="nccl",
+            minimax_h3_ulysses_pcie_engine="legacy",
             minimax_h3_ulysses_strict=False,
             minimax_h3_ulysses_max_seq_len=82368,
             minimax_h3_ulysses_max_sequence_geometries=4,
@@ -642,6 +643,7 @@ def _flashinfer_transport(attention: MiniMaxH3Attention, tokens: int) -> object 
         capacity=local_capacity * attention.num_heads * 3 * attention.head_dim,
         strict=args.minimax_h3_ulysses_strict,
         max_shapes=args.minimax_h3_ulysses_max_sequence_geometries,
+        pcie_engine=args.minimax_h3_ulysses_pcie_engine,
     )
     if transport is not None:
         transport.prepare_geometry(

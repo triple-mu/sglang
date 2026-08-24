@@ -3313,6 +3313,8 @@ class TestMiniMaxH3UlyssesArgs(unittest.TestCase):
                 "/fake",
                 "--minimax-h3-ulysses-transport",
                 "flashinfer-pcie",
+                "--minimax-h3-ulysses-pcie-engine",
+                "pipeline",
                 "--minimax-h3-ulysses-strict",
                 "--minimax-h3-ulysses-max-seq-len",
                 "82368",
@@ -3324,24 +3326,33 @@ class TestMiniMaxH3UlyssesArgs(unittest.TestCase):
         )
 
         self.assertEqual(defaults.minimax_h3_ulysses_transport, "nccl")
+        self.assertEqual(defaults.minimax_h3_ulysses_pcie_engine, "legacy")
         self.assertFalse(defaults.minimax_h3_ulysses_strict)
         self.assertEqual(defaults.minimax_h3_ulysses_max_seq_len, 82368)
         self.assertEqual(defaults.minimax_h3_ulysses_max_sequence_geometries, 4)
         self.assertTrue(defaults.minimax_h3_ulysses_direct_input_buffer)
         self.assertEqual(configured.minimax_h3_ulysses_transport, "flashinfer-pcie")
+        self.assertEqual(configured.minimax_h3_ulysses_pcie_engine, "pipeline")
         self.assertTrue(configured.minimax_h3_ulysses_strict)
         self.assertFalse(configured.minimax_h3_ulysses_direct_input_buffer)
 
     def test_validation_rejects_strict_nccl_and_nonpositive_limits(self):
         args = ServerArgs.__new__(ServerArgs)
         args.minimax_h3_ulysses_transport = "nccl"
+        args.minimax_h3_ulysses_pcie_engine = "legacy"
         args.minimax_h3_ulysses_strict = True
         args.minimax_h3_ulysses_max_seq_len = 82368
         args.minimax_h3_ulysses_max_sequence_geometries = 4
         with self.assertRaisesRegex(ValueError, "requires.*flashinfer-pcie"):
             args._validate_minimax_h3_ulysses()
 
+        args.minimax_h3_ulysses_strict = False
+        args.minimax_h3_ulysses_pcie_engine = "pipeline"
+        with self.assertRaisesRegex(ValueError, "pcie-engine.*requires"):
+            args._validate_minimax_h3_ulysses()
+
         args.minimax_h3_ulysses_transport = "flashinfer-pcie"
+        args.minimax_h3_ulysses_pcie_engine = "legacy"
         args.minimax_h3_ulysses_strict = False
         args.minimax_h3_ulysses_max_seq_len = 0
         with self.assertRaisesRegex(ValueError, "max-seq-len must be positive"):
