@@ -6,9 +6,9 @@ Ulysses backend moves the payload with copy engines rather than SM stores, and
 at world size 8 it routes the cross-NUMA half over each rank's local mlx5 NIC
 while the same-NUMA half stays on CUDA P2P.
 
-This exposes the same surface as the fast-ulysses transport beside it --
-``qkv_buffer`` / ``exchange_input`` / ``exchange_output`` -- so the attention
-core does not care which one it is talking to.
+The adapter exposes ``qkv_buffer`` / ``exchange_input`` / ``exchange_output``
+to the attention core and pre-registers each scatter/gather pair before the
+projection for that sequence geometry begins.
 
 Q/K/V travel as one operand. The projection already emits
 ``[tokens, heads, 3, head_dim]``, so the head axis carries ``3 * H`` entries and
@@ -37,7 +37,6 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -54,8 +53,6 @@ def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
     Only conditions that exist before a group does, and only ones every rank
     evaluates identically.
     """
-    if not envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE:
-        return "disabled"
     try:
         import flashinfer.comm  # noqa: F401
     except ImportError as error:
@@ -76,12 +73,21 @@ def _unusable(world_size: int, dtype: torch.dtype) -> str | None:
 class FlashInferUlyssesA2A:
     """One communicator, plus per-shape send buffers and registered outputs."""
 
-    def __init__(self, comm, world_size: int, max_shapes: int, max_elems: int) -> None:
+    def __init__(
+        self,
+        comm,
+        world_size: int,
+        max_shapes: int,
+        max_elems: int,
+        *,
+        strict: bool,
+    ) -> None:
         self._comm = comm
         self.world_size = world_size
         self.device = comm.device
         self._max_shapes = max_shapes
         self.max_elems = max_elems
+        self.strict = strict
         # Constructing a transport says nothing about whether anything routes
         # through it. An integration that silently keeps calling NCCL looks
         # exactly like one that works, so count what is actually carried and
@@ -93,6 +99,7 @@ class FlashInferUlyssesA2A:
         # Same key -> the operand buffer that output reads with no staging copy.
         self._sends: dict[tuple, torch.Tensor] = {}
         self._declined: set[tuple] = set()
+        self._geometries: set[tuple] = set()
 
     @property
     def backend(self) -> str:
@@ -118,29 +125,37 @@ class FlashInferUlyssesA2A:
             return cached
         if key in self._declined:
             return None
-        if len(self._outputs) >= self._max_shapes:
+        # Fused QKV uses one scatter and attention output one gather
+        # registration per geometry. Count geometry pairs, not individual
+        # registrations, so a budget of four really admits four request shapes.
+        if len(self._outputs) >= 2 * self._max_shapes:
             self._declined.add(key)
-            logger.info(
-                "flashinfer ulysses: %d shapes already registered, staying on NCCL for %s",
-                self._max_shapes,
-                key,
+            reason = (
+                f"{self._max_shapes} sequence geometries are already registered; "
+                f"cannot register {key}"
             )
+            if self.strict:
+                raise RuntimeError(f"flashinfer ulysses strict mode: {reason}")
+            logger.info("flashinfer ulysses: %s; staying on NCCL", reason)
             return None
         if torch.Size(source_shape).numel() > self.max_elems:
             self._declined.add(key)
-            logger.warning(
-                "flashinfer ulysses: %s exceeds the declared capacity of %d elements, "
-                "so this shape stays on NCCL. Set "
-                "SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN to the largest packed "
-                "sequence this deployment serves.",
-                key,
-                self.max_elems,
+            reason = (
+                f"{key} exceeds the declared capacity of {self.max_elems} elements; "
+                "raise --minimax-h3-ulysses-max-seq-len"
             )
+            if self.strict:
+                raise RuntimeError(f"flashinfer ulysses strict mode: {reason}")
+            logger.warning("flashinfer ulysses: %s; staying on NCCL", reason)
             return None
         try:
             out = self._comm.allocate_output(sample, op)
         except Exception as error:  # noqa: BLE001
             self._declined.add(key)
+            if self.strict:
+                raise RuntimeError(
+                    f"flashinfer ulysses strict mode: could not register {key}"
+                ) from error
             logger.warning(
                 "flashinfer ulysses: could not register %s (%s); staying on NCCL "
                 "for this shape",
@@ -150,6 +165,74 @@ class FlashInferUlyssesA2A:
             return None
         self._outputs[key] = out
         return out
+
+    def prepare_geometry(
+        self,
+        tokens: int,
+        heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        *,
+        direct_input: bool,
+    ) -> None:
+        """Collectively pre-register the paired scatter/gather workspaces."""
+        geometry = (tokens, heads, head_dim, dtype)
+        if geometry in self._geometries:
+            return
+        if len(self._geometries) >= self._max_shapes:
+            reason = f"geometry budget {self._max_shapes} exhausted before {geometry}"
+            if self.strict:
+                raise RuntimeError(f"flashinfer ulysses strict mode: {reason}")
+            logger.warning("flashinfer ulysses: %s; staying on NCCL", reason)
+            return
+
+        qkv = torch.empty(
+            (1, tokens, heads * 3, head_dim), dtype=dtype, device=self.device
+        )
+        scatter = self._output("qkv", qkv, "scatter_heads")
+        if scatter is None:
+            return
+        if direct_input:
+            try:
+                send = self._comm.allocate_input(scatter, "scatter_heads")
+            except Exception as error:  # noqa: BLE001
+                if self.strict:
+                    raise RuntimeError(
+                        "flashinfer ulysses strict mode: direct input buffer "
+                        f"allocation failed for {geometry}"
+                    ) from error
+                logger.warning(
+                    "flashinfer ulysses: direct input unavailable for %s (%s); "
+                    "using the staged path",
+                    geometry,
+                    error,
+                )
+            else:
+                self._sends[("qkv", tuple(qkv.shape), dtype)] = send
+
+        gathered_source = torch.empty(
+            (1, tokens * self.world_size, heads // self.world_size, head_dim),
+            dtype=dtype,
+            device=self.device,
+        )
+        if self._output("attn_out", gathered_source, "gather_heads") is None:
+            return
+        self._geometries.add(geometry)
+
+    def stats(self, reset: bool = False) -> dict[str, object]:
+        stats = dict(self._comm.stats(reset=reset))
+        stats.update(
+            {
+                "sglang_exchanges": self._exchanges,
+                "registered_geometries": len(self._geometries),
+                "geometry_budget": self._max_shapes,
+                "declined_geometries": len(self._declined),
+                "strict": self.strict,
+            }
+        )
+        if reset:
+            self._exchanges = 0
+        return stats
 
     # -------------------------------------------------------------- input --
     def qkv_buffer(self, tokens: int, heads: int, head_dim: int, dtype):
@@ -180,6 +263,10 @@ class FlashInferUlyssesA2A:
             try:
                 send = self._comm.allocate_input(out, "scatter_heads")
             except Exception as error:  # noqa: BLE001
+                if self.strict:
+                    raise RuntimeError(
+                        f"flashinfer ulysses strict mode: no operand buffer for {key}"
+                    ) from error
                 logger.warning(
                     "flashinfer ulysses: no operand buffer for %s (%s); this "
                     "shape keeps its staging copy",
@@ -241,11 +328,18 @@ class FlashInferUlyssesA2A:
         )
         self._sends.clear()
         self._outputs.clear()
+        self._geometries.clear()
         self._comm.close()
 
 
 def get_flashinfer_ulysses_a2a(
-    group, device: torch.device, dtype: torch.dtype, capacity: int
+    group,
+    device: torch.device,
+    dtype: torch.dtype,
+    capacity: int,
+    *,
+    strict: bool,
+    max_shapes: int,
 ) -> FlashInferUlyssesA2A | None:
     """The transport for this process group, constructing it once.
 
@@ -258,7 +352,9 @@ def get_flashinfer_ulysses_a2a(
     reason = _unusable(world_size, dtype)
     name = getattr(group, "group_name", None) or str(id(group))
     if reason is not None:
-        if reason != "disabled" and name not in _TRANSPORTS:
+        if strict:
+            raise RuntimeError(f"flashinfer ulysses strict mode: {reason}")
+        if name not in _TRANSPORTS:
             _TRANSPORTS[name] = None
             logger.info("flashinfer ulysses is unusable (%s); staying on NCCL", reason)
         return None
@@ -292,17 +388,30 @@ def get_flashinfer_ulysses_a2a(
             except Exception:  # noqa: BLE001
                 logger.exception("flashinfer ulysses: close after a failed start")
         _TRANSPORTS[name] = None
+        if strict:
+            raise RuntimeError(
+                "flashinfer ulysses strict mode: communicator construction failed"
+            ) from error
         logger.warning(
             "flashinfer ulysses could not start on some rank (%s); staying on NCCL",
             error,
         )
         return None
 
+    try:
+        comm.preflight(strict=strict)
+    except Exception:
+        # The strict world-size-8 gate is rank-invariant. Close collectively
+        # while the process group is still alive, then surface the route error.
+        comm.close()
+        raise
+
     transport = FlashInferUlyssesA2A(
         comm,
         world_size,
-        envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SHAPES,
+        max_shapes,
         capacity,
+        strict=strict,
     )
     _TRANSPORTS[name] = transport
     logger.info(
@@ -326,3 +435,41 @@ def shutdown_flashinfer_ulysses_a2a() -> None:
             transport.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("flashinfer ulysses: teardown failed for %s", name)
+
+
+def reset_flashinfer_ulysses_request_stats() -> None:
+    """Start a request-local interval without disturbing registrations."""
+    for transport in _TRANSPORTS.values():
+        if transport is not None:
+            transport.stats(reset=True)
+
+
+def validate_flashinfer_ulysses_request(
+    expected_exchanges: int, *, strict: bool
+) -> list[dict[str, object]]:
+    """Validate that every live transport carried the whole request."""
+    reports = [
+        transport.stats() for transport in _TRANSPORTS.values() if transport is not None
+    ]
+    problems = []
+    if not reports:
+        problems.append("no active FlashInfer Ulysses communicator")
+    for report in reports:
+        actual = int(report["sglang_exchanges"])
+        if actual != expected_exchanges:
+            problems.append(
+                f"rank-local exchange delta is {actual}, expected {expected_exchanges}"
+            )
+    if problems:
+        message = "MiniMax-H3 FlashInfer Ulysses request validation: " + "; ".join(
+            problems
+        )
+        if strict:
+            raise RuntimeError(message)
+        logger.warning("%s; request used an NCCL fallback", message)
+    else:
+        logger.info(
+            "MiniMax-H3 FlashInfer Ulysses request completed with %d exchanges",
+            expected_exchanges,
+        )
+    return reports

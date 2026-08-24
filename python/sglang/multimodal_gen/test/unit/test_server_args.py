@@ -785,7 +785,6 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
-
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
@@ -3124,6 +3123,60 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 fsdp_args._validate_direct_gpu_weight_loading()
             with self.assertRaisesRegex(ValueError, "tp-size 1"):
                 tp_args._validate_direct_gpu_weight_loading()
+
+
+class TestMiniMaxH3UlyssesArgs(unittest.TestCase):
+    def test_cli_defaults_and_explicit_flashinfer_configuration(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        defaults, _ = parser.parse_known_args(["--model-path", "/fake"])
+        configured, _ = parser.parse_known_args(
+            [
+                "--model-path",
+                "/fake",
+                "--minimax-h3-ulysses-transport",
+                "flashinfer-pcie",
+                "--minimax-h3-ulysses-strict",
+                "--minimax-h3-ulysses-max-seq-len",
+                "82368",
+                "--minimax-h3-ulysses-max-sequence-geometries",
+                "4",
+                "--minimax-h3-ulysses-direct-input-buffer",
+                "false",
+            ]
+        )
+
+        self.assertEqual(defaults.minimax_h3_ulysses_transport, "nccl")
+        self.assertFalse(defaults.minimax_h3_ulysses_strict)
+        self.assertEqual(defaults.minimax_h3_ulysses_max_seq_len, 82368)
+        self.assertEqual(defaults.minimax_h3_ulysses_max_sequence_geometries, 4)
+        self.assertTrue(defaults.minimax_h3_ulysses_direct_input_buffer)
+        self.assertEqual(configured.minimax_h3_ulysses_transport, "flashinfer-pcie")
+        self.assertTrue(configured.minimax_h3_ulysses_strict)
+        self.assertFalse(configured.minimax_h3_ulysses_direct_input_buffer)
+
+    def test_validation_rejects_strict_nccl_and_nonpositive_limits(self):
+        args = ServerArgs.__new__(ServerArgs)
+        args.minimax_h3_ulysses_transport = "nccl"
+        args.minimax_h3_ulysses_strict = True
+        args.minimax_h3_ulysses_max_seq_len = 82368
+        args.minimax_h3_ulysses_max_sequence_geometries = 4
+        with self.assertRaisesRegex(ValueError, "requires.*flashinfer-pcie"):
+            args._validate_minimax_h3_ulysses()
+
+        args.minimax_h3_ulysses_transport = "flashinfer-pcie"
+        args.minimax_h3_ulysses_strict = False
+        args.minimax_h3_ulysses_max_seq_len = 0
+        with self.assertRaisesRegex(ValueError, "max-seq-len must be positive"):
+            args._validate_minimax_h3_ulysses()
+
+        args.minimax_h3_ulysses_max_seq_len = 82368
+        args.minimax_h3_ulysses_max_sequence_geometries = 0
+        with self.assertRaisesRegex(
+            ValueError, "max-sequence-geometries must be positive"
+        ):
+            args._validate_minimax_h3_ulysses()
 
 
 if __name__ == "__main__":
