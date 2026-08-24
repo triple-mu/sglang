@@ -708,8 +708,8 @@ class DiffGenerator:
         if self.local_scheduler_process and self.owns_scheduler_client:
             try:
                 sync_scheduler_client.forward(ShutdownReq(), timeout_ms=5000)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Graceful scheduler shutdown request failed: %s", exc)
 
         if self.local_scheduler_process:
             for process in self.local_scheduler_process:
