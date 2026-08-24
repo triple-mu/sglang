@@ -13,6 +13,7 @@ import struct
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import ExitStack
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import torch
@@ -71,6 +72,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -583,6 +585,22 @@ def _qkv_row_order_is_free(quant_config: QuantizationConfig | None) -> bool:
     )
 
 
+def _minimax_h3_ulysses_args():
+    """Runtime Ulysses configuration, with import-safe unit-test defaults."""
+    try:
+        return get_global_server_args()
+    except ValueError:
+        # Low-level module tests construct attention directly without starting
+        # a scheduler. Match ServerArgs defaults without mutating process env.
+        return SimpleNamespace(
+            minimax_h3_ulysses_transport="nccl",
+            minimax_h3_ulysses_strict=False,
+            minimax_h3_ulysses_max_seq_len=82368,
+            minimax_h3_ulysses_max_sequence_geometries=4,
+            minimax_h3_ulysses_direct_input_buffer=True,
+        )
+
+
 def _flashinfer_transport(attention: MiniMaxH3Attention, tokens: int) -> object | None:
     """The transport for this rank's Ulysses group, or None to stay on NCCL.
 
@@ -598,14 +616,36 @@ def _flashinfer_transport(attention: MiniMaxH3Attention, tokens: int) -> object 
     group = get_sp_group().ulysses_group
     if group is None:
         return None
-    declared = envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_MAX_SEQ_LEN
-    local_tokens = max(tokens, declared // dist.get_world_size(group))
-    return get_flashinfer_ulysses_a2a(
+    args = _minimax_h3_ulysses_args()
+    declared = args.minimax_h3_ulysses_max_seq_len
+    world_size = dist.get_world_size(group)
+    local_capacity = (declared + world_size - 1) // world_size
+    if tokens > local_capacity:
+        reason = (
+            f"local sequence {tokens} exceeds the declared global capacity "
+            f"{declared} for world size {world_size}"
+        )
+        if args.minimax_h3_ulysses_strict:
+            raise RuntimeError(f"MiniMax-H3 FlashInfer Ulysses strict mode: {reason}")
+        _transport_unused(reason)
+        return None
+    transport = get_flashinfer_ulysses_a2a(
         group,
         torch.device("cuda", torch.cuda.current_device()),
         _BF16_DTYPE,
-        capacity=local_tokens * attention.num_heads * 3 * attention.head_dim,
+        capacity=local_capacity * attention.num_heads * 3 * attention.head_dim,
+        strict=args.minimax_h3_ulysses_strict,
+        max_shapes=args.minimax_h3_ulysses_max_sequence_geometries,
     )
+    if transport is not None:
+        transport.prepare_geometry(
+            tokens,
+            attention.num_heads,
+            attention.head_dim,
+            _BF16_DTYPE,
+            direct_input=args.minimax_h3_ulysses_direct_input_buffer,
+        )
+    return transport
 
 
 def _project_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
@@ -618,6 +658,8 @@ def _project_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
     linear, which is one GEMM.
     """
     torch.mm(x, layer.weight.t(), out=out)
+
+
 _ULYSSES_FALLBACKS: set[str] = set()
 
 
@@ -662,7 +704,9 @@ def _minimax_h3_attention_core_impl(
     ``fused_qkv`` is the [tokens, heads, 3, head_dim] projection output that
     ``q``/``k``/``v`` are views of, when the projection emits that layout. It
     is already the exchange's send layout, so passing it skips the pack.
-    ``transport`` carries both exchanges over FlashInfer instead of NCCL.
+    ``transport`` carries both exchanges over FlashInfer PCIe instead of NCCL.
+    It resolves to None -- returning this to NCCL outside strict mode -- on
+    conditions that are the same on every rank, so ranks never split paths.
     """
 
     if ulysses_active:
@@ -773,13 +817,10 @@ class MiniMaxH3Attention(nn.Module):
         # and attention kernels all accept. The checkpoint stores its rows in
         # exactly that per-head [q, k, v] order, so this is a row order the
         # loader keeps rather than one it has to build.
+        ulysses_args = _minimax_h3_ulysses_args()
+        row_order_free = _qkv_row_order_is_free(quant_config)
         self._qkv_interleaved = bool(
-            (
-                envs.SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED
-                or envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE
-            )
-            and _qkv_row_order_is_free(quant_config)
-            and self.total_num_heads % self.tp_size == 0
+            row_order_free and self.total_num_heads % self.tp_size == 0
         )
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
@@ -809,16 +850,25 @@ class MiniMaxH3Attention(nn.Module):
         # interleaved layout. The transport does not retain its input pointer.
         _fusable = bool(self._qkv_interleaved)
         self._flashinfer_eligible = bool(
-            envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_PCIE and _fusable
+            ulysses_args.minimax_h3_ulysses_transport == "flashinfer-pcie" and _fusable
         )
+        if (
+            ulysses_args.minimax_h3_ulysses_transport == "flashinfer-pcie"
+            and ulysses_args.minimax_h3_ulysses_strict
+            and not _fusable
+        ):
+            raise ValueError(
+                "MiniMax-H3 FlashInfer Ulysses strict mode requires a QKV "
+                "checkpoint/quantization whose output rows can use the "
+                "head-interleaved layout"
+            )
         # The FlashInfer transport can additionally hand the projection its own
         # registered buffer, which removes a 203.7 MB copy per layer. That needs
         # the projection to be one plain GEMM: quantized weights are not, so an
-        # fp8 run keeps the copy rather than losing the transport. fast-ulysses
-        # pins the caller's pointer instead and has no buffer to hand out.
+        # fp8 run keeps the copy rather than losing the transport.
         self._projects_into_buffer = bool(
             self._flashinfer_eligible
-            and not envs.SGLANG_DIFFUSION_MINIMAX_H3_ULYSSES_NO_INPUT_BUFFER
+            and ulysses_args.minimax_h3_ulysses_direct_input_buffer
             and quant_config is None
             and getattr(self.qkv_proj, "bias", None) is None
             and not self.qkv_proj.gather_output
@@ -899,8 +949,8 @@ class MiniMaxH3Attention(nn.Module):
                 # K's rows, silently, so refuse instead.
                 raise RuntimeError(
                     "head-interleaved qkv needs the dense bf16 shard copy, "
-                    "which declined this parameter; unset "
-                    "SGLANG_DIFFUSION_MINIMAX_H3_QKV_INTERLEAVED"
+                    "which declined this parameter; use a supported dense or "
+                    "online-FP8 checkpoint"
                 )
             base_loader(param, _reorder_checkpoint_weight(loaded_weight))
 
@@ -1062,8 +1112,9 @@ class MiniMaxH3Attention(nn.Module):
         total = x.shape[0]
         transport = None
         fused_qkv = None
-        if ulysses_active and not ring_active and self._flashinfer_eligible:
-            transport = _flashinfer_transport(self, total)
+        if ulysses_active and not ring_active:
+            if self._flashinfer_eligible:
+                transport = _flashinfer_transport(self, total)
         if transport is not None and self._projects_into_buffer:
             fused_qkv = transport.qkv_buffer(
                 total, self.num_heads, self.head_dim, _BF16_DTYPE

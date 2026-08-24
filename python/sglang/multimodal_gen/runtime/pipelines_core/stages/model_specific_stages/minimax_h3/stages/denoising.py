@@ -656,6 +656,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            flashinfer_requested = (
+                server_args.minimax_h3_ulysses_transport == "flashinfer-pcie"
+            )
+            if flashinfer_requested:
+                from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_ulysses_a2a import (
+                    reset_flashinfer_ulysses_request_stats,
+                )
+
+                reset_flashinfer_ulysses_request_stats()
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
@@ -706,6 +715,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         self._profile_denoising_step,
                         batch=batch,
                     ),
+                )
+            if flashinfer_requested:
+                from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_ulysses_a2a import (
+                    validate_flashinfer_ulysses_request,
+                )
+
+                validate_flashinfer_ulysses_request(
+                    len(model.blocks) * (len(sigmas_video) - 1) * 2,
+                    strict=server_args.minimax_h3_ulysses_strict,
                 )
         finally:
             self._finish_active_component_use()
