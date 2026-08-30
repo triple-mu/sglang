@@ -374,11 +374,32 @@ def _usp_input_all_to_all_packed_qkv(
             device=q.device,
         )
         for index, tensor in enumerate((q, k, v)):
-            head_shards = tensor.view(s_local, world_size, h_local, head_size).permute(
-                1, 0, 2, 3
-            )
+            # reshape: the native-row-order projection hands strided head views.
+            head_shards = tensor.reshape(
+                s_local, world_size, h_local, head_size
+            ).permute(1, 0, 2, 3)
             packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
 
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
+    q, k, v = packed.split(head_size, dim=-1)
+    return q, k, v
+
+
+def _usp_input_all_to_all_prepacked_qkv(
+    packed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange a QKV send buffer that is already destination-major.
+
+    ``packed`` is ``[world, s_local, h_local, 3*head_size]`` in the exact
+    layout ``pack_qkv_destination_major`` produces (destination w holds the
+    w-th contiguous block of heads). The MiniMax-H3 native-row-order qkv
+    projection writes this buffer directly, so only the collective and the
+    receive-side views of ``_usp_input_all_to_all_packed_qkv`` remain.
+    """
+    world_size, s_local, h_local, packed_head_size = packed.shape
+    assert world_size == get_ulysses_parallel_world_size()
+    head_size = packed_head_size // 3
     packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
     packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
     q, k, v = packed.split(head_size, dim=-1)

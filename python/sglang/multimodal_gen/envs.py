@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     MINIMAX_H3_FUSED_ADALN: bool = True
+    MINIMAX_H3_QKV_NATIVE_ORDER: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -355,6 +356,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexed scale/shift, and the gated-residual Plan B variant). Set 0 to
     # fall back to the eager norm/modulate/gate kernels.
     "MINIMAX_H3_FUSED_ADALN": _lazy_bool("MINIMAX_H3_FUSED_ADALN", "true"),
+    # Keep the MiniMax-H3 checkpoint's per-head [q|k|v] qkv row interleave
+    # resident and write the Ulysses A2A send buffer directly from one qkv
+    # GEMM per destination rank (the destination-major pack kernel becomes a
+    # no-op). bf16 unquantized DiT with tp=1 only; quant/LoRA/TP fail closed.
+    "MINIMAX_H3_QKV_NATIVE_ORDER": _lazy_bool("MINIMAX_H3_QKV_NATIVE_ORDER"),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
     # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers

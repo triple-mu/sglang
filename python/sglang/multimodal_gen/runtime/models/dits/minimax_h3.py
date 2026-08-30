@@ -569,21 +569,30 @@ def _minimax_h3_attention_core_impl(
     ulysses_active: bool,
     subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
+    prepacked_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
     This is the narrow BCG break point: projections, normalization, RoPE,
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
+
+    ``prepacked_qkv`` is the destination-major send buffer written directly by
+    the native-row-order qkv projection; q/k/v are None in that case and the
+    pack step is skipped.
     """
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_input_all_to_all_packed_qkv,
+            _usp_input_all_to_all_prepacked_qkv,
             _usp_output_all_to_all,
         )
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if prepacked_qkv is not None:
+            q, k, v = _usp_input_all_to_all_prepacked_qkv(prepacked_qkv)
+        else:
+            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -709,7 +718,17 @@ class MiniMaxH3Attention(nn.Module):
         checkpoint_qkv_is_native = (
             checkpoint_qkv_is_native or arch.checkpoint_uses_diffusers_layout
         )
-        if not checkpoint_qkv_is_native:
+        self._qkv_rows_interleaved = False
+        if checkpoint_qkv_is_native:
+            if envs.MINIMAX_H3_QKV_NATIVE_ORDER:
+                raise ValueError(
+                    "MINIMAX_H3_QKV_NATIVE_ORDER applies to the official "
+                    "interleaved qkv checkpoints only; this checkpoint already "
+                    "stores [q_all, k_all, v_all] rows."
+                )
+        elif envs.MINIMAX_H3_QKV_NATIVE_ORDER:
+            self._install_qkv_native_order(quant_config)
+        else:
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
@@ -799,6 +818,167 @@ class MiniMaxH3Attention(nn.Module):
             if name == "weight":
                 continue
             _install_qkv_row_reorder(param, _reorder_checkpoint_weight, qkv_rows)
+
+    def _install_qkv_native_order(
+        self, quant_config: QuantizationConfig | None
+    ) -> None:
+        """Keep the checkpoint's per-head [q|k|v] qkv row interleave resident.
+
+        The interleaved rows are already the destination-major Ulysses send
+        layout: destination w's [T, h_local, 3*head_dim] slab is the w-th
+        contiguous row block of the weight, so the projection can write the
+        A2A send buffer directly and the pack kernel becomes a no-op.
+        Everything that assumes the reordered [q_all, k_all, v_all] layout
+        fails closed here: quantized checkpoints (row-indexed scale metadata
+        moves with the reorder), TP sharding (rows are sliced per logical
+        Q/K/V matrix), and non-CUDA platforms (the MPS streamed path splits
+        contiguous Q/K/V segments). LoRA adapters are rejected at conversion
+        time via the weight marker read by the LoRA pipeline.
+        """
+        if not current_platform.is_cuda():
+            raise ValueError("MINIMAX_H3_QKV_NATIVE_ORDER requires a CUDA platform.")
+        if quant_config is not None:
+            raise ValueError(
+                "MINIMAX_H3_QKV_NATIVE_ORDER does not support quantized "
+                f"checkpoints (quantization={quant_config.get_name()!r}); "
+                "row-indexed scale metadata assumes the reordered layout."
+            )
+        if self.tp_size > 1:
+            raise ValueError(
+                "MINIMAX_H3_QKV_NATIVE_ORDER requires DiT tp_size == 1, got "
+                f"{self.tp_size}."
+            )
+        self._qkv_rows_interleaved = True
+        self.qkv_proj.weight.qkv_rows_interleaved = True
+
+    def _fused_qknorm_rope_inplace(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        fused_inplace_qknorm_rope(
+            q,
+            k,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=self.q_norm.eps,
+            head_dim=self.head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+            round_norm_before_rope=True,
+        )
+
+    def _project_qkv_interleaved(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        ulysses_active: bool,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Project qkv with the checkpoint's per-head [q|k|v] rows resident.
+
+        Returns ``(q, k, v, prepacked)``. On the Ulysses dual-slab path the
+        projection writes the destination-major A2A send buffer directly and
+        norm+RoPE run in place on its interleaved views; q/k/v are None and
+        ``prepacked`` is that buffer. Otherwise q/k/v are [T, heads, head_dim]
+        views with head stride 3*head_dim -- the same stride pattern every
+        attention backend already receives after the Ulysses exchange.
+        """
+        total = x.shape[0]
+        world, _ = get_ulysses_ctx() if ulysses_active else (1, 0)
+        fused_rope_ready = (
+            rope_cache is not None
+            and self._use_fused_qknorm_rope
+            and not torch.compiler.is_compiling()
+        )
+        if (
+            world > 1
+            and fused_rope_ready
+            and x.is_cuda
+            and x.dtype is _BF16_DTYPE
+            and self.num_heads % world == 0
+            and not torch.is_grad_enabled()
+            # The captured GEMM would bake the grow-only staging buffer's
+            # address into the graph; capture keeps the pack-kernel path.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            cos_sin_cache, positions = rope_cache
+            packed = self._project_qkv_dual_slab(
+                x, cos_sin_cache=cos_sin_cache, positions=positions, world=world
+            )
+            return None, None, None, packed
+
+        qkv, _ = self.qkv_proj(x)
+        heads = qkv.view(total, self.num_heads, 3 * self.head_dim)
+        q = heads[..., : self.head_dim]
+        k = heads[..., self.head_dim : 2 * self.head_dim]
+        v = heads[..., 2 * self.head_dim :]
+        if rope_cache is None:
+            q, k = _apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
+        elif fused_rope_ready:
+            cos_sin_cache, positions = rope_cache
+            self._fused_qknorm_rope_inplace(q, k, cos_sin_cache, positions)
+        else:
+            cos_sin_cache, positions = rope_cache
+            q, k = _apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
+            q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
+        return q, k, v, None
+
+    def _project_qkv_dual_slab(
+        self,
+        x: torch.Tensor,
+        *,
+        cos_sin_cache: torch.Tensor,
+        positions: torch.Tensor,
+        world: int,
+    ) -> torch.Tensor:
+        """qkv projection written directly as the Ulysses send buffer.
+
+        One [T, qkv_rows/world] GEMM per destination rank into the contiguous
+        [world, T, h_local, 3*head_dim] staging buffer; splitting the GEMM N
+        dimension keeps each output element's K reduction unchanged, so the
+        buffer is bit-equal to pack_qkv_destination_major over the single-GEMM
+        projection (verified on H200). Norm+RoPE then run in place per slab on
+        the interleaved head views.
+        """
+        from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
+
+        total = x.shape[0]
+        head_dim = self.head_dim
+        h_local = self.num_heads // world
+        slab_rows = 3 * h_local * head_dim
+        weight = self.qkv_proj.weight
+        packed = _a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world, total, h_local, 3 * head_dim),
+            x.dtype,
+            x.device,
+        )
+        slabs = packed.view(world, total, slab_rows)
+        for dest in range(world):
+            torch.mm(
+                x,
+                weight[dest * slab_rows : (dest + 1) * slab_rows].t(),
+                out=slabs[dest],
+            )
+        for dest in range(world):
+            slab = packed[dest]
+            self._fused_qknorm_rope_inplace(
+                slab[..., :head_dim],
+                slab[..., head_dim : 2 * head_dim],
+                cos_sin_cache,
+                positions,
+            )
+        return packed
 
     def _forward_mps_streamed_attention(
         self,
@@ -934,36 +1114,18 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_heads, self.head_dim)
-        v = v.view(total, self.num_heads, self.head_dim)
-        if rope_cache is None:
-            q, k = _apply_qk_norm(
-                q,
-                k,
-                self.q_norm,
-                self.k_norm,
-                self.head_dim,
+        prepacked_qkv = None
+        if self._qkv_rows_interleaved:
+            q, k, v, prepacked_qkv = self._project_qkv_interleaved(
+                x, rope_cache=rope_cache, ulysses_active=ulysses_active
             )
         else:
-            cos_sin_cache, positions = rope_cache
-            if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
-                fused_inplace_qknorm_rope(
-                    q,
-                    k,
-                    self.q_norm.weight,
-                    self.k_norm.weight,
-                    cos_sin_cache,
-                    positions,
-                    is_neox=True,
-                    eps=self.q_norm.eps,
-                    head_dim=self.head_dim,
-                    rope_dim=cos_sin_cache.shape[-1],
-                    round_norm_before_rope=True,
-                )
-            else:
+            qkv, _ = self.qkv_proj(x)
+            q, k, v = qkv.split(self.local_inner_dim, dim=-1)
+            q = q.view(total, self.num_heads, self.head_dim)
+            k = k.view(total, self.num_heads, self.head_dim)
+            v = v.view(total, self.num_heads, self.head_dim)
+            if rope_cache is None:
                 q, k = _apply_qk_norm(
                     q,
                     k,
@@ -971,7 +1133,19 @@ class MiniMaxH3Attention(nn.Module):
                     self.k_norm,
                     self.head_dim,
                 )
-                q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
+            else:
+                cos_sin_cache, positions = rope_cache
+                if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
+                    self._fused_qknorm_rope_inplace(q, k, cos_sin_cache, positions)
+                else:
+                    q, k = _apply_qk_norm(
+                        q,
+                        k,
+                        self.q_norm,
+                        self.k_norm,
+                        self.head_dim,
+                    )
+                    q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
         attention_core = (
             _minimax_h3_attention_core_bcg
@@ -989,6 +1163,7 @@ class MiniMaxH3Attention(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            prepacked_qkv=prepacked_qkv,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
