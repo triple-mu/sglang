@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 
+from .decoder_cuda_graph import DecoderTileCudaGraphRunner
 from .processor import VAEProcessor, get_norm_constants
 from .vae_cnn import EncoderFCN3D
 from .vae_vit import ViT3DDecoder
@@ -1294,6 +1295,11 @@ class AutoencoderKLLegacy(AutoencoderKL):
         vit_kwargs.setdefault("patch_size_t", self.vae_ratio_t)
         vit_kwargs.setdefault("t_causal", causal_decoder)
         self.decoder = ViT3DDecoder(**vit_kwargs)
+        # Tiled decode repeats one fixed-shape ViT forward per tile; the
+        # runner replays it as a CUDA graph after first-sight verification.
+        self._decoder_graph_runner = DecoderTileCudaGraphRunner(
+            decoder=self.decoder, offload_owner=self
+        )
 
         # State-dict markers so already-folded dumps are not folded twice.
         self.register_buffer(
@@ -1362,7 +1368,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
     def decode(self, z):
         # post_quant_conv is folded into decoder.x_embedder at checkpoint load.
         self._require_folded_weights()
-        return self.decoder(z)
+        return self._decoder_graph_runner.run(z)
 
     def encode_base(self, input, process_image=False):
         if self.use_3d_conv and input.ndim == 4:

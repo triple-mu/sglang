@@ -220,6 +220,9 @@ class ViT3DDecoder(ViTBase):
 
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        # Bumped whenever parameter storages may have been re-materialized;
+        # the decoder CUDA graph runner drops captures from older epochs.
+        self._graph_epoch = 0
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
@@ -228,6 +231,7 @@ class ViT3DDecoder(ViTBase):
         result = super()._apply(fn, recurse=recurse)
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        self._graph_epoch += 1
         return result
 
     def prepare_autocast_linear_weights(self, dtype: torch.dtype) -> int:
@@ -260,6 +264,10 @@ class ViT3DDecoder(ViTBase):
                 if linear.weight.dtype != dtype:
                     linear.to(dtype=dtype)
                     converted += 1
+        if converted:
+            # Submodule .to() bypasses this module's _apply override, but the
+            # replaced weight storages equally invalidate captured graphs.
+            self._graph_epoch += 1
         self._autocast_linear_dtype = dtype
         return converted
 
