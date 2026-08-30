@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -1520,7 +1521,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        adaln_input: torch.Tensor,
+        adaln_input: torch.Tensor | None,
         combined_indices: torch.Tensor,
         rope_cache: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor,
@@ -1634,21 +1635,66 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.audio_out",
         )
+        self._merged_out_key: tuple[int, ...] | None = None
+        self._merged_out_weight: torch.Tensor | None = None
+        self._merged_out_bias: torch.Tensor | None = None
+
+    def _merged_out_params(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Concatenated [video|audio] head params for the single-GEMM path.
+
+        Only plain unquantized heads qualify: a LoRA (or any other) wrapper
+        owns the projection math, so the two-GEMM path stays authoritative
+        there. The cache key tracks each tensor's storage pointer and in-place
+        version, so weight reloads, device moves, and in-place merges rebuild
+        the concat instead of leaving it stale.
+        """
+        video_out = self.video_out
+        audio_out = self.audio_out
+        if (
+            type(video_out) is not ColumnParallelLinear
+            or type(audio_out) is not ColumnParallelLinear
+        ):
+            return None
+        if not isinstance(
+            video_out.quant_method, UnquantizedLinearMethod
+        ) or not isinstance(audio_out.quant_method, UnquantizedLinearMethod):
+            return None
+        params = (video_out.weight, video_out.bias, audio_out.weight, audio_out.bias)
+        if any(isinstance(param, DTensor) for param in params):
+            return None
+        key = tuple(
+            value for param in params for value in (param.data_ptr(), param._version)
+        )
+        if key != self._merged_out_key:
+            self._merged_out_weight = torch.cat(
+                (video_out.weight.detach(), audio_out.weight.detach()), dim=0
+            )
+            self._merged_out_bias = torch.cat(
+                (video_out.bias.detach(), audio_out.bias.detach()), dim=0
+            )
+            self._merged_out_key = key
+        return self._merged_out_weight, self._merged_out_bias
 
     def forward(
         self,
         x: torch.Tensor,
         *,
-        adaln_input: torch.Tensor,
+        adaln_input: torch.Tensor | None,
         inverse_indices: torch.Tensor,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Project all rows into TP-local video/audio output shards.
 
         Apply single-modality shift/scale AdaLN to the final normalized
         activations, cast to fp32, then apply both output heads to all rows.
         The model gathers output columns only after selecting live media rows,
         preserving the GEMM shape while reducing collective payload.
+
+        Returns (video, audio, merged): with plain unwrapped heads both
+        projections run as one concatenated GEMM, video/audio are column views
+        of ``merged`` (already the ``cat((video, audio), -1)`` layout), and
+        callers needing the concatenation reuse ``merged``; otherwise merged
+        is None and the two-GEMM path is authoritative.
         """
         if adaln_params is None:
             if self.adaln_proj is None:
@@ -1686,14 +1732,26 @@ class MiniMaxH3FinalLayer(nn.Module):
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
             assert video is not None and audio is not None
-            return video, audio
+            return video, audio, None
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
-        video, _ = self.video_out(h)
-        audio, _ = self.audio_out(h)
-        return video, audio
+        merged_params = self._merged_out_params()
+        if merged_params is None:
+            video, _ = self.video_out(h)
+            audio, _ = self.audio_out(h)
+            return video, audio, None
+        merged_weight, merged_bias = merged_params
+        merged = nn.functional.linear(h, merged_weight, merged_bias)
+        video, audio = merged.split(
+            (
+                self.video_out.output_size_per_partition,
+                self.audio_out.output_size_per_partition,
+            ),
+            dim=-1,
+        )
+        return video, audio, merged
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
@@ -2210,6 +2268,30 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.release_mps_non_layer_weights("rope")
         return result
 
+    def _write_projected_latent_rows(
+        self,
+        embeddings: torch.Tensor,
+        *,
+        latents: torch.Tensor,
+        proj: nn.Module,
+        global_ids: torch.Tensor,
+        row_ids: torch.Tensor,
+        accumulate: bool = False,
+    ) -> None:
+        """Project selected latent rows and scatter them into the shard buffer."""
+        if row_ids.numel() == 0:
+            return
+        # latent embedders stay fp32; only rows owned by this SP rank are
+        # projected, then cast during scattering into the bf16 sequence
+        rows = (
+            latents.view(-1, latents.shape[-1])
+            .index_select(0, global_ids)
+            .to(_FP32_DTYPE)
+        )
+        projected, _ = proj(rows)
+        write_rows = embeddings.index_add_ if accumulate else embeddings.index_copy_
+        write_rows(0, row_ids, projected.to(_BF16_DTYPE))
+
     @eager_on_graph(True)
     def _embed(
         self,
@@ -2227,12 +2309,42 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         row_stop: int,
         device: torch.device,
         refined_prompt_embeds_length: int | torch.Tensor | None = None,
-        local_embedding_layout: dict[str, torch.Tensor | int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        local_embedding_layout: dict[str, Any] | None = None,
+        skip_time_embedding: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Build embeddings for one contiguous block-stack row shard.
 
         Returns (decoder_input [S_local, H] bf16, t_emb [M, t_dim] fp32).
+        t_emb is None with ``skip_time_embedding`` (resident AdaLN cache: every
+        consumer reads cached params, so the embedding would be dead compute).
         """
+        t_emb = None if skip_time_embedding else self._time_embedding(unique_timesteps)
+        embed_cache = (
+            None
+            if local_embedding_layout is None
+            else local_embedding_layout.get("embedding_cache")
+        )
+        embeddings = None if embed_cache is None else embed_cache.get("embeddings")
+        if embeddings is not None:
+            # Post-priming steps: text/condition/reference rows and the zero
+            # padding tail persist from the priming forward; only target rows
+            # of x/audio_x change per step (the denoise loop's x_buffer
+            # priming contract), so only their projections are refreshed.
+            self._write_projected_latent_rows(
+                embeddings,
+                latents=x,
+                proj=self.video_patch_proj,
+                global_ids=local_embedding_layout["img_target_global_ids"],
+                row_ids=local_embedding_layout["img_target_row_ids"],
+            )
+            self._write_projected_latent_rows(
+                embeddings,
+                latents=audio_x,
+                proj=self.audio_patch_proj,
+                global_ids=local_embedding_layout["audio_target_global_ids"],
+                row_ids=local_embedding_layout["audio_target_row_ids"],
+            )
+            return embeddings, t_emb
         # BCG pads the prompt tensor only to stabilize its input signature.
         # Raw-input callers recover the live length from refiner metadata;
         # request-static refined inputs carry it as a host integer and avoid a
@@ -2332,33 +2444,25 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 text_embed.index_select(0, text_source_ids).to(_BF16_DTYPE),
             )
 
-        # latent embedders stay fp32; only rows owned by this SP rank are
-        # projected, then cast during scattering into the bf16 sequence
-        if img_row_ids.numel():
-            x_rows = (
-                x.view(-1, x.shape[-1]).index_select(0, img_global_ids).to(_FP32_DTYPE)
-            )
-            video_embed, _ = self.video_patch_proj(x_rows)
-            write_rows(
-                0,
-                img_row_ids,
-                video_embed.to(_BF16_DTYPE),
-            )
+        self._write_projected_latent_rows(
+            embeddings,
+            latents=x,
+            proj=self.video_patch_proj,
+            global_ids=img_global_ids,
+            row_ids=img_row_ids,
+            accumulate=not trusted_layout,
+        )
+        self._write_projected_latent_rows(
+            embeddings,
+            latents=audio_x,
+            proj=self.audio_patch_proj,
+            global_ids=audio_global_ids,
+            row_ids=audio_row_ids,
+            accumulate=not trusted_layout,
+        )
 
-        if audio_row_ids.numel():
-            audio_rows = (
-                audio_x.view(-1, audio_x.shape[-1])
-                .index_select(0, audio_global_ids)
-                .to(_FP32_DTYPE)
-            )
-            audio_embed, _ = self.audio_patch_proj(audio_rows)
-            write_rows(
-                0,
-                audio_row_ids,
-                audio_embed.to(_BF16_DTYPE),
-            )
-
-        t_emb = self._time_embedding(unique_timesteps)
+        if embed_cache is not None:
+            embed_cache["embeddings"] = embeddings
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2522,14 +2626,20 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             device=device,
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
+            skip_time_embedding=self.adaln_cache is not None,
         )
         self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
-        # request-step AdaLN input shared by all blocks
-        adaln_input = (
-            t_emb
-            if self.adaln_t_table is not None
-            else nn.functional.silu(t_emb).to(_BF16_DTYPE)
-        )
+        # request-step AdaLN input shared by all blocks; None with a resident
+        # AdaLN cache, whose consumers only need the unique-timestep count
+        if t_emb is None:
+            adaln_input = None
+        else:
+            adaln_input = (
+                t_emb
+                if self.adaln_t_table is not None
+                else nn.functional.silu(t_emb).to(_BF16_DTYPE)
+            )
+        num_unique_timesteps = int(unique_timesteps.view(-1).shape[0])
         inverse_indices = inverse_indices.to(device)
         block_inverse = inverse_indices[row_start:row_stop]
         if block_token_tags is None:
@@ -2563,7 +2673,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 self.adaln_cache.block(
                     index,
                     adaln_cache_plan_index,
-                    adaln_input.shape[0],
+                    num_unique_timesteps,
                 )
                 for index in range(len(self.blocks))
             )
@@ -2598,7 +2708,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 ),
             )
         self.materialize_mps_non_layer_weights("final_layer")
-        video_logits, audio_logits = self.final_layer(
+        video_logits, audio_logits, merged_logits = self.final_layer(
             hidden,
             adaln_input=adaln_input,
             inverse_indices=block_inverse,
@@ -2607,7 +2717,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 if adaln_cache_plan_index is None
                 else self.adaln_cache.final(
                     adaln_cache_plan_index,
-                    adaln_input.shape[0],
+                    num_unique_timesteps,
                 )
             ),
         )
@@ -2618,9 +2728,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
 
             video_width = video_logits.shape[-1]
-            logits = get_sp_group().all_gather(
-                torch.cat((video_logits, audio_logits), dim=-1), dim=0
-            )
+            if merged_logits is None:
+                merged_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            logits = get_sp_group().all_gather(merged_logits, dim=0)
             video_logits, audio_logits = logits.split(
                 (video_width, logits.shape[-1] - video_width), dim=-1
             )

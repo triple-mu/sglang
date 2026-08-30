@@ -98,19 +98,15 @@ def _minimax_h3_update_target_rows_(
     state: torch.Tensor,
     velocity: torch.Tensor,
     *,
-    sigma_t: torch.Tensor,
     sigma_curr: float,
-    sigma_ratio: torch.Tensor,
-    one_minus_sigma_ratio: torch.Tensor,
-    denoised_scratch: torch.Tensor,
+    sigma_next: float,
 ) -> None:
-    torch.mul(sigma_t, velocity, out=denoised_scratch)
-    torch.add(state, denoised_scratch, out=denoised_scratch)
+    # Euler eta0 collapse: r*x + (1-r)*(x + sigma_c*v) = x + (sigma_c-sigma_n)*v
+    # with r = sigma_n/sigma_c; the coefficient is host float64 math. A zero
+    # sigma_curr kept the state untouched on the expanded form too.
     if sigma_curr == 0.0:
         return
-    torch.mul(one_minus_sigma_ratio, denoised_scratch, out=velocity)
-    torch.mul(sigma_ratio, state, out=state)
-    torch.add(state, velocity, out=state)
+    state.add_(velocity, alpha=float(sigma_curr) - float(sigma_next))
 
 
 def _build_local_embedding_layout(
@@ -122,7 +118,9 @@ def _build_local_embedding_layout(
     world_size: int,
     rank: int,
     device: torch.device,
-) -> dict[str, torch.Tensor | int]:
+    img_update_mask: torch.Tensor | None = None,
+    audio_update_mask: torch.Tensor | None = None,
+) -> dict[str, Any]:
     if seq_len % world_size:
         raise ValueError(
             f"packed seq_len {seq_len} not divisible by the combined "
@@ -137,20 +135,35 @@ def _build_local_embedding_layout(
             (pos >= row_start) & (pos < row_stop),
             as_tuple=False,
         ).view(-1)
-        return source_ids.to(device), pos.index_select(0, source_ids).to(device)
+        return source_ids, pos.index_select(0, source_ids)
 
     text_source_start = min(row_start, int(text_pos.shape[0]))
     text_source_stop = min(row_stop, int(text_pos.shape[0]))
-    _, img_global_ids = local_ids(img_pos)
-    _, audio_global_ids = local_ids(audio_pos)
-    return {
+    img_source_ids, img_global_ids = local_ids(img_pos)
+    audio_source_ids, audio_global_ids = local_ids(audio_pos)
+    layout: dict[str, Any] = {
         "text_source_start": text_source_start,
         "text_source_stop": text_source_stop,
-        "img_global_ids": img_global_ids,
-        "img_row_ids": img_global_ids - row_start,
-        "audio_global_ids": audio_global_ids,
-        "audio_row_ids": audio_global_ids - row_start,
+        "img_global_ids": img_global_ids.to(device),
+        "img_row_ids": (img_global_ids - row_start).to(device),
+        "audio_global_ids": audio_global_ids.to(device),
+        "audio_row_ids": (audio_global_ids - row_start).to(device),
     }
+    if img_update_mask is None or audio_update_mask is None:
+        return layout
+    img_target = img_update_mask.view(-1).to(torch.bool)[img_source_ids]
+    audio_target = audio_update_mask.view(-1).to(torch.bool)[audio_source_ids]
+    layout["img_target_global_ids"] = img_global_ids[img_target].to(device)
+    layout["img_target_row_ids"] = (img_global_ids[img_target] - row_start).to(device)
+    layout["audio_target_global_ids"] = audio_global_ids[audio_target].to(device)
+    layout["audio_target_row_ids"] = (audio_global_ids[audio_target] - row_start).to(
+        device
+    )
+    # Per-request slot for the model's persistent decoder-input buffer; after
+    # the priming forward, _embed rewrites only the target rows above because
+    # text/condition/reference rows of x/audio_x never change post-priming.
+    layout["embedding_cache"] = {}
+    return layout
 
 
 class MiniMaxH3DenoiseBranch:
@@ -288,6 +301,8 @@ class MiniMaxH3DenoiseBranch:
                 world_size=sp_world_size,
                 rank=sp_rank,
                 device=device,
+                img_update_mask=self.update_mask,
+                audio_update_mask=self.audio_update_mask,
             ),
             "packed_seq_params": {
                 "cu_seqlens_q": cu.to(device),
@@ -517,10 +532,6 @@ def minimax_h3_denoise_loop(
     audio_target_slice = positive.audio_target_slice
     video_timesteps = [1.0 - sigma for sigma in sigmas_video[:-1]]
     audio_timesteps = [1.0 - sigma for sigma in sigmas_audio[:-1]]
-    # One H2D copy per schedule, preserving the previous Python-float
-    # subtraction followed by fp32 conversion.
-    video_step_t = torch.tensor(video_timesteps, dtype=torch.float32, device=device)
-    audio_step_t = torch.tensor(audio_timesteps, dtype=torch.float32, device=device)
     timestep_plan = positive.prepare_timestep_plan(
         video_timesteps=video_timesteps,
         audio_timesteps=audio_timesteps,
@@ -532,18 +543,6 @@ def minimax_h3_denoise_loop(
     # one pass here instead of topping up step by step inside the loop.
     model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
 
-    # match the scheduler's device-fp32 math once, then reuse one denoised
-    # scratch per modality instead of allocating intermediates every step
-    video_sigmas = torch.tensor(sigmas_video, dtype=torch.float32, device=device)
-    audio_sigmas = torch.tensor(sigmas_audio, dtype=torch.float32, device=device)
-    video_sigma_ratios = video_sigmas[1:] / video_sigmas[:-1]
-    audio_sigma_ratios = audio_sigmas[1:] / audio_sigmas[:-1]
-    video_sigma_t = 1.0 - video_step_t
-    audio_sigma_t = 1.0 - audio_step_t
-    video_one_minus_sigma_ratios = 1.0 - video_sigma_ratios
-    audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
-    video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
-    audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
@@ -560,32 +559,20 @@ def minimax_h3_denoise_loop(
                     v_video, v_audio = model(**fk)
                 else:
                     v_video, v_audio = model_forward(model, fk, step)
-                # The model outputs are inference tensors. Keep their disposable
-                # fp32 velocity updates in the same context so ``out=velocity``
-                # can reuse the output storage without an extra clone.
                 mv_video_t = v_video.float()
                 mv_audio_t = v_audio[audio_target_slice].float()
 
-                video_target = video_rows[video_target_slice]
                 _minimax_h3_update_target_rows_(
-                    video_target,
+                    video_rows[video_target_slice],
                     mv_video_t,
-                    sigma_t=video_sigma_t[step],
                     sigma_curr=s_v,
-                    sigma_ratio=video_sigma_ratios[step],
-                    one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
-                    denoised_scratch=video_denoised_scratch,
+                    sigma_next=sigmas_video[step + 1],
                 )
-
-                audio_target = audio_rows[audio_target_slice]
                 _minimax_h3_update_target_rows_(
-                    audio_target,
+                    audio_rows[audio_target_slice],
                     mv_audio_t,
-                    sigma_t=audio_sigma_t[step],
                     sigma_curr=s_a,
-                    sigma_ratio=audio_sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
-                    denoised_scratch=audio_denoised_scratch,
+                    sigma_next=sigmas_audio[step + 1],
                 )
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
