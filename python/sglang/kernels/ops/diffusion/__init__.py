@@ -299,6 +299,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Sana-WM bidirectional gated delta-net.",
     ),
     (
+        "diffusion.per_head_quant_fp8",
+        KernelBackend.TRITON,
+        "attention.per_head_quant_fp8_triton:per_head_quant_fp8",
+        _CUDA,
+        "Per-head dynamic FP8 e4m3 quant for FA3 fp8 attention inputs.",
+    ),
+    (
         "diffusion.usp_merge_heads",
         KernelBackend.JIT,
         "layout.usp_relayout_jit:usp_merge_heads",
@@ -481,6 +488,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_silu_mul_per_token_quant_fp8": "activation.silu_mul_quant_triton",
     "fused_silu_mul_per_token_quant_fp8": "activation.silu_mul_quant_triton",
     # Diffusion attention kernels
+    "can_use_per_head_quant_fp8": "attention.per_head_quant_fp8_triton",
+    "per_head_quant_fp8": "attention.per_head_quant_fp8_triton",
     "cam_scan_bidi_chunkwise": "attention.sana_wm_gdn_chunkwise_triton",
     "fused_bigdn_func": "attention.sana_wm_gdn_triton",
     "fused_qk_inv_rms": "attention.sana_wm_gdn_triton",

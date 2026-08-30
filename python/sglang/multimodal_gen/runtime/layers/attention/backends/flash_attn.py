@@ -458,6 +458,9 @@ class FlashAttentionImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
         out: torch.Tensor | None = None,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
         output = flash_attn_varlen_func(
@@ -470,6 +473,11 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            # fp8 e4m3 q/k/v with one fp32 descale per (segment, head);
+            # the kernel's output dtype stays bf16.
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             ver=fa_ver,
             out=out,
         )

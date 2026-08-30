@@ -10,7 +10,14 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.kernels.ops.diffusion import (
+    can_use_merge_two_sources_per_token_quant_fp8,
+    can_use_usp_merge_heads_per_token_quant_fp8,
+    merge_two_sources_per_token_quant_fp8,
+    pack_qkv_destination_major,
+    usp_merge_heads,
+    usp_merge_heads_per_token_quant_fp8,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -700,6 +707,91 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
 
     return x
+
+
+def _ipc_output_merge_quant_fp8(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """2-rank IPC output exchange fused with per-token FP8 quantization.
+
+    Mirrors ``_ipc_varlen_fast(x[None], [half, half], 2, "output")`` except
+    that the local head half is never copied into the staging: after the
+    NVLink write + wait, one kernel quantizes straight from (local FA3 rows,
+    peer-written staging half) in output-column order. Payload and scale are
+    bitwise equal to quantizing the legacy merged bf16 rows. None when the
+    transport or an eligible slot is unavailable; every eligibility check runs
+    before ``next_slot`` so a bail-out never desyncs the slot sequence.
+    """
+    s_global, h_local, d = x.shape
+    if s_global % 2 or not x.is_contiguous():
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    half = s_global // 2
+    r = IPC_A2A.rank
+    inner = h_local * d
+    mine = x.narrow(0, r * half, half).view(half, inner)
+    n = half * 2 * inner
+    pair = IPC_A2A.get_staging(n, n, x.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
+    slot = IPC_A2A.next_slot()
+    pst = peer[slot].narrow(0, 0, n).view(half, 2 * h_local, d)
+    pst[:, r * h_local : (r + 1) * h_local].copy_(
+        x.narrow(0, (1 - r) * half, half), non_blocking=True
+    )
+    IPC_A2A.signal()
+    IPC_A2A.wait()
+    theirs = (
+        local[slot]
+        .narrow(0, 0, n)
+        .view(half, 2 * h_local, d)[:, (1 - r) * h_local : (2 - r) * h_local]
+        .view(half, inner)
+    )
+    first, second = (mine, theirs) if r == 0 else (theirs, mine)
+    return merge_two_sources_per_token_quant_fp8(first, second)
+
+
+def _usp_output_all_to_all_quant_fp8(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Ulysses output exchange fused with per-token FP8 quantization.
+
+    ``x`` is one rank's attention output ``[s_global, h_local, d]`` (the 3D
+    form ``_usp_output_all_to_all(x[None], head_dim=2)[0]`` consumes).
+    Returns ``(payload, scale)`` with ``payload`` fp8 ``[s_local,
+    world*h_local*d]`` and ``scale`` fp32 ``[s_local, 1]`` -- out_proj's
+    pre-quantized input -- bitwise equal to running the bf16 exchange and
+    ``sgl_per_token_quant_fp8`` separately. None when the fused form does not
+    apply; callers then run the unfused exchange.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1 or torch.compiler.is_compiling():
+        return None
+    if not x.is_cuda or x.dtype is not torch.bfloat16 or x.ndim != 3:
+        return None
+    s_global, h_local, d = x.shape
+    if s_global % world_size:
+        return None
+
+    if world_size == 2 and s_global % 2 == 0 and x.is_contiguous():
+        mine = x.narrow(0, 0, s_global // 2).view(s_global // 2, h_local * d)
+        if can_use_merge_two_sources_per_token_quant_fp8(mine, mine):
+            fused = _ipc_output_merge_quant_fp8(x)
+            if fused is not None:
+                return fused
+
+    recv = _usp_all_to_all_single(x.reshape(s_global, 1, h_local, d), role="usp_output")
+    recv = recv.reshape(world_size, s_global // world_size, 1, h_local, d)
+    if not can_use_usp_merge_heads_per_token_quant_fp8(recv):
+        return None
+    return usp_merge_heads_per_token_quant_fp8(recv)
 
 
 def _usp_output_all_to_all_varlen(

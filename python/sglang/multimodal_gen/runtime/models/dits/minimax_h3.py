@@ -25,11 +25,15 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_silu_mul_per_token_quant_fp8,
+    can_use_per_head_quant_fp8,
     fused_inplace_qknorm_rope,
+    fused_silu_mul_per_token_quant_fp8,
     gate_residual_rmsnorm_indexed_scale_shift_,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    per_head_quant_fp8,
     rmsnorm_indexed_scale_shift,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
@@ -366,6 +370,21 @@ def _modulate_gate(
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
+def _linear_accepts_per_token_prequant_fp8(linear) -> bool:
+    """Whether this linear's quant method takes a producer-quantized
+    ``(fp8_payload, per_token_scale)`` tuple (the diffusion fp8 W8A8 path)."""
+    if linear.quant_config is None:
+        return False
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+        Fp8LinearMethod,
+    )
+
+    method = linear.quant_method
+    return isinstance(
+        method, Fp8LinearMethod
+    ) and method.supports_per_token_prequant_input(linear)
+
+
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     if (
         reuse_input
@@ -574,6 +593,60 @@ def _attn_out_direct_staging_enabled(attention: MiniMaxH3Attention) -> bool:
     return _flash_attn_backend.fa_ver == 3
 
 
+def _fa3_fp8_attention_enabled(attention: MiniMaxH3Attention) -> bool:
+    """Whether FA3 may run its fp8 e4m3 path for this attention call.
+
+    Quality-gated and default OFF (MINIMAX_H3_FA3_FP8). Only the FA v3
+    backend takes fp8 payloads with per-head descales; ring and sparse
+    branches never reach the quantization site, FA4 and other backends fail
+    closed here.
+    """
+    if not envs.MINIMAX_H3_FA3_FP8:
+        return False
+    if torch.compiler.is_compiling():
+        return False
+    if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        return False
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        flash_attn as _flash_attn_backend,
+    )
+
+    return _flash_attn_backend.fa_ver == 3
+
+
+def _quantize_qkv_per_head_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    num_segments: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]] | None:
+    """Per-head fp8 e4m3 payloads + FA3 ``[segments, heads]`` descales.
+
+    Runs after qknorm+rope (post all-to-all under Ulysses, so each rank owns
+    its heads' full sequence and the per-head amax needs no cross-rank
+    coordination). None when any input is ineligible; callers then keep bf16.
+    """
+    if not (
+        can_use_per_head_quant_fp8(q)
+        and can_use_per_head_quant_fp8(k)
+        and can_use_per_head_quant_fp8(v)
+    ):
+        return None
+    payloads = []
+    descales = []
+    for tensor in (q, k, v):
+        payload, scale = per_head_quant_fp8(tensor)
+        payloads.append(payload)
+        descales.append(scale.view(1, -1).repeat(num_segments, 1))
+    return payloads[0], payloads[1], payloads[2], tuple(descales)
+
+
+def _usp_merge_quant_fp8_enabled(attention: MiniMaxH3Attention) -> bool:
+    """Whether the Ulysses output merge may emit out_proj's input pre-quantized."""
+    return attention.out_proj_accepts_prequant_fp8 and envs.MINIMAX_H3_FUSED_MERGE_QUANT
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -606,6 +679,7 @@ def _minimax_h3_attention_core_impl(
             _usp_input_all_to_all_packed_qkv,
             _usp_input_all_to_all_prepacked_qkv,
             _usp_output_all_to_all,
+            _usp_output_all_to_all_quant_fp8,
         )
 
         if prepacked_qkv is not None:
@@ -673,6 +747,8 @@ def _minimax_h3_attention_core_impl(
                 ),
             )
         else:
+            # Staging geometry/dtype come from the bf16 q; the fp8 quant below
+            # only changes payload dtype, and FA3's fp8 output stays bf16.
             direct = (
                 _usp_attn_output_direct_begin(
                     s_global=q.shape[0],
@@ -683,6 +759,18 @@ def _minimax_h3_attention_core_impl(
                 if ulysses_active and _attn_out_direct_staging_enabled(attention)
                 else None
             )
+            descale_kwargs = {}
+            if _fa3_fp8_attention_enabled(attention):
+                fp8_qkv = _quantize_qkv_per_head_fp8(
+                    q, k, v, num_segments=cu_seqlens.shape[0] - 1
+                )
+                if fp8_qkv is not None:
+                    q, k, v, (q_descale, k_descale, v_descale) = fp8_qkv
+                    descale_kwargs = dict(
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
             if direct is not None:
                 out = attention._attention_impl.forward_varlen(
                     q,
@@ -692,6 +780,7 @@ def _minimax_h3_attention_core_impl(
                     max_seqlen=max_seqlen,
                     cu_seqlens_host=cu_seqlens_host,
                     out=direct.attn_out,
+                    **descale_kwargs,
                 )
                 return _usp_attn_output_direct_finish(direct, out)
             out = attention._attention_impl.forward_varlen(
@@ -701,8 +790,13 @@ def _minimax_h3_attention_core_impl(
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=cu_seqlens_host,
+                **descale_kwargs,
             )
     if ulysses_active:
+        if _usp_merge_quant_fp8_enabled(attention):
+            fused = _usp_output_all_to_all_quant_fp8(out)
+            if fused is not None:
+                return fused
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
 
@@ -793,6 +887,9 @@ class MiniMaxH3Attention(nn.Module):
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
+        )
+        self.out_proj_accepts_prequant_fp8 = _linear_accepts_per_token_prequant_fp8(
+            self.out_proj
         )
 
     def _set_attention_backend(self, backend) -> None:
@@ -1205,6 +1302,11 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             prepacked_qkv=prepacked_qkv,
         )
+        if isinstance(out, tuple):
+            # The Ulysses merge pre-quantized out_proj's input:
+            # (fp8 payload [T, heads*head_dim], per-token fp32 scale).
+            out, _ = self.out_proj(out)
+            return out
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
         return out
@@ -1244,6 +1346,14 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None or (
             quant_config.get_name() == "gguf"
         )
+        # Under fp8 W8A8 the eager silu chain + fc2's standalone quant are
+        # replaced by one fused kernel emitting fc2's pre-quantized input;
+        # bitwise equal to that separated chain (MINIMAX_H3_FUSED_SILU_QUANT
+        # is the kill switch, read per forward).
+        self.fc2_accepts_prequant_fp8 = (
+            not self.reuse_fc1_activation
+            and _linear_accepts_per_token_prequant_fp8(self.fc2)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.device.type == "mps":
@@ -1259,6 +1369,14 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
+        if (
+            self.fc2_accepts_prequant_fp8
+            and envs.MINIMAX_H3_FUSED_SILU_QUANT
+            and not torch.compiler.is_compiling()
+            and can_use_fused_silu_mul_per_token_quant_fp8(hidden)
+        ):
+            out, _ = self.fc2(fused_silu_mul_per_token_quant_fp8(hidden))
+            return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out

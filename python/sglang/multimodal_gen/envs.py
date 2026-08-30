@@ -81,6 +81,9 @@ if TYPE_CHECKING:
     MINIMAX_H3_FUSED_ADALN: bool = True
     MINIMAX_H3_QKV_NATIVE_ORDER: bool = False
     MINIMAX_H3_ATTN_OUT_DIRECT_STAGING: bool = True
+    MINIMAX_H3_FUSED_SILU_QUANT: bool = True
+    MINIMAX_H3_FUSED_MERGE_QUANT: bool = True
+    MINIMAX_H3_FA3_FP8: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -370,6 +373,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MINIMAX_H3_ATTN_OUT_DIRECT_STAGING": _lazy_bool(
         "MINIMAX_H3_ATTN_OUT_DIRECT_STAGING", "true"
     ),
+    # Kill-switch for the fused silu(gate)*up + per-token fp8 quant feeding
+    # fc2 under --quantization fp8. Bitwise equal to the separated eager
+    # silu chain + standalone quant; set 0 to restore that chain.
+    "MINIMAX_H3_FUSED_SILU_QUANT": _lazy_bool("MINIMAX_H3_FUSED_SILU_QUANT", "true"),
+    # Kill-switch for the Ulysses output merge fused with per-token fp8 quant
+    # feeding out_proj under --quantization fp8. Bitwise equal to the
+    # separated merge + standalone quant; set 0 to restore that chain.
+    "MINIMAX_H3_FUSED_MERGE_QUANT": _lazy_bool("MINIMAX_H3_FUSED_MERGE_QUANT", "true"),
+    # FA3 fp8 e4m3 attention for MiniMax-H3: q/k/v are quantized per head
+    # after qknorm+rope (post all-to-all under Ulysses), FA3 runs QK^T/PV on
+    # fp8 tensor cores with per-head descales, output stays bf16. Lossy
+    # (quality-gated); default OFF until the e2e quality gate passes.
+    # Fail-closed for ring, sparse, and FA4.
+    "MINIMAX_H3_FA3_FP8": _lazy_bool("MINIMAX_H3_FA3_FP8"),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
     # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers
