@@ -557,6 +557,23 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+def _attn_out_direct_staging_enabled(attention: MiniMaxH3Attention) -> bool:
+    """Whether FA3 may write the ulysses output IPC staging via ``out=``.
+
+    Only the FA v3 path is validated for a strided ``out=`` destination; FA4
+    and other backends fall back to the copy-based output all-to-all.
+    """
+    if not envs.MINIMAX_H3_ATTN_OUT_DIRECT_STAGING:
+        return False
+    if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        return False
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        flash_attn as _flash_attn_backend,
+    )
+
+    return _flash_attn_backend.fa_ver == 3
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -584,6 +601,8 @@ def _minimax_h3_attention_core_impl(
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_attn_output_direct_begin,
+            _usp_attn_output_direct_finish,
             _usp_input_all_to_all_packed_qkv,
             _usp_input_all_to_all_prepacked_qkv,
             _usp_output_all_to_all,
@@ -654,6 +673,27 @@ def _minimax_h3_attention_core_impl(
                 ),
             )
         else:
+            direct = (
+                _usp_attn_output_direct_begin(
+                    s_global=q.shape[0],
+                    h_local=q.shape[1],
+                    head_dim=q.shape[2],
+                    dtype=q.dtype,
+                )
+                if ulysses_active and _attn_out_direct_staging_enabled(attention)
+                else None
+            )
+            if direct is not None:
+                out = attention._attention_impl.forward_varlen(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_host=cu_seqlens_host,
+                    out=direct.attn_out,
+                )
+                return _usp_attn_output_direct_finish(direct, out)
             out = attention._attention_impl.forward_varlen(
                 q,
                 k,

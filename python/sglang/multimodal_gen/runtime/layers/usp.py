@@ -4,6 +4,7 @@ import logging
 import math
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
@@ -172,6 +173,87 @@ def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
     out[:, :, r * h_local : (r + 1) * h_local].copy_(x.narrow(1, off[r], my_len))
     IPC_A2A.wait()
     return out
+
+
+class _AttnOutputDirectStaging(msgspec.Struct):
+    """Views over one IPC staging slot pre-acquired for attention ``out=``.
+
+    The slot is viewed as the merged output extended to every sequence row,
+    [s_global, 2*h_local, d]; ``attn_out`` is its local-heads column slice, so
+    one kernel store lands this rank's sequence half exactly where the merged
+    result needs it and stages the peer half as the NVLink source.
+    """
+
+    attn_out: torch.Tensor  # [s_global, h_local, d] strided kernel destination
+    merged: torch.Tensor  # [s_local, 2*h_local, d] this rank's merged output
+    nvlink_src: torch.Tensor  # [s_peer, h_local, d] my heads of the peer's half
+    nvlink_dst: torch.Tensor  # same-shape view of the peer's merged region
+
+
+def _usp_attn_output_direct_begin(
+    *, s_global: int, h_local: int, head_dim: int, dtype: torch.dtype
+) -> _AttnOutputDirectStaging | None:
+    """Pre-acquire the 2-rank IPC output staging so the attention kernel can
+    write it directly, replacing the local merge copy of the
+    ``_ipc_varlen_fast`` "output" branch. None when the transport, an even
+    sequence split, or an eligible slot is unavailable; callers then run the
+    regular ``_usp_output_all_to_all``. Must be paired with
+    ``_usp_attn_output_direct_finish`` on both ranks: it consumes a slot, so
+    an unfinished exchange desyncs the slot/signal sequence.
+    """
+    if get_ulysses_parallel_world_size() != 2 or s_global % 2:
+        return None
+    if torch.compiler.is_compiling():
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    half = s_global // 2
+    r = IPC_A2A.rank
+    n = s_global * 2 * h_local * head_dim
+    pair = IPC_A2A.get_staging(n, n, dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
+    slot = IPC_A2A.next_slot()
+    big = local[slot].narrow(0, 0, n).view(s_global, 2 * h_local, head_dim)
+    peer_big = peer[slot].narrow(0, 0, n).view(s_global, 2 * h_local, head_dim)
+    local_heads = slice(r * h_local, (r + 1) * h_local)
+    peer_rows = slice((1 - r) * half, (2 - r) * half)
+    return _AttnOutputDirectStaging(
+        attn_out=big[:, local_heads],
+        merged=big[r * half : (r + 1) * half],
+        nvlink_src=big[peer_rows, local_heads],
+        nvlink_dst=peer_big[peer_rows, local_heads],
+    )
+
+
+def _usp_attn_output_direct_finish(
+    staging: _AttnOutputDirectStaging, attn_out: torch.Tensor
+) -> torch.Tensor:
+    """Complete the exchange begun by ``_usp_attn_output_direct_begin``.
+
+    Same signal ordering as ``_ipc_varlen_fast``: the NVLink write is enqueued
+    before bump_signal on this stream, so the peer's spin_wait still orders
+    its read of the merged result after my write. The local half needs no
+    signal -- the kernel stored it in stream order before this call.
+    """
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    if attn_out.data_ptr() != staging.attn_out.data_ptr():
+        # The kernel declined the buffer (``out=`` TypeError fallback or an
+        # internal reallocation); land the bytes at the legacy path's cost.
+        staging.attn_out.copy_(attn_out)
+    staging.nvlink_dst.copy_(staging.nvlink_src, non_blocking=True)
+    IPC_A2A.signal()
+    IPC_A2A.wait()
+    return staging.merged
 
 
 def _ipc_input_a2a_qkv(q, k, v):

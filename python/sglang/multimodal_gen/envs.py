@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     MINIMAX_H3_FUSED_ADALN: bool = True
     MINIMAX_H3_QKV_NATIVE_ORDER: bool = False
+    MINIMAX_H3_ATTN_OUT_DIRECT_STAGING: bool = True
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -361,6 +362,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GEMM per destination rank (the destination-major pack kernel becomes a
     # no-op). bf16 unquantized DiT with tp=1 only; quant/LoRA/TP fail closed.
     "MINIMAX_H3_QKV_NATIVE_ORDER": _lazy_bool("MINIMAX_H3_QKV_NATIVE_ORDER"),
+    # MiniMax-H3 2-rank Ulysses: FA3 writes its output through ``out=`` into
+    # the IPC merged staging directly, eliminating the local merge copy of the
+    # output all-to-all. Bit-identical to the copy path (FA3 stores the same
+    # values, only the destination changes); costs one s_global-row staging
+    # slot (2x the merged size). Set 0 to restore FA3 -> copy -> staging.
+    "MINIMAX_H3_ATTN_OUT_DIRECT_STAGING": _lazy_bool(
+        "MINIMAX_H3_ATTN_OUT_DIRECT_STAGING", "true"
+    ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
     # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers

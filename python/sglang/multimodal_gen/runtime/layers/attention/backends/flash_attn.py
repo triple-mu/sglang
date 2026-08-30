@@ -457,6 +457,7 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
         output = flash_attn_varlen_func(
@@ -470,6 +471,7 @@ class FlashAttentionImpl(AttentionImpl):
             softmax_scale=self.softmax_scale,
             causal=self.causal,
             ver=fa_ver,
+            out=out,
         )
         return output[0] if isinstance(output, tuple) else output
 
