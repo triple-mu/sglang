@@ -189,6 +189,37 @@ SGL_DEVICE T rotary_sub_fp32(T x, float cos, T y, float sin) {
 #endif
 }
 
+// Replicates the sum-of-squares reduction of aten's
+// vectorized_layer_norm_kernel<c10::Half, float, true> (torch nn.RMSNorm on
+// half inputs, N == 64): 4 contiguous elements per thread summed sequentially
+// in fp32, xor-tree combine, rsqrtf. Verified bit-exact vs torch 2.13 on
+// H200; retire if torch changes that kernel's reduction.
+template <int64_t kHeadDim, typename Storage>
+SGL_DEVICE float aten_order_rms_norm_factor(const Storage& input_vec, float eps, uint32_t lane_id) {
+  using namespace device;
+  static_assert(kHeadDim == 64, "aten-order norm replication is only mapped for head_dim 64");
+#ifdef USE_ROCM
+  // aten dispatches a different kernel on ROCm; this replication is CUDA-only.
+  return 0.0f;
+#else
+  // Each lane holds elements [2*lane, 2*lane+1]; aten groups 4 contiguous
+  // elements per thread, so even lanes fold in the odd neighbor's squares.
+  // fp16 squares are exact in fp32, so only the addition order matters.
+  const auto [x0, x1] = cast<fp32x2_t>(input_vec[0]);
+  const float sq0 = x0 * x0;
+  const float sq1 = x1 * x1;
+  const float nsq0 = __shfl_down_sync(warp::kFullMask, sq0, 1);
+  const float nsq1 = __shfl_down_sync(warp::kFullMask, sq1, 1);
+  float partial = ((sq0 + sq1) + nsq0) + nsq1;
+#pragma unroll
+  for (uint32_t offset = 16; offset >= 2; offset >>= 1) {
+    partial += __shfl_xor_sync(warp::kFullMask, partial, offset);
+  }
+  const float total = __shfl_sync(warp::kFullMask, partial, lane_id & ~1u);
+  return math::rsqrt(total / static_cast<float>(kHeadDim) + eps);
+#endif
+}
+
 template <
     int64_t kHeadDim,
     int64_t kRopeDim,
@@ -199,6 +230,7 @@ template <
     bool kRoundNormBeforeRope,
     bool kPackKV,
     bool kCacheHasFullWidth,
+    bool kAtenNormOrder,
     typename IdType>
 __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_constant__ params) {
   using namespace device;
@@ -224,6 +256,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
   static_assert(
       !kRoundNormBeforeRope || std::is_same_v<DType, CacheDType> || std::is_same_v<CacheDType, fp32_t>,
       "Rounded QKNorm+RoPE requires cache and activation dtypes to match or an FP32 cache");
+  static_assert(!kAtenNormOrder || kHeadDim == 64, "aten-order norm replication is only mapped for head_dim 64");
 
   using Packed = packed_t<DType>;
   using Storage = AlignedVector<Packed, kVecSize>;
@@ -310,7 +343,18 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
     const auto weight_vec = load_as<Storage>(weight_ptr, lane_id);
 
     if constexpr (kRoundNormBeforeRope) {
-      auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
+      Storage output_vec;
+      if constexpr (kAtenNormOrder) {
+        const float norm_factor = aten_order_rms_norm_factor<kHeadDim>(input_vec, eps, lane_id);
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          const auto [x0, x1] = cast<fp32x2_t>(input_vec[j]);
+          const auto [w0, w1] = cast<fp32x2_t>(weight_vec[j]);
+          output_vec[j] = cast<Packed, fp32x2_t>({x0 * norm_factor * w0, x1 * norm_factor * w1});
+        }
+      } else {
+        output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
+      }
       const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
       const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
       const auto sin_ptr = cos_ptr + (kCacheHasFullWidth ? kRopeDim : kRopeDim / 2);
@@ -382,8 +426,13 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
       sum_of_squares += x0 * x0 + x1 * x1;
     }
 
-    sum_of_squares = warp::reduce_sum(sum_of_squares);
-    const float norm_factor = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+    float norm_factor;
+    if constexpr (kAtenNormOrder) {
+      norm_factor = aten_order_rms_norm_factor<kHeadDim>(input_vec, eps, lane_id);
+    } else {
+      sum_of_squares = warp::reduce_sum(sum_of_squares);
+      norm_factor = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+    }
 
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -454,7 +503,8 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
-    bool kCacheHasFullWidth>
+    bool kCacheHasFullWidth,
+    bool kAtenNormOrder>
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   template <typename IdType>
@@ -468,6 +518,7 @@ struct QKNormRopeKernel {
       kRoundNormBeforeRope,
       false,
       kCacheHasFullWidth,
+      kAtenNormOrder,
       IdType>;
 
   static void
@@ -551,7 +602,8 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
-    bool kCacheHasFullWidth>
+    bool kCacheHasFullWidth,
+    bool kAtenNormOrder>
 struct QKNormRopePackKVKernel {
   static_assert(!kCacheHasFullWidth, "KV packing does not support full-width cos/sin caches");
   template <typename IdType>
@@ -565,6 +617,7 @@ struct QKNormRopePackKVKernel {
       kRoundNormBeforeRope,
       true,
       kCacheHasFullWidth,
+      kAtenNormOrder,
       IdType>;
 
   static void

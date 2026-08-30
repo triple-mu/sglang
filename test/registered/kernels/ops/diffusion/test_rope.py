@@ -247,6 +247,63 @@ def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
     assert torch.equal(k_ref, k_fused)
 
 
+def test_qknorm_rope_aten_order_matches_torch_rms_norm_fp16() -> None:
+    """MiniMax-H3 VAE decoder contract: aten_norm_order replicates torch's
+    weightless fp16 nn.RMSNorm reduction bit-for-bit before the shared NeoX
+    rope, at the production decode-tile shape."""
+    from sgl_kernel import rotary_embedding
+
+    num_tokens, num_heads, head_dim, rope_dim = 1797, 32, 64, 48
+    dtype = torch.float16
+    norm = torch.nn.RMSNorm(head_dim, eps=1e-5, elementwise_affine=False).to(DEVICE)
+    weight = torch.ones(head_dim, device=DEVICE, dtype=dtype)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, num_tokens).to(dtype)
+
+    q = torch.randn(num_tokens, num_heads, head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+
+    q_ref, k_ref = norm(q), norm(k)
+    rotary_embedding(
+        positions,
+        q_ref.view(num_tokens, -1),
+        k_ref.view(num_tokens, -1),
+        head_dim,
+        cos_sin_cache,
+        True,
+    )
+    fused_inplace_qknorm_rope(
+        q,
+        k,
+        weight,
+        weight,
+        cos_sin_cache,
+        positions,
+        is_neox=True,
+        eps=1e-5,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    )
+
+    assert torch.equal(q_ref, q)
+    assert torch.equal(k_ref, k)
+
+
+def test_qknorm_rope_aten_order_requires_head_dim_64() -> None:
+    # The aten-order reduction is mapped for torch's 64-wide rows only; wider
+    # heads must be rejected rather than silently diverge from aten.
+    assert not can_use_fused_inplace_qknorm_rope(
+        128,
+        96,
+        True,
+        torch.float16,
+        cache_dtype=torch.float16,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    )
+
+
 def test_qknorm_rope_preserves_full_width_neox_cache() -> None:
     from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 

@@ -73,7 +73,8 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
 
     kwargs = usp_attention.call_args.kwargs
     assert kwargs["skip_sequence_parallel"] is True
-    assert kwargs["default_attention_backend"] == AttentionBackendEnum.TORCH_SDPA
+    # FA3 default per V3 fusion; SDPA stays supported as the fallback.
+    assert kwargs["default_attention_backend"] == AttentionBackendEnum.FA
     assert kwargs["supported_attention_backends"] == {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,

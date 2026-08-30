@@ -32,6 +32,8 @@ class CaseSpec:
     is_neox: bool
     cache_has_full_width: bool = False
     round_norm_before_rope: bool = False
+    aten_norm_order: bool = False
+    dtype: torch.dtype = DEFAULT_DTYPE
 
 
 BENCH_CASES = (
@@ -42,6 +44,19 @@ BENCH_CASES = (
     CaseSpec("zimage_1024", 1, 4096, 30, 128, 128, False),
     CaseSpec("longcat_1024", 1, 4608, 24, 128, 128, False, True, True),
     CaseSpec("batch2_medium", 2, 2048, 24, 128, 128, False),
+    # MiniMax-H3 VAE decode tile: fp16, partial rope, aten-order weightless norm.
+    CaseSpec(
+        "minimax_h3_vae_decode",
+        1,
+        1797,
+        32,
+        64,
+        48,
+        True,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+        dtype=torch.float16,
+    ),
 )
 CASE_BY_NAME = {case.name: case for case in BENCH_CASES}
 CASE_NAMES = get_benchmark_range(
@@ -93,7 +108,7 @@ def make_inputs(case: CaseSpec) -> dict[str, torch.Tensor | bool]:
             case.num_heads,
             case.head_dim,
             device=DEFAULT_DEVICE,
-            dtype=DEFAULT_DTYPE,
+            dtype=case.dtype,
             generator=generator,
         ),
         "k": torch.randn(
@@ -101,19 +116,19 @@ def make_inputs(case: CaseSpec) -> dict[str, torch.Tensor | bool]:
             case.num_heads,
             case.head_dim,
             device=DEFAULT_DEVICE,
-            dtype=DEFAULT_DTYPE,
+            dtype=case.dtype,
             generator=generator,
         ),
         "q_weight": torch.randn(
             case.head_dim,
             device=DEFAULT_DEVICE,
-            dtype=DEFAULT_DTYPE,
+            dtype=case.dtype,
             generator=generator,
         ),
         "k_weight": torch.randn(
             case.head_dim,
             device=DEFAULT_DEVICE,
-            dtype=DEFAULT_DTYPE,
+            dtype=case.dtype,
             generator=generator,
         ),
         "positions": torch.randint(
@@ -124,10 +139,16 @@ def make_inputs(case: CaseSpec) -> dict[str, torch.Tensor | bool]:
             dtype=torch.int64,
             generator=generator,
         ),
-        "cos_sin_cache": cos_sin_cache,
+        # aten_norm_order pairs with a half-precision cache in production;
+        # the split baseline keeps fp32 because FlashInfer rope requires it.
+        "cos_sin_cache": (
+            cos_sin_cache.to(case.dtype) if case.aten_norm_order else cos_sin_cache
+        ),
+        "cos_sin_cache_split": cos_sin_cache,
         "is_neox": case.is_neox,
         "cache_has_full_width": case.cache_has_full_width,
         "round_norm_before_rope": case.round_norm_before_rope,
+        "aten_norm_order": case.aten_norm_order,
     }
 
 
@@ -152,7 +173,7 @@ def split_qknorm_rope(
     q_weight = inputs["q_weight"]
     k_weight = inputs["k_weight"]
     positions = inputs["positions"]
-    cos_sin_cache = inputs["cos_sin_cache"]
+    cos_sin_cache = inputs["cos_sin_cache_split"]
     is_neox = bool(inputs["is_neox"])
 
     fused_inplace_qknorm(q, k, q_weight, k_weight)
@@ -196,6 +217,7 @@ def fused_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
         ),
         round_norm_before_rope=bool(inputs["round_norm_before_rope"]),
         cache_has_full_width=bool(inputs["cache_has_full_width"]),
+        aten_norm_order=bool(inputs["aten_norm_order"]),
     )
 
 

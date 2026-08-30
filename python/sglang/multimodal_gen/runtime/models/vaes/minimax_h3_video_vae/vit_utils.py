@@ -209,6 +209,114 @@ def apply_rotary_pos_emb(
         raise
 
 
+_FUSED_QKNORM_ROPE_ENV = "MINIMAX_H3_VAE_DECODER_VIT_FUSED_QKNORM_ROPE"
+_QKNORM_ONES_WEIGHTS: dict = {}
+
+
+def _qknorm_ones_weight(
+    head_dim: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    key = (head_dim, device, dtype)
+    weight = _QKNORM_ONES_WEIGHTS.get(key)
+    if weight is None:
+        # The fused kernel API requires an affine weight; multiplying the fp32
+        # accumulator by 1.0 is an exact identity, so ones == weightless.
+        weight = torch.ones(head_dim, device=device, dtype=dtype)
+        _QKNORM_ONES_WEIGHTS[key] = weight
+    return weight
+
+
+def _is_weightless_rms_norm(module) -> bool:
+    return (
+        isinstance(module, torch.nn.RMSNorm)
+        and module.weight is None
+        and module.eps is not None
+    )
+
+
+def fused_qknorm_rope_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    rotary_pos_emb: Sequence[torch.Tensor],
+    *,
+    norm_q,
+    norm_k,
+) -> bool:
+    """Fuse the weightless RMSNorm + NeoX rotary chain into one in-place kernel.
+
+    Returns True when applied; callers fall back to the eager chain otherwise.
+    aten_norm_order keeps the fused output bit-exact vs the released chain
+    (aten fp16 RMSNorm then sgl_kernel rotary_embedding).
+    """
+    if not _env_flag(_FUSED_QKNORM_ROPE_ENV, "1"):
+        return False
+    if (
+        rotary_pos_emb is None
+        or len(rotary_pos_emb) != 4
+        or not _is_weightless_rms_norm(norm_q)
+        or not _is_weightless_rms_norm(norm_k)
+        or norm_q.eps != norm_k.eps
+        or not query.is_cuda
+        or query.dim() != 4
+        or query.shape[0] != 1
+        or query.shape != key.shape
+        or query.dtype != key.dtype
+        or query.dtype not in (torch.float16, torch.bfloat16)
+        or query.stride(-1) != 1
+        or key.stride(-1) != 1
+        or query.stride(2) != key.stride(2)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+    ):
+        return False
+    seq_len, head_dim = query.shape[1], query.shape[-1]
+    cache, positions = rotary_pos_emb[2], rotary_pos_emb[3]
+    if (
+        not cache.is_cuda
+        or cache.dtype != query.dtype
+        or cache.dim() != 2
+        or cache.shape[0] != seq_len
+        or cache.shape[1] > head_dim
+        or not positions.is_cuda
+        or positions.shape != (seq_len,)
+    ):
+        return False
+
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_inplace_qknorm_rope,
+        fused_inplace_qknorm_rope,
+    )
+
+    rope_dim = int(cache.shape[1])
+    if not can_use_fused_inplace_qknorm_rope(
+        head_dim,
+        rope_dim,
+        True,
+        query.dtype,
+        cache_dtype=cache.dtype,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    ):
+        return False
+
+    ones = _qknorm_ones_weight(head_dim, query.device, query.dtype)
+    fused_inplace_qknorm_rope(
+        query[0],
+        key[0],
+        ones,
+        ones,
+        cache,
+        positions,
+        is_neox=True,
+        eps=norm_q.eps,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    )
+    return True
+
+
 def apply_rotary_pos_emb_qk(
     query: torch.Tensor,
     key: torch.Tensor,
