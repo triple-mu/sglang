@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
+    MINIMAX_H3_FUSED_ADALN: bool = True
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -350,6 +351,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
     ),
+    # Kill-switch for the MiniMax-H3 fused adaLN chain (merged-w_eff RMSNorm +
+    # indexed scale/shift, and the gated-residual Plan B variant). Set 0 to
+    # fall back to the eager norm/modulate/gate kernels.
+    "MINIMAX_H3_FUSED_ADALN": _lazy_bool("MINIMAX_H3_FUSED_ADALN", "true"),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
     # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers

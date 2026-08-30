@@ -92,6 +92,8 @@ Several norms look interchangeable and are not. Start here.
 |---|---|---|---|
 | `fuse_scale_shift_kernel` | Triton | close | contiguous BLC; scalar/row/token modulation plus causal-video `[B, F, 1, C]`, using a static capped power-of-two tile to avoid request-time autotuning |
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |
+| `rmsnorm_indexed_scale_shift` | Triton | near-lossless (<= 4 bf16 ulp of the pre-shift operand, p99 <= 2; closer to fp64 than the eager chain); merged `w_eff = gamma * (1 + scale)` fp32 rows, per-row group index | bf16 rows, any `H`; MiniMax-H3 adaLN (Plan A) |
+| `gate_residual_rmsnorm_indexed_scale_shift_` | Triton | residual output bit-exact vs `indexed_gate_bf16_`; modulated output near-lossless | as above, plus the preceding indexed gated-residual add (Plan B) |
 | `fused_scale_residual_rmsnorm_scale_shift_bitexact` | Triton | bit-exact, incl. the preceding residual-gate add | as above |
 | `fused_layernorm_modulate` | Triton | bit-exact vs aten `vectorized_layer_norm` | bf16, `N % 4 == 0`, 16B-aligned |
 | `fused_norm_scale_shift` / `fused_scale_residual_norm_scale_shift` | CuTe-DSL | fp32 statistics, close | fp16/bf16/fp32, LN or RMS, many broadcast modes |
@@ -148,6 +150,21 @@ tensor copy per residual site.
 `(table + temb.float()).chunk(6, dim=2)` materializes ~8 GB of fp32 at
 704p/121f *and* hands six strided slices downstream, whose `.contiguous()`
 calls copy each one again.
+
+### Producer + per-token FP8 quant (bitwise vs the separated fp8 chain)
+
+For `--quantization fp8` serving, where every fp8 GEMM is preceded by a
+standalone `sgl_per_token_quant_fp8` pass over a bf16 tensor the producer just
+wrote. These fuse the producer with the quant; "lossless" here means *bitwise
+equal to the separated chain* (`common/fp8_quant_replica.py` replicates the
+reference quant arithmetic, including its fast-math SM90 build and
+dispatch-dependent zero-scale semantics), not bitwise vs bf16 serving.
+
+| Entry point | Backend | Replaces |
+|---|---|---|
+| `fused_silu_mul_per_token_quant_fp8` | Triton | eager `F.silu(gate) * up` + quant before fc2 (MiniMax-H3 MLP under fp8) |
+| `usp_merge_heads_per_token_quant_fp8` | Triton | `usp_merge_heads` copy + quant before out_proj (NCCL Ulysses output) |
+| `merge_two_sources_per_token_quant_fp8` | Triton | the 2-rank IPC output merge copy + quant, halves in output-column order |
 
 ## What is not a kernel
 

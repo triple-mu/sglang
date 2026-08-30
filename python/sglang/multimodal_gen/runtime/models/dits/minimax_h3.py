@@ -26,9 +26,11 @@ from sglang.kernels.ops.activation.activation import (
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
+    gate_residual_rmsnorm_indexed_scale_shift_,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    rmsnorm_indexed_scale_shift,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -1587,6 +1589,72 @@ class MiniMaxH3DiTBlock(nn.Module):
             dtype=_BF16_DTYPE,
         )
 
+    def forward_fused(
+        self,
+        x: torch.Tensor,
+        *,
+        fused_adaln: tuple[torch.Tensor, ...],
+        pending_gate: tuple[torch.Tensor, torch.Tensor] | None,
+        combined_indices: torch.Tensor,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+        max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None = None,
+        ulysses_active: bool = False,
+        ring_active: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Fused-adaLN ``forward``: norm + indexed scale/shift run as one
+        kernel over merged ``w_eff`` rows, absorbing the preceding indexed
+        gated-residual add where one exists (see the fused block loop in
+        ``MiniMaxH3DiTModel.forward``).
+
+        ``fused_adaln`` is ``(w_msa, shift_msa, gate_msa, w_mlp, shift_mlp,
+        gate_mlp)`` with ``w_* = norm_weight * (1 + scale_*)`` in fp32.
+        ``pending_gate`` carries the previous block's ``(gate, update)`` whose
+        gated-residual add lands in this block's first fused norm; the return
+        value ``(residual, (gate_mlp, update))`` defers this block's trailing
+        gate to the caller the same way.
+        """
+        w_msa, shift_msa, gate_msa, w_mlp, shift_mlp, gate_mlp = fused_adaln
+        if pending_gate is None:
+            residual = x
+            h = rmsnorm_indexed_scale_shift(
+                x, w_msa, shift_msa, combined_indices, eps=self.norm1.eps
+            )
+        else:
+            prev_gate, prev_update = pending_gate
+            h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+                x,
+                prev_update,
+                prev_gate,
+                w_msa,
+                shift_msa,
+                combined_indices,
+                eps=self.norm1.eps,
+            )
+        h = self.attn(
+            h,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+        )
+        h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+            residual,
+            h,
+            gate_msa,
+            w_mlp,
+            shift_mlp,
+            combined_indices,
+            eps=self.norm2.eps,
+        )
+        h = self.mlp(h)
+        return residual, (gate_mlp, h)
+
 
 class MiniMaxH3FinalLayer(nn.Module):
     def __init__(
@@ -1856,6 +1924,80 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             and all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
         )
 
+    def _stacked_norm_weights(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        weights = [
+            weight
+            for block in self.blocks
+            for weight in (block.norm1.weight, block.norm2.weight)
+        ]
+        if any(
+            weight.dtype is not _BF16_DTYPE or isinstance(weight, DTensor)
+            for weight in weights
+        ):
+            return None
+        # Keyed on storage pointer and in-place version so weight reloads and
+        # device moves rebuild the stacks instead of leaving them stale.
+        key = tuple(
+            value
+            for weight in weights
+            for value in (weight.data_ptr(), weight._version)
+        )
+        if key != self._fused_adaln_gamma_key:
+            self._fused_adaln_gamma1 = torch.stack(
+                [block.norm1.weight.detach() for block in self.blocks]
+            ).to(_FP32_DTYPE)
+            self._fused_adaln_gamma2 = torch.stack(
+                [block.norm2.weight.detach() for block in self.blocks]
+            ).to(_FP32_DTYPE)
+            self._fused_adaln_gamma_key = key
+        return self._fused_adaln_gamma1, self._fused_adaln_gamma2
+
+    def _fused_adaln_block_params(
+        self,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None,
+        hidden: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        """Per-step merged AdaLN parameters for the fused block loop.
+
+        Folds each block's RMSNorm weight into the step's ``(1 + scale)``
+        modulation rows once per forward -- ``w_* = gamma * (1 + scale_*)`` in
+        fp32, ~50 us over the 50-block slab -- so every norm + scale/shift
+        (+ preceding gate) site runs as a single indexed kernel. Returns None
+        whenever the fused chain cannot engage (flag off, fp32 curve-AdaLN
+        island, Cache-DiT / offload wrappers, non-CUDA input, compile), which
+        keeps the eager loop fully authoritative.
+        """
+        if (
+            block_adaln_params is None
+            or not envs.MINIMAX_H3_FUSED_ADALN
+            or not hidden.is_cuda
+            or hidden.dtype is not _BF16_DTYPE
+            or not hidden.is_contiguous()
+            or torch.compiler.is_compiling()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or is_layerwise_offloaded_module(self)
+            or any(
+                type(block) is not MiniMaxH3DiTBlock
+                or block.preserve_input_for_cache_dit
+                for block in self.blocks
+            )
+            or any(param.dtype is not _BF16_DTYPE for param in block_adaln_params[0])
+        ):
+            return None
+        gammas = self._stacked_norm_weights()
+        if gammas is None:
+            return None
+        gamma1, gamma2 = gammas
+        scale_msa = torch.stack([params[1] for params in block_adaln_params])
+        scale_mlp = torch.stack([params[4] for params in block_adaln_params])
+        w_msa = (scale_msa.to(_FP32_DTYPE) + 1.0).mul_(gamma1.unsqueeze(1))
+        w_mlp = (scale_mlp.to(_FP32_DTYPE) + 1.0).mul_(gamma2.unsqueeze(1))
+        return tuple(
+            (w_msa[index], params[0], params[2], w_mlp[index], params[3], params[5])
+            for index, params in enumerate(block_adaln_params)
+        )
+
     def _validate_tp_config(
         self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int
     ) -> None:
@@ -2066,6 +2208,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if self._adaln_precomputed
             else None
         )
+        # Fused-adaLN loop state: fp32 [num_layers, H] stacks of the block
+        # norm weights, keyed like MiniMaxH3FinalLayer._merged_out_params.
+        self._fused_adaln_gamma_key: tuple[int, ...] | None = None
+        self._fused_adaln_gamma1: torch.Tensor | None = None
+        self._fused_adaln_gamma2: torch.Tensor | None = None
         # Component overrides disappear when the loader context exits. Preserve
         # only that selection; process-wide overrides are resolved at first use.
         self._component_attention_backend_override = (
@@ -2691,22 +2838,50 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # (Ulysses) and/or ring-rotates KV across ring ranks; everything
         # else, including the final layer, is row-local. Only the narrow
         # video/audio logits are gathered after the final layer.
-        for index, block in enumerate(self.blocks):
-            hidden = block(
-                hidden,
-                adaln_input=adaln_input,
-                combined_indices=block_combined,
-                rope_cache=rope_cache,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_host=cu_seqlens_host,
-                max_seqlen=max_seqlen,
-                subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
-                ulysses_active=ulysses_ws > 1,
-                ring_active=ring_ws > 1,
-                adaln_params=(
-                    None if block_adaln_params is None else block_adaln_params[index]
-                ),
+        fused_block_adaln = self._fused_adaln_block_params(block_adaln_params, hidden)
+        if fused_block_adaln is not None:
+            # Each block defers its trailing gated-residual add into the next
+            # block's fused norm (Plan B); block 0's first norm has no
+            # preceding gate and the last block's trailing gate runs eagerly
+            # because the final layer keeps its own norm path.
+            pending_gate = None
+            for index, block in enumerate(self.blocks):
+                hidden, pending_gate = block.forward_fused(
+                    hidden,
+                    fused_adaln=fused_block_adaln[index],
+                    pending_gate=pending_gate,
+                    combined_indices=block_combined,
+                    rope_cache=rope_cache,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_host=cu_seqlens_host,
+                    max_seqlen=max_seqlen,
+                    subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+                    ulysses_active=ulysses_ws > 1,
+                    ring_active=ring_ws > 1,
+                )
+            last_gate, last_update = pending_gate
+            hidden = _modulate_gate(
+                hidden, last_gate, last_update, block_combined, dtype=_BF16_DTYPE
             )
+        else:
+            for index, block in enumerate(self.blocks):
+                hidden = block(
+                    hidden,
+                    adaln_input=adaln_input,
+                    combined_indices=block_combined,
+                    rope_cache=rope_cache,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_host=cu_seqlens_host,
+                    max_seqlen=max_seqlen,
+                    subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+                    ulysses_active=ulysses_ws > 1,
+                    ring_active=ring_ws > 1,
+                    adaln_params=(
+                        None
+                        if block_adaln_params is None
+                        else block_adaln_params[index]
+                    ),
+                )
         self.materialize_mps_non_layer_weights("final_layer")
         video_logits, audio_logits, merged_logits = self.final_layer(
             hidden,
