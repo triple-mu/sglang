@@ -73,15 +73,31 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
 
 
 @contextlib.contextmanager
-def minimax_h3_scoped_encode_fp32(video_vae: Any):
-    """Scope the video VAE to fp32 for one or more keyframe/reference encodes.
+def minimax_h3_scoped_encode_dtype(video_vae: Any):
+    """Pin the video VAE to the encode-recipe dtype for one or more encodes.
 
-    encode_keyframe_cond_rows and encode_reference_video_rows each also guard
-    their own cast (skipping it when already fp32), so nesting this around a
-    caller that does more than one encode -- FL2VA's two keyframes, ref2va's
-    image reference plus video reference -- turns their per-call casts into
-    no-ops instead of toggling the whole VAE's dtype once per encode.
+    Default contract: fp32 weights, scoped -- cast the whole VAE to fp32 and
+    restore afterwards. encode_keyframe_cond_rows and
+    encode_reference_video_rows each also enter this scope (a no-op when
+    already pinned), so nesting it around a caller that does more than one
+    encode -- FL2VA's two keyframes, ref2va's image reference plus video
+    reference -- turns their per-call casts into no-ops instead of toggling
+    the whole VAE's dtype once per encode.
+
+    Under the quality-gated MINIMAX_H3_VAE_ENCODER_BF16 mode the encoder is
+    pinned to bf16 instead (normally already done by the CUDA optimize_vae
+    hook so the cudnn plan warmup sees bf16 weights); the cast is one-time
+    and encoder-only, so there is nothing to restore.
     """
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.encoder_precision import (
+        maybe_cast_minimax_h3_vae_encoder_bf16,
+        minimax_h3_vae_encoder_bf16_enabled,
+    )
+
+    if minimax_h3_vae_encoder_bf16_enabled():
+        maybe_cast_minimax_h3_vae_encoder_bf16(video_vae)
+        yield
+        return
     parameter = next(video_vae.parameters())
     prev_dtype = parameter.dtype
     if prev_dtype != torch.float32:
@@ -121,18 +137,13 @@ def minimax_h3_encode_keyframe_cond_rows(
     Returns [n_rows, 24 * patch_h * patch_w] fp32 on CPU.
     """
     seed = MINIMAX_H3_KEYFRAME_ENCODE_SEED
-    # The encode recipe runs on fp32 weights. Normal H3 residency already keeps
-    # the shared video VAE in fp32; retain the scoped cast for standalone use.
-    parameter = next(video_vae.parameters())
-    prev_dtype = parameter.dtype
-    if prev_dtype != torch.float32:
-        video_vae.to(torch.float32)
-    try:
-        with minimax_h3_scoped_encode_rng(seed, parameter.device):
+    # The encode recipe runs on fp32 weights (bf16 under the quality-gated
+    # encoder flag). Normal H3 residency already keeps the shared video VAE
+    # in fp32; retain the scoped pin for standalone use.
+    device = next(video_vae.parameters()).device
+    with minimax_h3_scoped_encode_dtype(video_vae):
+        with minimax_h3_scoped_encode_rng(seed, device):
             z = video_vae.encode_images(image, use_fp16_latent=True)[0]
-    finally:
-        if prev_dtype != torch.float32:
-            video_vae.to(prev_dtype)
     z = z.cpu().float()
     if z.dim() == 4:
         z = z[None]
@@ -157,5 +168,5 @@ __all__ = [
     "_cached_latent_mean_std",
     "minimax_h3_encode_keyframe_cond_rows",
     "minimax_h3_scoped_encode_rng",
-    "minimax_h3_scoped_encode_fp32",
+    "minimax_h3_scoped_encode_dtype",
 ]

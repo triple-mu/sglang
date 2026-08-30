@@ -66,6 +66,37 @@ def _resolve_temporal_stream_cat():
     return raw not in ("0", "false", "no", "off", "disable", "disabled")
 
 
+def _resolve_encoder_tile_size(default_tile_size: int, vae_ratio: int) -> int:
+    """Encoder-only tile size override (quality-gated, default unchanged).
+
+    Larger encode tiles reduce overlap-area redundancy but change the
+    tile-boundary blending, so the config default stays authoritative until
+    the e2e gate passes. Decoder tiling keeps reading the config values.
+    """
+    raw = os.environ.get("MINIMAX_H3_VAE_ENCODER_TILE_SIZE", "").strip().lower()
+    if raw in ("", "0", "default"):
+        return int(default_tile_size)
+    try:
+        tile_size = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"MINIMAX_H3_VAE_ENCODER_TILE_SIZE must be an integer, got {raw!r}"
+        ) from e
+    if tile_size <= 0 or tile_size % vae_ratio:
+        raise ValueError(
+            "MINIMAX_H3_VAE_ENCODER_TILE_SIZE must be a positive multiple of "
+            f"the spatial ratio {vae_ratio}, got {tile_size}"
+        )
+    return tile_size
+
+
+def _resolve_encoder_stack_tiling() -> bool:
+    """Encode-only stacked tiling (near-lossless: the batch dim changes
+    conv/GEMM kernel selection, so outputs move at ~1-ulp scale)."""
+    raw = os.environ.get("MINIMAX_H3_VAE_ENCODER_STACK_TILING", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def get_tile_parallel_state():
     if not dist.is_initialized() or not model_parallel_is_initialized():
         return 0, 1
@@ -169,9 +200,14 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.encoder_tiling = kwargs.get("encoder_tiling", False)
         self.decoder_tiling = kwargs.get("decoder_tiling", False)
         self.stack_tiling = kwargs.get("stack_tiling", False)
-        self.tile_size = kwargs.get("tile_size", 256)
+        # tile_size feeds the encoder; the env overrides are encoder-scoped,
+        # so the decoder default derives from the config value, not from the
+        # possibly-overridden encoder tile size.
+        base_tile_size = kwargs.get("tile_size", 256)
+        self.tile_size = _resolve_encoder_tile_size(base_tile_size, self.vae_ratio)
+        self.encoder_stack_tiling = self.stack_tiling or _resolve_encoder_stack_tiling()
         self.tile_overlap_min = kwargs.get("tile_overlap_min", 64)
-        self.decoder_tile_size = kwargs.get("decoder_tile_size", self.tile_size)
+        self.decoder_tile_size = kwargs.get("decoder_tile_size", base_tile_size)
         self.decoder_tile_overlap_min = kwargs.get(
             "decoder_tile_overlap_min", self.tile_overlap_min
         )
@@ -417,7 +453,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             local_tile_indices = self._local_tile_indices(
                 num_tiles, tile_rank, tile_world_size
             )
-            stack_tiling = self.stack_tiling and not (
+            stack_tiling = self.encoder_stack_tiling and not (
                 self.training and getattr(self.encoder, "mask_enabled", False)
             )
             encoded_tasks = self._run_tile_tasks(
@@ -1362,6 +1398,11 @@ class AutoencoderKLLegacy(AutoencoderKL):
     def encode(self, x):
         # quant_conv is folded into encoder.conv_out at checkpoint load.
         self._require_folded_weights()
+        # Under the bf16 encode gate the cast happens per tile here, so the
+        # full pixel canvas upstream stays fp32.
+        weight_dtype = self.encoder.conv_in.weight.dtype
+        if x.dtype != weight_dtype:
+            x = x.to(weight_dtype)
         return self.encoder(x)
 
     @torch.no_grad()

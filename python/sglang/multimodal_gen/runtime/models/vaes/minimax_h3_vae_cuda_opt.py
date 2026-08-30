@@ -28,7 +28,10 @@ Install is all-or-nothing; validation walks the full module tree before the
 first patch. Validation is structural only, so load-time weight-value folds
 (e.g. quant_conv folded into conv_out, pixel normalize folded into conv_in)
 stay compatible -- but they must run BEFORE install so the channels_last_3d
-weight conversion applies to the folded weights.
+weight conversion applies to the folded weights. The same ordering holds for
+the quality-gated bf16 encoder cast (encoder_precision): cudnn plans are
+dtype-specific, so the cast runs first and the warmup builds bf16 plans;
+cudnn_conv executes bf16 io with fp32 accumulation natively.
 
 NOTE: cudnn-frontend execution plans ignore ``torch.backends.cudnn.enabled``,
 ``.deterministic``, and ``.benchmark``. No determinism context currently wraps
@@ -401,9 +404,17 @@ def maybe_optimize_minimax_h3_vae_encoder(vae: nn.Module) -> nn.Module:
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
         AutoencoderKLLegacy,
     )
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.encoder_precision import (
+        maybe_cast_minimax_h3_vae_encoder_bf16,
+    )
 
     if not isinstance(vae, AutoencoderKLLegacy):
         return vae
+    # The quality-gated bf16 encode cast (MINIMAX_H3_VAE_ENCODER_BF16) must
+    # precede install: cudnn plans and the channels_last_3d conversion are
+    # dtype-specific, and the warmup below must build the bf16 plans. It also
+    # applies when the cudnn gate is off, giving the eager bf16 encoder.
+    maybe_cast_minimax_h3_vae_encoder_bf16(vae)
     enabled = _env_optional_bool(ENV_FLAG)
     if enabled is False:
         logger.info(

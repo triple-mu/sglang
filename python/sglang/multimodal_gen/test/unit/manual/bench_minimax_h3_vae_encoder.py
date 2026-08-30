@@ -78,12 +78,20 @@ def load_encoder_only_vae(vae_dir: pathlib.Path, device: torch.device):
     config = MiniMaxH3VideoVAEConfig(arch_config=arch)
     config.post_init()
     # The ViT decoder needs global server args (attention backend selection)
-    # and is never exercised by this encoder-only bench; stub it out.
+    # and is never exercised by this encoder-only bench; stub it out. The
+    # DecoderTileCudaGraphRunner reads _graph_epoch off the decoder at init
+    # and the load-time weight folds read decoder.config, so the stub carries
+    # both (fold values are unused: the filtered state dict has no proj_out).
+    from types import SimpleNamespace
     from unittest import mock
 
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
 
-    with mock.patch.object(klvae, "ViT3DDecoder", lambda **kwargs: torch.nn.Identity()):
+    class _DecoderStub(torch.nn.Identity):
+        _graph_epoch = 0
+        config = SimpleNamespace(patch_size=16, patch_size_t=4)
+
+    with mock.patch.object(klvae, "ViT3DDecoder", lambda **kwargs: _DecoderStub()):
         vae = MiniMaxH3VideoVAE(config)
 
     from safetensors.torch import load_file
@@ -109,6 +117,10 @@ def load_encoder_only_vae(vae_dir: pathlib.Path, device: torch.device):
             f"e.g. {sorted(missing)[:3]}"
         )
     vae.load_state_dict(wanted, strict=False)
+    # The filtered dict carries no decoder.proj_out, so its fold never runs
+    # and _require_folded_weights would reject encode; the decoder is a stub
+    # here, so mark its fold done by hand.
+    vae.proj_out_pixel_denorm_folded.fill_(True)
 
     vae.eval()
     vae.encoder.to(device=device, dtype=torch.float32)
@@ -325,9 +337,7 @@ def main():
             install_minimax_h3_vae_encoder_cudnn_conv,
         )
 
-        install_minimax_h3_vae_encoder_cudnn_conv(
-            v, channels_last=not args.contiguous
-        )
+        install_minimax_h3_vae_encoder_cudnn_conv(v, channels_last=not args.contiguous)
         import cudnn_conv
 
         print(
