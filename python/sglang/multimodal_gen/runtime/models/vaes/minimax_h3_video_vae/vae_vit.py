@@ -209,7 +209,9 @@ class ViT3DDecoder(ViTBase):
             ]
         )
 
-        self.norm_out = nn.LayerNorm(dim, elementwise_affine=norm_affine, eps=eps)
+        # The checkpoint's norm_out affine is folded into proj_out columns at
+        # load (weight_folds); norm_affine still governs the block norms.
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         patch_dim = out_channels * patch_size_t * patch_size * patch_size
         self.proj_out = nn.Linear(dim, patch_dim)
 

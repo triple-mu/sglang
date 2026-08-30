@@ -155,11 +155,18 @@ def _should_use_channels_last_3d(
     return False
 
 
+# Bump when load-time weight folds change the values the cast decoder weights
+# hold (fold1: MiniMax-H3 LayerScale baked into to_out/ff.w2); adopting an
+# older store would silently restore pre-fold weights.
+_DECODE_DTYPE_STORE_FORMAT = "fold1"
+
+
 def _decode_dtype_store_path(
     component_model_path: str, component_name: str, dtype: torch.dtype
 ) -> str:
     key = hashlib.sha1(
-        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}".encode()
+        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}"
+        f"|{_DECODE_DTYPE_STORE_FORMAT}".encode()
     ).hexdigest()[:16]
     return os.path.join(
         envs.SGLANG_DIFFUSION_CACHE_ROOT, "decode_dtype_store", f"{key}.safetensors"

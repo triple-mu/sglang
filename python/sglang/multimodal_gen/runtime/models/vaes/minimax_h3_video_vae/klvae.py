@@ -21,13 +21,14 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 
-from .processor import (
-    VAEProcessor,
-    get_denormalize_transform,
-    get_normalize_transform,
-)
+from .processor import VAEProcessor, get_norm_constants
 from .vae_cnn import EncoderFCN3D
 from .vae_vit import ViT3DDecoder
+from .weight_folds import (
+    CONV_IN_PIXEL_NORM_FOLDED_KEY,
+    PROJ_OUT_PIXEL_DENORM_FOLDED_KEY,
+    apply_minimax_h3_vae_weight_folds_,
+)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -1228,8 +1229,15 @@ class AutoencoderKLLegacy(AutoencoderKL):
                 "this release only supports use_3d_conv=True with use_vit_decoder=True"
             )
 
-        self.transform = get_normalize_transform(pixel_norm_type)
-        self.transform_rev = get_denormalize_transform(pixel_norm_type)
+        # The pixel Normalize/denormalize are folded into encoder.conv_in and
+        # decoder.proj_out at checkpoint load (weight_folds): this VAE consumes
+        # and produces raw [0, 1] pixels, so the processor transforms are
+        # identities.
+        self._pixel_norm_mean, self._pixel_norm_std = get_norm_constants(
+            pixel_norm_type
+        )
+        self.transform = nn.Identity()
+        self.transform_rev = nn.Identity()
 
         self.use_3d_conv = use_3d_conv
         self.causal_encoder = causal_encoder
@@ -1262,8 +1270,15 @@ class AutoencoderKLLegacy(AutoencoderKL):
             "use_t_isolated_gn": use_t_isolated_gn,
         }
         self.encoder = EncoderFCN3D(**encoder_config)
+        # conv_in consumes raw pixels once the Normalize is folded into its
+        # weights; its constant temporal padding must inject the raw value
+        # that normalized to zero, i.e. the per-channel mean.
+        self.encoder.conv_in.temporal_pad_values = torch.tensor(
+            self._pixel_norm_mean, dtype=torch.float32
+        )
 
-        # init pointwise quant/post_quant conv
+        # Both 1x1x1 convs are folded away at checkpoint load (weight_folds)
+        # and left holding identity kernels; encode/decode never call them.
         self.quant_conv = nn.Conv3d(z_channels * 2, 2 * embed_dim, 1)
         self.post_quant_conv = nn.Conv3d(embed_dim, z_channels, 1)
 
@@ -1280,16 +1295,74 @@ class AutoencoderKLLegacy(AutoencoderKL):
         vit_kwargs.setdefault("t_causal", causal_decoder)
         self.decoder = ViT3DDecoder(**vit_kwargs)
 
+        # State-dict markers so already-folded dumps are not folded twice.
+        self.register_buffer(
+            CONV_IN_PIXEL_NORM_FOLDED_KEY, torch.tensor(False), persistent=True
+        )
+        self.register_buffer(
+            PROJ_OUT_PIXEL_DENORM_FOLDED_KEY, torch.tensor(False), persistent=True
+        )
+        self._pixel_folds_checked = False
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        decoder_config = self.decoder.config
+        apply_minimax_h3_vae_weight_folds_(
+            state_dict,
+            prefix=prefix,
+            pixel_mean=self._pixel_norm_mean,
+            pixel_std=self._pixel_norm_std,
+            proj_rows_per_channel=int(decoder_config.patch_size_t)
+            * int(decoder_config.patch_size) ** 2,
+        )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def _require_folded_weights(self):
+        """Fail loud when a load path bypassed the weight folds.
+
+        The forward paths assume folded weights (plain residual adds, skipped
+        quant convs, raw-pixel domain); a load that bypasses
+        ``load_state_dict`` (for example diffusers' meta-device loading) would
+        otherwise silently produce wrong pixels. One device sync, then cached.
+        """
+        if self._pixel_folds_checked:
+            return
+        conv_in_folded = bool(self.conv_in_pixel_norm_folded.item())
+        proj_out_folded = bool(self.proj_out_pixel_denorm_folded.item())
+        if not (conv_in_folded and proj_out_folded):
+            raise RuntimeError(
+                "MiniMax H3 VAE weights were not folded at load; load the "
+                "checkpoint through load_state_dict so weight_folds can run"
+            )
+        self._pixel_folds_checked = True
+
     @torch.no_grad()
     def encode(self, x):
-        return self.quant_conv(self.encoder(x))
+        # quant_conv is folded into encoder.conv_out at checkpoint load.
+        self._require_folded_weights()
+        return self.encoder(x)
 
     @torch.no_grad()
     def decode(self, z):
-        z2 = self.post_quant_conv(z)
-        if self.use_vit_decoder:
-            return self.decoder(z2)
-        return self.decoder(z2, z)
+        # post_quant_conv is folded into decoder.x_embedder at checkpoint load.
+        self._require_folded_weights()
+        return self.decoder(z)
 
     def encode_base(self, input, process_image=False):
         if self.use_3d_conv and input.ndim == 4:
