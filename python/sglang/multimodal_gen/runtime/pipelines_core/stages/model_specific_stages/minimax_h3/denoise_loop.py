@@ -20,6 +20,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_persist import (
+    adaln_plan_key,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -104,6 +110,11 @@ def _minimax_h3_update_target_rows_(
     one_minus_sigma_ratio: torch.Tensor,
     denoised_scratch: torch.Tensor,
 ) -> None:
+    # The expanded r*x + (1-r)*(x + sigma_t*v) chain collapses to a single
+    # axpy, but the collapsed rounding perturbs the fp32 latent every step and
+    # the trajectory divergence dominates the sub-ms saving; keep the exact
+    # legacy operation order (measured: fusion-vs-baseline video SSIM 0.894
+    # from ulp-level per-step drift).
     torch.mul(sigma_t, velocity, out=denoised_scratch)
     torch.add(state, denoised_scratch, out=denoised_scratch)
     if sigma_curr == 0.0:
@@ -122,7 +133,9 @@ def _build_local_embedding_layout(
     world_size: int,
     rank: int,
     device: torch.device,
-) -> dict[str, torch.Tensor | int]:
+    img_update_mask: torch.Tensor | None = None,
+    audio_update_mask: torch.Tensor | None = None,
+) -> dict[str, Any]:
     if seq_len % world_size:
         raise ValueError(
             f"packed seq_len {seq_len} not divisible by the combined "
@@ -137,20 +150,37 @@ def _build_local_embedding_layout(
             (pos >= row_start) & (pos < row_stop),
             as_tuple=False,
         ).view(-1)
-        return source_ids.to(device), pos.index_select(0, source_ids).to(device)
+        return source_ids, pos.index_select(0, source_ids)
 
     text_source_start = min(row_start, int(text_pos.shape[0]))
     text_source_stop = min(row_stop, int(text_pos.shape[0]))
-    _, img_global_ids = local_ids(img_pos)
-    _, audio_global_ids = local_ids(audio_pos)
-    return {
+    img_source_ids, img_global_ids = local_ids(img_pos)
+    audio_source_ids, audio_global_ids = local_ids(audio_pos)
+    layout: dict[str, Any] = {
         "text_source_start": text_source_start,
         "text_source_stop": text_source_stop,
-        "img_global_ids": img_global_ids,
-        "img_row_ids": img_global_ids - row_start,
-        "audio_global_ids": audio_global_ids,
-        "audio_row_ids": audio_global_ids - row_start,
+        "img_global_ids": img_global_ids.to(device),
+        "img_row_ids": (img_global_ids - row_start).to(device),
+        "audio_global_ids": audio_global_ids.to(device),
+        "audio_row_ids": (audio_global_ids - row_start).to(device),
     }
+    if img_update_mask is None or audio_update_mask is None:
+        return layout
+    img_target = img_update_mask.view(-1).to(torch.bool)[img_source_ids]
+    audio_target = audio_update_mask.view(-1).to(torch.bool)[audio_source_ids]
+    layout["img_target_global_ids"] = img_global_ids[img_target].to(device)
+    layout["img_target_row_ids"] = (img_global_ids[img_target] - row_start).to(device)
+    layout["audio_target_global_ids"] = audio_global_ids[audio_target].to(device)
+    layout["audio_target_row_ids"] = (audio_global_ids[audio_target] - row_start).to(
+        device
+    )
+    # The persistent decoder-input buffer (rewrite only target rows after
+    # priming) is disabled: the target-rows-only patch_proj GEMM selects a
+    # different cuBLAS kernel than the full-M projection and perturbs the fp32
+    # latent trajectory every step (e2e-gate bisect, fusion-vs-baseline video
+    # SSIM 0.894); the saving was a few ms per request. The target-row id
+    # entries above stay -- tests and future exact re-fusions consume them.
+    return layout
 
 
 class MiniMaxH3DenoiseBranch:
@@ -288,6 +318,8 @@ class MiniMaxH3DenoiseBranch:
                 world_size=sp_world_size,
                 rank=sp_rank,
                 device=device,
+                img_update_mask=self.update_mask,
+                audio_update_mask=self.audio_update_mask,
             ),
             "packed_seq_params": {
                 "cu_seqlens_q": cu.to(device),
@@ -431,6 +463,122 @@ class MiniMaxH3DenoiseBranch:
         ]
 
 
+# A plan key is fully determined by the serving schedule and by which pinned
+# row classes the packed layout carries -- never by latent geometry. One
+# warmup request serves a whole partition, so the prewarm must cover every
+# layout class the partition can be asked for, not just the warmup's own
+# (a t2va-shaped warmup can otherwise never prebuild fl2va's cond-row keys).
+_MINIMAX_H3_ADALN_LAYOUT_CLASSES: tuple[tuple[bool, bool], ...] = (
+    (False, False),  # t2va: no pinned rows
+    (True, False),  # fl2va keyframes / image-reference ref2va
+    (False, True),  # audio-reference only
+    (True, True),  # ref2va with visual + audio references
+)
+
+
+def _minimax_h3_layout_class_step_timesteps(
+    *,
+    video_timesteps: list[float],
+    audio_timesteps: list[float],
+    has_imgvid_cond: bool,
+    has_audio_ref: bool,
+    imgvid_cond_noise_aug: float,
+    audio_ref_cond_noise_aug: float,
+) -> list[torch.Tensor]:
+    """One schedule's per-step unique timesteps under one layout class.
+
+    Mirrors _expand_step_timesteps exactly: host float64 candidate math, then
+    fp32 torch.unique collision semantics. Text and target rows exist in every
+    real layout, so t_video/t_audio are always candidates.
+    """
+    step_timesteps = []
+    for t_video, t_audio in zip(video_timesteps, audio_timesteps):
+        candidates = [float(t_video), float(t_audio)]
+        if has_imgvid_cond:
+            candidates.append(float(max(t_video, imgvid_cond_noise_aug)))
+        if has_audio_ref:
+            candidates.append(float(max(t_audio, audio_ref_cond_noise_aug)))
+        step_timesteps.append(
+            torch.unique(torch.tensor(candidates, dtype=torch.float32), sorted=True)
+        )
+    return step_timesteps
+
+
+def _adaln_prewarm_step_timesteps(
+    model: Any,
+    positive: MiniMaxH3DenoiseBranch,
+    *,
+    base_step_timesteps: list[torch.Tensor],
+    adaln_prewarm_sigmas: dict[str, list[float]] | None,
+    imgvid_cond_noise_aug: float,
+    audio_ref_cond_noise_aug: float,
+) -> list[torch.Tensor]:
+    """Serving-schedule step timesteps a warmup request should co-build.
+
+    Covers the serving schedule under every layout class, the warmup's own
+    class first. Capacity is checked per whole class -- a partially covered
+    class saves nothing because its first request re-reads the full
+    checkpoint anyway, while every fully covered class stays a cache hit.
+    """
+    if adaln_prewarm_sigmas is None:
+        return []
+    cache = model.adaln_cache
+    if cache is None or cache.weight_files is None:
+        return []
+    video_timesteps = [
+        1.0 - float(value) for value in adaln_prewarm_sigmas["video"][:-1]
+    ]
+    audio_timesteps = [
+        1.0 - float(value) for value in adaln_prewarm_sigmas["audio"][:-1]
+    ]
+    own_class = (positive.video_target_start > 0, positive.audio_target_start > 0)
+    layout_classes = [own_class] + [
+        layout for layout in _MINIMAX_H3_ADALN_LAYOUT_CLASSES if layout != own_class
+    ]
+    # Mirror build()'s per-request capacity checks so the warmup request can
+    # never fail on plans it does not itself need.
+    wanted = {adaln_plan_key(timesteps) for timesteps in base_step_timesteps}
+    prewarm_step_timesteps: list[torch.Tensor] = []
+    skipped: list[tuple[bool, bool]] = []
+    for has_imgvid_cond, has_audio_ref in layout_classes:
+        class_steps = _minimax_h3_layout_class_step_timesteps(
+            video_timesteps=video_timesteps,
+            audio_timesteps=audio_timesteps,
+            has_imgvid_cond=has_imgvid_cond,
+            has_audio_ref=has_audio_ref,
+            imgvid_cond_noise_aug=imgvid_cond_noise_aug,
+            audio_ref_cond_noise_aug=audio_ref_cond_noise_aug,
+        )
+        class_plans = {
+            adaln_plan_key(timesteps): timesteps for timesteps in class_steps
+        }
+        widest = max(timesteps.numel() for timesteps in class_plans.values())
+        union = wanted | set(class_plans)
+        if widest > cache.max_plan_width or len(union) > cache.max_plans:
+            skipped.append((has_imgvid_cond, has_audio_ref))
+            continue
+        prewarm_step_timesteps.extend(
+            timesteps for key, timesteps in class_plans.items() if key not in wanted
+        )
+        wanted = union
+    if skipped:
+        logger.warning(
+            "MiniMax H3 AdaLN warmup prewarm dropped layout class(es) "
+            "%s: the warmup+serving plan union exceeds the rebuild slab "
+            "(max_plans %d, max plan width %d); the first request of a "
+            "dropped class pays a full AdaLN rebuild. Declaring the real "
+            "serving step count via --warmup-num-inference-steps shrinks "
+            "each class to its true size",
+            [
+                f"(imgvid_cond={cond}, audio_ref={ref})"
+                for cond, ref in skipped
+            ],
+            cache.max_plans,
+            cache.max_plan_width,
+        )
+    return prewarm_step_timesteps
+
+
 def minimax_h3_denoise_loop(
     *,
     model: Any,
@@ -444,6 +592,7 @@ def minimax_h3_denoise_loop(
     audio_ref_rows: torch.Tensor | None = None,
     sigmas_video: list[float],
     sigmas_audio: list[float],
+    adaln_prewarm_sigmas: dict[str, list[float]] | None = None,
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
@@ -517,10 +666,6 @@ def minimax_h3_denoise_loop(
     audio_target_slice = positive.audio_target_slice
     video_timesteps = [1.0 - sigma for sigma in sigmas_video[:-1]]
     audio_timesteps = [1.0 - sigma for sigma in sigmas_audio[:-1]]
-    # One H2D copy per schedule, preserving the previous Python-float
-    # subtraction followed by fp32 conversion.
-    video_step_t = torch.tensor(video_timesteps, dtype=torch.float32, device=device)
-    audio_step_t = torch.tensor(audio_timesteps, dtype=torch.float32, device=device)
     timestep_plan = positive.prepare_timestep_plan(
         video_timesteps=video_timesteps,
         audio_timesteps=audio_timesteps,
@@ -529,11 +674,23 @@ def minimax_h3_denoise_loop(
     )
     # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
     # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in
-    # one pass here instead of topping up step by step inside the loop.
-    model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
+    # one pass here instead of topping up step by step inside the loop. A
+    # warmup request folds its serving-steps plans into the same pass.
+    step_timesteps = [entry[0] for entry in timestep_plan]
+    prewarm_step_timesteps = _adaln_prewarm_step_timesteps(
+        model,
+        positive,
+        base_step_timesteps=step_timesteps,
+        adaln_prewarm_sigmas=adaln_prewarm_sigmas,
+        imgvid_cond_noise_aug=float(imgvid_cond_noise_aug_for_inference),
+        audio_ref_cond_noise_aug=float(audio_cond_noise_aug_for_inference),
+    )
+    model.prepare_adaln_plans(step_timesteps + prewarm_step_timesteps)
 
     # match the scheduler's device-fp32 math once, then reuse one denoised
     # scratch per modality instead of allocating intermediates every step
+    video_step_t = torch.tensor(video_timesteps, dtype=torch.float32, device=device)
+    audio_step_t = torch.tensor(audio_timesteps, dtype=torch.float32, device=device)
     video_sigmas = torch.tensor(sigmas_video, dtype=torch.float32, device=device)
     audio_sigmas = torch.tensor(sigmas_audio, dtype=torch.float32, device=device)
     video_sigma_ratios = video_sigmas[1:] / video_sigmas[:-1]
@@ -544,6 +701,7 @@ def minimax_h3_denoise_loop(
     audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
+
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
@@ -560,15 +718,11 @@ def minimax_h3_denoise_loop(
                     v_video, v_audio = model(**fk)
                 else:
                     v_video, v_audio = model_forward(model, fk, step)
-                # The model outputs are inference tensors. Keep their disposable
-                # fp32 velocity updates in the same context so ``out=velocity``
-                # can reuse the output storage without an extra clone.
                 mv_video_t = v_video.float()
                 mv_audio_t = v_audio[audio_target_slice].float()
 
-                video_target = video_rows[video_target_slice]
                 _minimax_h3_update_target_rows_(
-                    video_target,
+                    video_rows[video_target_slice],
                     mv_video_t,
                     sigma_t=video_sigma_t[step],
                     sigma_curr=s_v,
@@ -576,10 +730,8 @@ def minimax_h3_denoise_loop(
                     one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
                     denoised_scratch=video_denoised_scratch,
                 )
-
-                audio_target = audio_rows[audio_target_slice]
                 _minimax_h3_update_target_rows_(
-                    audio_target,
+                    audio_rows[audio_target_slice],
                     mv_audio_t,
                     sigma_t=audio_sigma_t[step],
                     sigma_curr=s_a,

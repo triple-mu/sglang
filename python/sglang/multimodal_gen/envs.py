@@ -78,6 +78,16 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
+    MINIMAX_H3_FUSED_ADALN: bool = True
+    MINIMAX_H3_FUSED_ADALN_BITEXACT: bool = True
+    MINIMAX_H3_QKV_NATIVE_ORDER: bool = True
+    MINIMAX_H3_ATTN_OUT_DIRECT_STAGING: bool = True
+    MINIMAX_H3_FUSED_SILU_QUANT: bool = True
+    MINIMAX_H3_FUSED_MERGE_QUANT: bool = True
+    MINIMAX_H3_FA3_FP8: bool = False
+    MINIMAX_H3_QKNORM_ROPE_WIDE: bool = False
+    MINIMAX_H3_ADALN_WARMUP_MATCH_STEPS: bool = True
+    MINIMAX_H3_ADALN_PERSIST_DIR: str | None = None
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -350,6 +360,70 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
     ),
+    # Kill-switch for the MiniMax-H3 fused adaLN chain (RMSNorm + indexed
+    # scale/shift, and the gated-residual Plan B variant). Set 0 to fall back
+    # to the eager norm/modulate/gate kernels. Default on: with the bitexact
+    # flag below at its default the chain is bitwise vs eager (frame-md5
+    # verified on the t2va e2e).
+    "MINIMAX_H3_FUSED_ADALN": _lazy_bool("MINIMAX_H3_FUSED_ADALN", "true"),
+    # Fused-adaLN numeric contract. Default (1): the aten-order bitexact
+    # kernels, bitwise vs the eager chain, so the flag above is output
+    # neutral. 0 opts into the faster merged-w_eff kernels whose norm output
+    # is ~4 bf16 ulp from eager -- enough to diverge the denoise trajectory
+    # over 8 NFE (e2e gate SSIM 0.89 vs 0.99).
+    "MINIMAX_H3_FUSED_ADALN_BITEXACT": _lazy_bool(
+        "MINIMAX_H3_FUSED_ADALN_BITEXACT", "true"
+    ),
+    # Keep the MiniMax-H3 checkpoint's per-head [q|k|v] qkv row interleave
+    # resident and write the Ulysses A2A send buffer directly from one qkv
+    # GEMM per destination rank (the destination-major pack kernel becomes a
+    # no-op). Default on; unsupported configs (quantized checkpoint, tp > 1,
+    # startup LoRA, non-CUDA, pre-reordered checkpoint) automatically fall
+    # back to the legacy reordered rows. Set 1 explicitly to turn that
+    # fallback into an init error (debugging), 0 to force the legacy order.
+    "MINIMAX_H3_QKV_NATIVE_ORDER": _lazy_bool("MINIMAX_H3_QKV_NATIVE_ORDER", "true"),
+    # MiniMax-H3 2-rank Ulysses: FA3 writes its output through ``out=`` into
+    # the IPC merged staging directly, eliminating the local merge copy of the
+    # output all-to-all. Bit-identical to the copy path (FA3 stores the same
+    # values, only the destination changes); costs one s_global-row staging
+    # slot (2x the merged size). Set 0 to restore FA3 -> copy -> staging.
+    "MINIMAX_H3_ATTN_OUT_DIRECT_STAGING": _lazy_bool(
+        "MINIMAX_H3_ATTN_OUT_DIRECT_STAGING", "true"
+    ),
+    # Kill-switch for the fused silu(gate)*up + per-token fp8 quant feeding
+    # fc2 under --quantization fp8. Bitwise equal to the separated eager
+    # silu chain + standalone quant; set 0 to restore that chain.
+    "MINIMAX_H3_FUSED_SILU_QUANT": _lazy_bool("MINIMAX_H3_FUSED_SILU_QUANT", "true"),
+    # Kill-switch for the Ulysses output merge fused with per-token fp8 quant
+    # feeding out_proj under --quantization fp8. Bitwise equal to the
+    # separated merge + standalone quant; set 0 to restore that chain.
+    "MINIMAX_H3_FUSED_MERGE_QUANT": _lazy_bool("MINIMAX_H3_FUSED_MERGE_QUANT", "true"),
+    # FA3 fp8 e4m3 attention for MiniMax-H3: q/k/v are quantized per head
+    # after qknorm+rope (post all-to-all under Ulysses), FA3 runs QK^T/PV on
+    # fp8 tensor cores with per-head descales, output stays bf16. Lossy
+    # (quality-gated); default OFF until the e2e quality gate passes.
+    # Fail-closed for ring, sparse, and FA4.
+    "MINIMAX_H3_FA3_FP8": _lazy_bool("MINIMAX_H3_FA3_FP8"),
+    # Wide (two heads per warp) DiT qknorm+rope variant: ~near-lossless (the
+    # fp32 sum-of-squares reduction tree changes, so outputs may differ from
+    # the contract-exact kernel by one bf16 ulp). Default OFF: the bit-exact
+    # split-chain contract stays the default until an e2e quality gate
+    # admits this variant.
+    "MINIMAX_H3_QKNORM_ROPE_WIDE": _lazy_bool("MINIMAX_H3_QKNORM_ROPE_WIDE"),
+    # With --minimax-h3-adaln-online, a warmup request also builds the AdaLN
+    # plans for its pre-trim (serving) step count inside the same checkpoint
+    # rebuild pass, so the first real request hits the plan cache instead of
+    # paying the full adaln_proj re-read. Set 0 to build only the trimmed
+    # --warmup-steps plans.
+    "MINIMAX_H3_ADALN_WARMUP_MATCH_STEPS": _lazy_bool(
+        "MINIMAX_H3_ADALN_WARMUP_MATCH_STEPS", "true"
+    ),
+    # Directory persisting online-rebuilt AdaLN plans across process starts,
+    # keyed by checkpoint fingerprint, tp size, and exact fp32 timestep plan.
+    # Unset disables persistence; any key or shape mismatch falls back to the
+    # checkpoint rebuild. Reuse only on the same host/GPU + library stack --
+    # plans are bit-exact artifacts of that configuration.
+    "MINIMAX_H3_ADALN_PERSIST_DIR": _lazy_str("MINIMAX_H3_ADALN_PERSIST_DIR"),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
     # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers

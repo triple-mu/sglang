@@ -370,13 +370,16 @@ class LoRAPipeline(ComposedPipelineBase):
         return converted_count
 
     def _reject_lora_on_packed_weights(self) -> None:
-        """Fail before any layer is replaced if a target has no plain weight.
+        """Fail before any layer is replaced if a target cannot take an adapter.
 
         ``BaseLayerWithLoRA`` reads ``base_layer.weight``, which a
         weight-packing quantization (GGUF) does not expose -- it registers
-        ``qweight``. Checking up front keeps a rejected request from leaving the
-        model half converted, and covers the dynamic ``set_lora`` API as well as
-        a startup ``--lora-path``.
+        ``qweight``. A weight kept in MiniMax-H3's interleaved qkv row order
+        (MINIMAX_H3_QKV_NATIVE_ORDER) is equally unmergeable: adapter B rows
+        are sliced assuming the reordered [q_all, k_all, v_all] layout and
+        would scatter across the wrong heads. Checking up front keeps a
+        rejected request from leaving the model half converted, and covers the
+        dynamic ``set_lora`` API as well as a startup ``--lora-path``.
         """
         for module_name in ("transformer", "transformer_2"):
             module = self.modules.get(module_name)
@@ -392,6 +395,18 @@ class LoRAPipeline(ComposedPipelineBase):
                         "weights are stored packed (GGUF), which an adapter "
                         "cannot be merged into or applied alongside. Serve the "
                         "unquantized checkpoint to use LoRA."
+                    )
+                weight = params.get("weight")
+                if weight is not None and getattr(
+                    weight, "qkv_rows_interleaved", False
+                ):
+                    raise ValueError(
+                        f"LoRA is not supported on {module_name}.{name}: "
+                        "MINIMAX_H3_QKV_NATIVE_ORDER keeps its qkv rows in the "
+                        "checkpoint's per-head interleaved order, which adapter "
+                        "rows cannot be merged into. Launch with --lora-path "
+                        "(native order then falls back automatically) or set "
+                        "MINIMAX_H3_QKV_NATIVE_ORDER=0 to use LoRA."
                     )
 
     def convert_to_lora_layers(self, snapshot_base: bool = True) -> None:
