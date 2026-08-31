@@ -36,7 +36,10 @@ _REPO_ROOT = _PACKAGE_DIR.parents[4]  # <repo>/python/sglang/kernels/ops/diffusi
 # else -- all runtime code -- must go through the facade.
 _DEEP_IMPORT_ALLOWLIST = {
     "python/sglang/multimodal_gen/test/unit/test_latent_upsampler_group_norm_silu.py",
+    # Pins the C++ JIT backends against their Triton fallbacks directly.
+    "test/registered/kernels/benchmark/diffusion/bench_group_norm_silu_twopass.py",
     "test/registered/kernels/ops/diffusion/test_model_fast_paths.py",
+    "test/registered/kernels/ops/diffusion/test_norm.py",
     "test/registered/kernels/ops/diffusion/test_sites.py",
     # This test exercises the pure-Torch fallback implementation directly.
     "test/registered/unit/utils/test_diffusion_torch_fallback.py",

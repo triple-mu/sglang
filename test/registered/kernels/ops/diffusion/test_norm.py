@@ -41,6 +41,13 @@ from sglang.kernels.ops.diffusion import (
     triton_group_norm_silu,
     wan_rmsnorm_silu,
 )
+
+# Deep imports on purpose (allowlisted in test_import_surface): the twopass
+# backend-equality and dispatch-order cases pin one backend each.
+from sglang.kernels.ops.diffusion.norm import (
+    group_norm_silu_twopass_jit,
+    group_norm_silu_twopass_triton,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -167,6 +174,81 @@ def test_group_norm_silu_4d_channels_last_and_guards():
         assert not can_use_group_norm_silu_4d(*args, 32)
         with pytest.raises(ValueError):
             group_norm_silu_4d(*args, 32, 1e-6)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_group_norm_silu_twopass_cpp_backend_matches_triton(dtype):
+    """C++ JIT backend vs the Triton backend it shadows, on both entry forms.
+
+    The dispatcher exercises only the backend it selects, so the shadowed one
+    could drift from the fp32-statistics contract unnoticed.  Odd spatial
+    extents exercise the C++ kernel's masked row tails.
+    """
+    gn = nn.GroupNorm(32, 128, eps=1e-6).to(DEVICE, dtype)
+    x = torch.randn(3, 128, 33, 47, device=DEVICE, dtype=dtype).to(
+        memory_format=torch.channels_last
+    )
+    x3 = x.permute(0, 2, 3, 1).reshape(3, 33 * 47, 128)
+    if not group_norm_silu_twopass_jit._can_use_cpp(x3):
+        pytest.skip("C++ twopass backend unavailable on this device")
+    for apply_silu in (True, False):
+        cpp = group_norm_silu_twopass_jit.group_norm_silu_4d(
+            x, gn.weight, gn.bias, 32, 1e-6, apply_silu
+        )
+        tri = group_norm_silu_twopass_triton.group_norm_silu_4d(
+            x, gn.weight, gn.bias, 32, 1e-6, apply_silu
+        )
+        assert cpp.is_contiguous(memory_format=torch.channels_last)
+        atol, rtol = _tol(dtype)
+        torch.testing.assert_close(cpp.float(), tri.float(), atol=atol, rtol=rtol)
+
+
+@torch.no_grad()
+def test_group_norm_silu_twopass_dispatch_order_cpp_then_triton(monkeypatch):
+    """cpp-jit is the default; only inputs it cannot vectorize reach Triton."""
+    calls = []
+    real = group_norm_silu_twopass_triton._gn_silu_rows
+
+    def spy(x3, weight, bias, num_groups, eps, apply_silu):
+        calls.append(x3.shape[-1])
+        return real(x3, weight, bias, num_groups, eps, apply_silu)
+
+    monkeypatch.setattr(group_norm_silu_twopass_jit, "_triton_gn_silu_rows", spy)
+    gn = nn.GroupNorm(32, 128, eps=1e-6).to(DEVICE, torch.float32)
+    good = torch.randn(2, 128, 16, 16, device=DEVICE, dtype=torch.float32).to(
+        memory_format=torch.channels_last
+    )
+    good3 = good.permute(0, 2, 3, 1).reshape(2, 256, 128)
+    cpp_ready = group_norm_silu_twopass_jit._can_use_cpp(good3)
+    group_norm_silu_twopass_jit.group_norm_silu_4d(good, gn.weight, gn.bias, 32, 1e-6)
+    assert calls == ([] if cpp_ready else [128])
+
+    # C=4 bf16 passes the shared twopass predicate but not the C++ kernel's
+    # 16B channel-vector requirement; Triton must serve it with the same
+    # oracle-held result.
+    gn4 = nn.GroupNorm(4, 4, eps=1e-6).to(DEVICE, torch.bfloat16)
+    narrow = torch.randn(2, 4, 8, 8, device=DEVICE, dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last
+    )
+    assert can_use_group_norm_silu_4d(narrow, gn4.weight, gn4.bias, 4)
+    out = group_norm_silu_twopass_jit.group_norm_silu_4d(
+        narrow, gn4.weight, gn4.bias, 4, 1e-6
+    )
+    assert calls[-1:] == [4]
+    torch.testing.assert_close(
+        out.float(),
+        F.silu(
+            F.group_norm(narrow.float(), 4, gn4.weight.float(), gn4.bias.float(), 1e-6)
+        ),
+        atol=7e-2,
+        rtol=2e-2,
+    )
+
+
+def test_facade_routes_group_norm_silu_through_jit_dispatcher():
+    # The registry must hand callers the dispatching wrapper, not a backend.
+    assert group_norm_silu_4d is group_norm_silu_twopass_jit.group_norm_silu_4d
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +555,66 @@ def test_validate_scale_shift_rejects_non_divisible_frames():
         validate_scale_shift(
             torch.empty((1, 4, 1, 256), device=DEVICE, dtype=torch.float16), 1, 10, 256
         )
+
+
+# ---------------------------------------------------------------------------
+# residual_rmsnorm_cast: MiniMax-H3 VAE decoder triple, held to the *eager
+# aten chain* bitwise -- mixed-dtype add (fp32), nn.RMSNorm on the fp32 trunk
+# (aten's vectorized rms kernel), then the autocast dtype cast. The kernel
+# replicates aten's reduction order, so torch.equal applies on both outputs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rows,dim",
+    [
+        # 1797 x 2048 is the production decode-tile site; the small dims cover
+        # partially-filled blocks (fewer row vectors than threads) and a
+        # non-power-of-two vector count per thread.
+        (1797, 2048),
+        (3, 128),
+        (5, 2052),
+    ],
+)
+@pytest.mark.parametrize("branch_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("affine", [True, False])
+def test_residual_rmsnorm_cast_matches_eager_triple(
+    rows: int, dim: int, branch_dtype: torch.dtype, out_dtype: torch.dtype, affine: bool
+) -> None:
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_residual_rmsnorm_cast,
+        fused_residual_rmsnorm_cast_,
+    )
+
+    assert can_use_fused_residual_rmsnorm_cast(dim, branch_dtype, out_dtype)
+    residual = torch.randn(rows, dim, device=DEVICE, dtype=torch.float32) * 2
+    branch = torch.randn(rows, dim, device=DEVICE, dtype=branch_dtype)
+    norm = nn.RMSNorm(dim, eps=EPS, elementwise_affine=affine).to(DEVICE)
+    if affine:
+        with torch.no_grad():
+            norm.weight.normal_()
+
+    y_ref = residual + branch
+    out_ref = norm(y_ref).to(out_dtype)
+
+    weight = norm.weight if affine else torch.ones(dim, device=DEVICE)
+    out = fused_residual_rmsnorm_cast_(
+        residual, branch, weight, eps=EPS, out_dtype=out_dtype
+    )
+
+    assert torch.equal(residual, y_ref)
+    assert torch.equal(out, out_ref)
+
+
+def test_residual_rmsnorm_cast_rejects_unsupported() -> None:
+    from sglang.kernels.ops.diffusion import can_use_fused_residual_rmsnorm_cast
+
+    # aten only takes its vectorized rms kernel (the replicated oracle) for
+    # rows divisible by 4; other widths must fail closed to the eager chain.
+    assert not can_use_fused_residual_rmsnorm_cast(2049, torch.float16, torch.float16)
+    assert not can_use_fused_residual_rmsnorm_cast(2048, torch.float64, torch.float16)
+    assert not can_use_fused_residual_rmsnorm_cast(2048, torch.float16, torch.float32)
 
 
 if __name__ == "__main__":
