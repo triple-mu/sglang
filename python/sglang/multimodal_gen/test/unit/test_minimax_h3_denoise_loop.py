@@ -184,7 +184,6 @@ def test_local_layout_target_rows_match_update_masks():
         branch = _branch(mode)
         text_len = int(branch.static_kwargs["prompt_embeds"].shape[0])
         branch_layout = branch.static_kwargs["local_embedding_layout"]
-        assert branch_layout["embedding_cache"] == {}
         for world_size in (1, 2, 4):
             for rank in range(world_size):
                 layout = _build_local_embedding_layout(
@@ -218,7 +217,6 @@ def test_local_layout_target_rows_match_update_masks():
                 assert torch.equal(
                     layout["audio_target_row_ids"], expected_audio - row_start
                 )
-                assert layout["embedding_cache"] == {}
                 assert torch.equal(
                     layout["img_global_ids"], branch.img_pos[img_in_shard]
                 )

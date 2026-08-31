@@ -113,7 +113,6 @@ def test_time_embedding_skipped_when_adaln_cache_covers_consumers(device_type):
     assert t_emb is None
     assert stub.time_embedding_calls == 0
 
-    kwargs["local_embedding_layout"]["embedding_cache"].clear()
     _, t_emb = stub._embed(**kwargs, skip_time_embedding=False)
     assert stub.time_embedding_calls == 1
     torch.testing.assert_close(
@@ -122,50 +121,6 @@ def test_time_embedding_skipped_when_adaln_cache_covers_consumers(device_type):
         rtol=0,
         atol=0,
     )
-
-
-@pytest.mark.parametrize("device_type", _DEVICES)
-def test_embedding_buffer_persists_step_constant_rows(device_type):
-    device = torch.device(device_type)
-    stub = _EmbedStub(device)
-    layout = _layout(device)
-    kwargs = _embed_kwargs(device, layout)
-
-    primed, _ = stub._embed(**kwargs, skip_time_embedding=True)
-    assert layout["embedding_cache"]["embeddings"] is primed
-    snapshot = primed.clone()
-
-    # Denoise-step mutation model: only target rows of x/audio_x change.
-    # Also poke one condition row to pin the contract that post-priming
-    # steps ignore condition-row bytes entirely.
-    img_target_pos = _IMG_POS[_IMG_UPDATE_MASK].to(device)
-    audio_target_pos = _AUDIO_POS[_AUDIO_UPDATE_MASK].to(device)
-    kwargs["x"][0, img_target_pos] += 0.5
-    kwargs["audio_x"][0, audio_target_pos] -= 0.25
-    kwargs["x"][0, int(_IMG_POS[0])] = 123.0
-
-    second, _ = stub._embed(**kwargs, skip_time_embedding=True)
-    assert second is primed
-
-    target_rows = torch.cat(
-        (layout["img_target_row_ids"], layout["audio_target_row_ids"])
-    )
-    step_constant = torch.ones(_SEQ_LEN, dtype=torch.bool, device=device)
-    step_constant[target_rows] = False
-    assert torch.equal(second[step_constant], snapshot[step_constant])
-
-    expected_img = (
-        stub.video_patch_proj(
-            kwargs["x"][0, layout["img_target_global_ids"]].to(torch.float32)
-        )[0]
-    ).to(torch.bfloat16)
-    assert torch.equal(second[layout["img_target_row_ids"]], expected_img)
-    expected_audio = (
-        stub.audio_patch_proj(
-            kwargs["audio_x"][0, layout["audio_target_global_ids"]].to(torch.float32)
-        )[0]
-    ).to(torch.bfloat16)
-    assert torch.equal(second[layout["audio_target_row_ids"]], expected_audio)
 
 
 @pytest.mark.parametrize("device_type", _DEVICES)

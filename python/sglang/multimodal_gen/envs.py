@@ -78,7 +78,11 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
-    MINIMAX_H3_FUSED_ADALN: bool = True
+    # Default off: the fused norm output is ~4 bf16 ulp from eager and the
+    # denoise trajectory diverges over 8 NFE (e2e gate SSIM 0.89 vs 0.99 with
+    # it off, for a 0.14 s/request saving). Re-enable once an eager-order
+    # bitwise variant lands (same replication approach as V1/R3).
+    MINIMAX_H3_FUSED_ADALN: bool = False
     MINIMAX_H3_QKV_NATIVE_ORDER: bool = True
     MINIMAX_H3_ATTN_OUT_DIRECT_STAGING: bool = True
     MINIMAX_H3_FUSED_SILU_QUANT: bool = True
@@ -362,7 +366,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kill-switch for the MiniMax-H3 fused adaLN chain (merged-w_eff RMSNorm +
     # indexed scale/shift, and the gated-residual Plan B variant). Set 0 to
     # fall back to the eager norm/modulate/gate kernels.
-    "MINIMAX_H3_FUSED_ADALN": _lazy_bool("MINIMAX_H3_FUSED_ADALN", "true"),
+    "MINIMAX_H3_FUSED_ADALN": _lazy_bool("MINIMAX_H3_FUSED_ADALN", "false"),
     # Keep the MiniMax-H3 checkpoint's per-head [q|k|v] qkv row interleave
     # resident and write the Ulysses A2A send buffer directly from one qkv
     # GEMM per destination rank (the destination-major pack kernel becomes a

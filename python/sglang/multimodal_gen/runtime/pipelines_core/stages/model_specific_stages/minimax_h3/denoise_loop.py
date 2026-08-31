@@ -174,10 +174,12 @@ def _build_local_embedding_layout(
     layout["audio_target_row_ids"] = (audio_global_ids[audio_target] - row_start).to(
         device
     )
-    # Per-request slot for the model's persistent decoder-input buffer; after
-    # the priming forward, _embed rewrites only the target rows above because
-    # text/condition/reference rows of x/audio_x never change post-priming.
-    layout["embedding_cache"] = {}
+    # The persistent decoder-input buffer (rewrite only target rows after
+    # priming) is disabled: the target-rows-only patch_proj GEMM selects a
+    # different cuBLAS kernel than the full-M projection and perturbs the fp32
+    # latent trajectory every step (e2e-gate bisect, fusion-vs-baseline video
+    # SSIM 0.894); the saving was a few ms per request. The target-row id
+    # entries above stay -- tests and future exact re-fusions consume them.
     return layout
 
 
