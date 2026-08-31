@@ -166,7 +166,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         """Direct keyframe encode: seeded sampled encode_images ->
         normalized [n,96] cond rows in batch.extra."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
-            minimax_h3_scoped_encode_fp32,
+            minimax_h3_scoped_encode_dtype,
         )
 
         materials = [m for m in plan.materials if m.condition_index in set(routed)]
@@ -206,7 +206,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
                 f"{unsupported}"
             )
         # One VAE dtype toggle for every visual condition in the request.
-        with minimax_h3_scoped_encode_fp32(self.video_vae):
+        with minimax_h3_scoped_encode_dtype(self.video_vae):
             if keyframe_materials:
                 self._encode_target_keyframes(batch, plan)
             if "image.reference_preserve" in chains:

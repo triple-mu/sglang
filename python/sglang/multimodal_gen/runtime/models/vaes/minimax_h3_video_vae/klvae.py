@@ -21,13 +21,15 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 
-from .processor import (
-    VAEProcessor,
-    get_denormalize_transform,
-    get_normalize_transform,
-)
+from .decoder_cuda_graph import DecoderTileCudaGraphRunner
+from .processor import VAEProcessor, get_norm_constants
 from .vae_cnn import EncoderFCN3D
 from .vae_vit import ViT3DDecoder
+from .weight_folds import (
+    CONV_IN_PIXEL_NORM_FOLDED_KEY,
+    PROJ_OUT_PIXEL_DENORM_FOLDED_KEY,
+    apply_minimax_h3_vae_weight_folds_,
+)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -62,6 +64,37 @@ def _resolve_temporal_stream_cat():
         .lower()
     )
     return raw not in ("0", "false", "no", "off", "disable", "disabled")
+
+
+def _resolve_encoder_tile_size(default_tile_size: int, vae_ratio: int) -> int:
+    """Encoder-only tile size override (quality-gated, default unchanged).
+
+    Larger encode tiles reduce overlap-area redundancy but change the
+    tile-boundary blending, so the config default stays authoritative until
+    the e2e gate passes. Decoder tiling keeps reading the config values.
+    """
+    raw = os.environ.get("MINIMAX_H3_VAE_ENCODER_TILE_SIZE", "").strip().lower()
+    if raw in ("", "0", "default"):
+        return int(default_tile_size)
+    try:
+        tile_size = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"MINIMAX_H3_VAE_ENCODER_TILE_SIZE must be an integer, got {raw!r}"
+        ) from e
+    if tile_size <= 0 or tile_size % vae_ratio:
+        raise ValueError(
+            "MINIMAX_H3_VAE_ENCODER_TILE_SIZE must be a positive multiple of "
+            f"the spatial ratio {vae_ratio}, got {tile_size}"
+        )
+    return tile_size
+
+
+def _resolve_encoder_stack_tiling() -> bool:
+    """Encode-only stacked tiling (near-lossless: the batch dim changes
+    conv/GEMM kernel selection, so outputs move at ~1-ulp scale)."""
+    raw = os.environ.get("MINIMAX_H3_VAE_ENCODER_STACK_TILING", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def get_tile_parallel_state():
@@ -167,9 +200,14 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.encoder_tiling = kwargs.get("encoder_tiling", False)
         self.decoder_tiling = kwargs.get("decoder_tiling", False)
         self.stack_tiling = kwargs.get("stack_tiling", False)
-        self.tile_size = kwargs.get("tile_size", 256)
+        # tile_size feeds the encoder; the env overrides are encoder-scoped,
+        # so the decoder default derives from the config value, not from the
+        # possibly-overridden encoder tile size.
+        base_tile_size = kwargs.get("tile_size", 256)
+        self.tile_size = _resolve_encoder_tile_size(base_tile_size, self.vae_ratio)
+        self.encoder_stack_tiling = self.stack_tiling or _resolve_encoder_stack_tiling()
         self.tile_overlap_min = kwargs.get("tile_overlap_min", 64)
-        self.decoder_tile_size = kwargs.get("decoder_tile_size", self.tile_size)
+        self.decoder_tile_size = kwargs.get("decoder_tile_size", base_tile_size)
         self.decoder_tile_overlap_min = kwargs.get(
             "decoder_tile_overlap_min", self.tile_overlap_min
         )
@@ -415,7 +453,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             local_tile_indices = self._local_tile_indices(
                 num_tiles, tile_rank, tile_world_size
             )
-            stack_tiling = self.stack_tiling and not (
+            stack_tiling = self.encoder_stack_tiling and not (
                 self.training and getattr(self.encoder, "mask_enabled", False)
             )
             encoded_tasks = self._run_tile_tasks(
@@ -1228,8 +1266,15 @@ class AutoencoderKLLegacy(AutoencoderKL):
                 "this release only supports use_3d_conv=True with use_vit_decoder=True"
             )
 
-        self.transform = get_normalize_transform(pixel_norm_type)
-        self.transform_rev = get_denormalize_transform(pixel_norm_type)
+        # The pixel Normalize/denormalize are folded into encoder.conv_in and
+        # decoder.proj_out at checkpoint load (weight_folds): this VAE consumes
+        # and produces raw [0, 1] pixels, so the processor transforms are
+        # identities.
+        self._pixel_norm_mean, self._pixel_norm_std = get_norm_constants(
+            pixel_norm_type
+        )
+        self.transform = nn.Identity()
+        self.transform_rev = nn.Identity()
 
         self.use_3d_conv = use_3d_conv
         self.causal_encoder = causal_encoder
@@ -1262,8 +1307,15 @@ class AutoencoderKLLegacy(AutoencoderKL):
             "use_t_isolated_gn": use_t_isolated_gn,
         }
         self.encoder = EncoderFCN3D(**encoder_config)
+        # conv_in consumes raw pixels once the Normalize is folded into its
+        # weights; its constant temporal padding must inject the raw value
+        # that normalized to zero, i.e. the per-channel mean.
+        self.encoder.conv_in.temporal_pad_values = torch.tensor(
+            self._pixel_norm_mean, dtype=torch.float32
+        )
 
-        # init pointwise quant/post_quant conv
+        # Both 1x1x1 convs are folded away at checkpoint load (weight_folds)
+        # and left holding identity kernels; encode/decode never call them.
         self.quant_conv = nn.Conv3d(z_channels * 2, 2 * embed_dim, 1)
         self.post_quant_conv = nn.Conv3d(embed_dim, z_channels, 1)
 
@@ -1279,17 +1331,85 @@ class AutoencoderKLLegacy(AutoencoderKL):
         vit_kwargs.setdefault("patch_size_t", self.vae_ratio_t)
         vit_kwargs.setdefault("t_causal", causal_decoder)
         self.decoder = ViT3DDecoder(**vit_kwargs)
+        # Tiled decode repeats one fixed-shape ViT forward per tile; the
+        # runner replays it as a CUDA graph after first-sight verification.
+        self._decoder_graph_runner = DecoderTileCudaGraphRunner(
+            decoder=self.decoder, offload_owner=self
+        )
+
+        # State-dict markers so already-folded dumps are not folded twice.
+        self.register_buffer(
+            CONV_IN_PIXEL_NORM_FOLDED_KEY, torch.tensor(False), persistent=True
+        )
+        self.register_buffer(
+            PROJ_OUT_PIXEL_DENORM_FOLDED_KEY, torch.tensor(False), persistent=True
+        )
+        self._pixel_folds_checked = False
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        decoder_config = self.decoder.config
+        apply_minimax_h3_vae_weight_folds_(
+            state_dict,
+            prefix=prefix,
+            pixel_mean=self._pixel_norm_mean,
+            pixel_std=self._pixel_norm_std,
+            proj_rows_per_channel=int(decoder_config.patch_size_t)
+            * int(decoder_config.patch_size) ** 2,
+        )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def _require_folded_weights(self):
+        """Fail loud when a load path bypassed the weight folds.
+
+        The forward paths assume folded weights (plain residual adds, skipped
+        quant convs, raw-pixel domain); a load that bypasses
+        ``load_state_dict`` (for example diffusers' meta-device loading) would
+        otherwise silently produce wrong pixels. One device sync, then cached.
+        """
+        if self._pixel_folds_checked:
+            return
+        conv_in_folded = bool(self.conv_in_pixel_norm_folded.item())
+        proj_out_folded = bool(self.proj_out_pixel_denorm_folded.item())
+        if not (conv_in_folded and proj_out_folded):
+            raise RuntimeError(
+                "MiniMax H3 VAE weights were not folded at load; load the "
+                "checkpoint through load_state_dict so weight_folds can run"
+            )
+        self._pixel_folds_checked = True
 
     @torch.no_grad()
     def encode(self, x):
-        return self.quant_conv(self.encoder(x))
+        # quant_conv is folded into encoder.conv_out at checkpoint load.
+        self._require_folded_weights()
+        # Under the bf16 encode gate the cast happens per tile here, so the
+        # full pixel canvas upstream stays fp32.
+        weight_dtype = self.encoder.conv_in.weight.dtype
+        if x.dtype != weight_dtype:
+            x = x.to(weight_dtype)
+        return self.encoder(x)
 
     @torch.no_grad()
     def decode(self, z):
-        z2 = self.post_quant_conv(z)
-        if self.use_vit_decoder:
-            return self.decoder(z2)
-        return self.decoder(z2, z)
+        # post_quant_conv is folded into decoder.x_embedder at checkpoint load.
+        self._require_folded_weights()
+        return self._decoder_graph_runner.run(z)
 
     def encode_base(self, input, process_image=False):
         if self.use_3d_conv and input.ndim == 4:

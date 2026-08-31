@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
     _cached_latent_mean_std,
+    minimax_h3_scoped_encode_dtype,
     minimax_h3_scoped_encode_rng,
 )
 
@@ -627,8 +628,9 @@ def minimax_h3_encode_reference_video_rows(
     """Encode transformed reference-video frames into packed imgvid cond rows.
 
     Frames come from the request's single ffmpeg transformation pass, then use
-    the SAME ``encode_videos`` recipe as the fl2va keyframe sink (fp32 weights,
-    configured complete-tile parallelism, torch seed pinned at 42 because the
+    the SAME ``encode_videos`` recipe as the fl2va keyframe sink (fp32 weights
+    unless the quality-gated bf16 encoder flag is on, configured complete-tile
+    parallelism, torch seed pinned at 42 because the
     encode SAMPLES the DiagonalGaussian, fp16 latent), then normalize
     and [1,2,2]-patchify. The VAE's clip_length=17 / token_drop=3 give the
     17-frames-per-5-latents temporal grouping (107 frames -> 32 latents).
@@ -653,18 +655,12 @@ def minimax_h3_encode_reference_video_rows(
             f"shape={list(frames.shape)}, dtype={frames.dtype}"
         )
 
-    parameter = next(video_vae.parameters())
-    prev_dtype = parameter.dtype
-    if prev_dtype != torch.float32:
-        video_vae.to(torch.float32)
-    try:
+    device = next(video_vae.parameters()).device
+    with minimax_h3_scoped_encode_dtype(video_vae):
         with minimax_h3_scoped_encode_rng(
-            MINIMAX_H3_REFERENCE_VIDEO_ENCODE_SEED, parameter.device
+            MINIMAX_H3_REFERENCE_VIDEO_ENCODE_SEED, device
         ):
             z = video_vae.encode_videos(frames, use_fp16_latent=True)[0]
-    finally:
-        if prev_dtype != torch.float32:
-            video_vae.to(prev_dtype)
     z = z.cpu().float()
     if z.dim() == 4:
         z = z[None]

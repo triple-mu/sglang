@@ -12,12 +12,15 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
-from .vit_utils import _env_flag, _vit_torch_compile_kwargs
+from .vit_utils import (
+    _env_flag,
+    _vit_torch_compile_kwargs,
+    fused_add_rmsnorm_cast_site,
+)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -26,11 +29,6 @@ def _vit_norm_input(module, hidden_states):
     if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
         return hidden_states.float()
     return hidden_states.to(getattr(module.weight, "dtype", hidden_states.dtype))
-
-
-def _scaled_residual_add(residual, x, scale):
-    fused = try_fused_scaled_residual_add_exact(residual, x, scale)
-    return residual + x * scale if fused is None else fused
 
 
 class FeedForward(nn.Module):
@@ -90,6 +88,9 @@ class FeedForward(nn.Module):
                 and hidden_states.is_contiguous()
                 and hidden_states.shape[-1] % 32 == 0
             ):
+                # Stays out of place: the in-place variant hands w2 a strided
+                # view, which flips nvjet to a different (slower) algo and
+                # breaks bit-exactness at the tile shape (measured on H200).
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
             elif self.silu_and_mul is not None:
                 hidden_states = self.silu_and_mul(hidden_states)
@@ -247,6 +248,9 @@ class TransformerBlock(nn.Module):
             **kwargs,
         )
         if use_scale:
+            # Checkpoints carry LayerScale vectors; weight_folds consumes them
+            # into attn.to_out / ff.w2 rows at load and loads ones here.
+            # Forward never reads them.
             self.scale1 = nn.Parameter(torch.zeros(dim))
 
         self.norm2 = norm_class(
@@ -273,20 +277,55 @@ class TransformerBlock(nn.Module):
             hidden_states.dtype
         )
         attn_output = self.attn(norm_hidden_states, rotary_pos_emb)
-        if self.use_scale:
-            hidden_states = _scaled_residual_add(
-                hidden_states, attn_output, self.scale1
-            )
-        else:
-            hidden_states = hidden_states + attn_output
+        # LayerScale is folded into attn.to_out / ff.w2 at checkpoint load
+        # (weight_folds), so both residual adds are unscaled.
+        hidden_states = hidden_states + attn_output
 
         norm_hidden_states = self.norm2(_vit_norm_input(self.norm2, hidden_states)).to(
             hidden_states.dtype
         )
         ff_output = self.ff(norm_hidden_states)
-        if self.use_scale:
-            hidden_states = _scaled_residual_add(hidden_states, ff_output, self.scale2)
-        else:
-            hidden_states = hidden_states + ff_output
+        hidden_states = hidden_states + ff_output
 
         return hidden_states
+
+    def _add_norm_cast(self, hidden_states, branch, norm):
+        """One residual triple: add ``branch`` (in place when fused), norm,
+        and cast to the compute dtype. Bit-exact either way -- the fused
+        kernel replicates the eager chain, and the eager fallback is it."""
+        fused = fused_add_rmsnorm_cast_site(hidden_states, branch, norm)
+        if fused is not None:
+            return hidden_states, fused
+        hidden_states = hidden_states + branch
+        normed = norm(_vit_norm_input(norm, hidden_states)).to(hidden_states.dtype)
+        return hidden_states, normed
+
+    def forward_deferred_residual(
+        self,
+        hidden_states: torch.FloatTensor,
+        pending_branch: Optional[torch.Tensor],
+        rotary_pos_emb: Optional[torch.FloatTensor] = None,
+    ):
+        """`forward` with both residual adds deferred into the following norm.
+
+        Takes the previous block's un-added ff output and returns this
+        block's un-added ff output; the caller adds the final pending branch
+        after the last block. Same math as `forward` -- each add still runs
+        immediately before the norm that consumes it, so the fused triple
+        kernel (or the identical eager sequence) covers every add+norm+cast
+        site across block boundaries.
+        """
+        if pending_branch is None:
+            norm_hidden_states = self.norm1(
+                _vit_norm_input(self.norm1, hidden_states)
+            ).to(hidden_states.dtype)
+        else:
+            hidden_states, norm_hidden_states = self._add_norm_cast(
+                hidden_states, pending_branch, self.norm1
+            )
+        attn_output = self.attn(norm_hidden_states, rotary_pos_emb)
+        hidden_states, norm_hidden_states = self._add_norm_cast(
+            hidden_states, attn_output, self.norm2
+        )
+        ff_output = self.ff(norm_hidden_states)
+        return hidden_states, ff_output

@@ -10,7 +10,11 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
 from .base_module import RotaryEmbeddingND, TransformerBlock
-from .vit_utils import create_token_ids, prepare_rotary_pos_emb
+from .vit_utils import (
+    create_token_ids,
+    fused_vit_triple_enabled,
+    prepare_rotary_pos_emb,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -50,7 +54,8 @@ def _pack_tensors_3d(tensors, patch_size, patch_size_t):
     return tensors
 
 
-def _unpack_tensors_3d(tensors, patch_size, patch_size_t, temporal, height, width):
+def _unpack_tensors_3d_view(tensors, patch_size, patch_size_t, temporal, height, width):
+    """Permuted 8-d view of the packed rows; materialize via _merge_unpacked_view."""
     batch_size, num_patches, channels = tensors.shape
     num_channels_tensors = channels // (patch_size_t * patch_size * patch_size)
 
@@ -64,9 +69,28 @@ def _unpack_tensors_3d(tensors, patch_size, patch_size_t, temporal, height, widt
         patch_size,
         patch_size,
     )
-    tensors = tensors.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
-    tensors = tensors.reshape(batch_size, num_channels_tensors, temporal, height, width)
-    return tensors
+    return tensors.permute(0, 4, 1, 5, 2, 6, 3, 7)
+
+
+def _merge_unpacked_view(view, *, copy):
+    """[B, C, T/pt, pt, H/p, p, W/p, p] view -> dense [B, C, T, H, W].
+
+    ``copy=True`` always materializes a fresh contiguous tensor (the graph
+    runner replays into static memory, so its callers must never alias it);
+    ``copy=False`` keeps the eager no-op-when-already-contiguous behavior.
+    """
+    b, c, t_out, pt, h_out, p1, w_out, p2 = view.shape
+    dense = (
+        view.clone(memory_format=torch.contiguous_format) if copy else view.contiguous()
+    )
+    return dense.view(b, c, t_out * pt, h_out * p1, w_out * p2)
+
+
+def _unpack_tensors_3d(tensors, patch_size, patch_size_t, temporal, height, width):
+    view = _unpack_tensors_3d_view(
+        tensors, patch_size, patch_size_t, temporal, height, width
+    )
+    return _merge_unpacked_view(view, copy=False)
 
 
 class ViTBase(ModelMixin, ConfigMixin):
@@ -209,7 +233,9 @@ class ViT3DDecoder(ViTBase):
             ]
         )
 
-        self.norm_out = nn.LayerNorm(dim, elementwise_affine=norm_affine, eps=eps)
+        # The checkpoint's norm_out affine is folded into proj_out columns at
+        # load (weight_folds); norm_affine still governs the block norms.
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         patch_dim = out_channels * patch_size_t * patch_size * patch_size
         self.proj_out = nn.Linear(dim, patch_dim)
 
@@ -218,6 +244,9 @@ class ViT3DDecoder(ViTBase):
 
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        # Bumped whenever parameter storages may have been re-materialized;
+        # the decoder CUDA graph runner drops captures from older epochs.
+        self._graph_epoch = 0
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
@@ -226,6 +255,7 @@ class ViT3DDecoder(ViTBase):
         result = super()._apply(fn, recurse=recurse)
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        self._graph_epoch += 1
         return result
 
     def prepare_autocast_linear_weights(self, dtype: torch.dtype) -> int:
@@ -258,34 +288,88 @@ class ViT3DDecoder(ViTBase):
                 if linear.weight.dtype != dtype:
                     linear.to(dtype=dtype)
                     converted += 1
+        if converted:
+            # Submodule .to() bypasses this module's _apply override, but the
+            # replaced weight storages equally invalidate captured graphs.
+            self._graph_epoch += 1
         self._autocast_linear_dtype = dtype
         return converted
 
+    def _embed_with_suffix_tokens(
+        self, packed: torch.Tensor, num_suffix: int
+    ) -> torch.Tensor:
+        """x_embedder projection plus register/cls suffix rows, [B, P+S, dim].
+
+        On the CUDA single-tile path the projection writes the leading rows of
+        the suffix-carrying buffer directly (same GEMM shape and leading
+        dimension, so the bits match F.linear), and only the tiny suffix rows
+        are prefilled -- the full-width torch.cat copy disappears.
+        """
+        batch_size, num_patches, _ = packed.shape
+        weight = self.x_embedder.weight
+        bias = self.x_embedder.bias
+        if (
+            packed.is_cuda
+            and batch_size == 1
+            and bias is not None
+            and packed.dtype == weight.dtype
+            and (
+                self.register_tokens is None
+                or self.register_tokens.dtype == weight.dtype
+            )
+        ):
+            hidden_states = packed.new_empty(
+                (1, num_patches + num_suffix, weight.shape[0])
+            )
+            rows = hidden_states[0, :num_patches]
+            with _cuda_autocast_disabled(packed):
+                if packed.is_contiguous():
+                    # F.linear folds contiguous 3d input to a bias-epilogue
+                    # addmm; the out= form issues the same GEMM.
+                    torch.addmm(bias, packed[0], weight.t(), out=rows)
+                else:
+                    # The patchify alias is a transposed view, which F.linear
+                    # lowers to matmul + a separate bias add (no epilogue);
+                    # replicate both steps so the bits match the legacy path.
+                    torch.mm(packed[0], weight.t(), out=rows)
+                    rows.add_(bias)
+            suffix_start = num_patches
+            if self.register_tokens is not None:
+                suffix_start = num_patches + self.register_tokens.shape[1]
+                hidden_states[0, num_patches:suffix_start] = self.register_tokens[0]
+            hidden_states[0, suffix_start:].zero_()
+            return hidden_states
+
+        with _cuda_autocast_disabled(packed):
+            hidden_states = _linear_with_module_dtype(
+                self.x_embedder, packed, packed.dtype
+            )
+        tokens = [hidden_states]
+        if self.register_tokens is not None:
+            tokens.append(self.register_tokens.expand(batch_size, -1, -1))
+        tokens.append(torch.zeros_like(hidden_states[:, 0:1, :]))
+        return torch.cat(tokens, dim=1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _merge_unpacked_view(self._forward_unpacked_view(x), copy=False)
+
+    def _forward_unpacked_view(self, x: torch.Tensor) -> torch.Tensor:
+        """Full tile forward up to the unpack permute, returned as a view.
+
+        ``forward`` materializes the view; the tile CUDA graph runner captures
+        this method instead and materializes outside the graph, merging the
+        unpack copy with the replay-output clone into one pass.
+        """
         B, C, latent_T, latent_H, latent_W = x.shape
         patch_size = self.config.patch_size
         patch_size_t = self.config.patch_size_t
         num_suffix = 1 + self.num_register_tokens
 
-        hidden_states = _pack_tensors_3d(x, 1, 1)
+        packed = _pack_tensors_3d(x, 1, 1)
         latent_size = (latent_T, latent_H, latent_W)
 
-        with _cuda_autocast_disabled(hidden_states):
-            hidden_states = _linear_with_module_dtype(
-                self.x_embedder, hidden_states, hidden_states.dtype
-            )
-
-        num_patches = hidden_states.shape[1]
-
-        tokens = [hidden_states]
-
-        if self.register_tokens is not None:
-            register_tokens = self.register_tokens.expand(B, -1, -1)
-            tokens.append(register_tokens)
-
-        cls_token = torch.zeros_like(hidden_states[:, 0:1, :])
-        tokens.append(cls_token)
-        hidden_states = torch.cat(tokens, dim=1)
+        num_patches = packed.shape[1]
+        hidden_states = self._embed_with_suffix_tokens(packed, num_suffix)
 
         patch_dims = [latent_T, latent_H, latent_W]
         rotary_dtype = (
@@ -338,8 +422,22 @@ class ViT3DDecoder(ViTBase):
                     rotary_pos_emb,
                 )
 
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_pos_emb)
+        if fused_vit_triple_enabled():
+            # Deferred-residual loop: each block hands its un-added ff output
+            # to the next block's norm1 so every add+norm+cast triple (also
+            # across block boundaries) is one fused-kernel site. Same math as
+            # the plain loop; the final pending add lands before norm_out
+            # exactly where the last block's eager add ran.
+            pending_branch = None
+            for block in self.transformer_blocks:
+                hidden_states, pending_branch = block.forward_deferred_residual(
+                    hidden_states, pending_branch, rotary_pos_emb
+                )
+            if pending_branch is not None:
+                hidden_states = hidden_states + pending_branch
+        else:
+            for block in self.transformer_blocks:
+                hidden_states = block(hidden_states, rotary_pos_emb)
 
         hidden_states = self.norm_out(hidden_states)
 
@@ -355,8 +453,6 @@ class ViT3DDecoder(ViTBase):
         video_t = latent_size[0] * patch_size_t
         video_h = latent_size[1] * patch_size
         video_w = latent_size[2] * patch_size
-        output = _unpack_tensors_3d(
+        return _unpack_tensors_3d_view(
             output, patch_size, patch_size_t, video_t, video_h, video_w
         )
-
-        return output

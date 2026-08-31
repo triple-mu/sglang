@@ -648,11 +648,14 @@ class CudaPlatformBase(Platform):
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
-        fast paths.
+        fast paths and the env-gated MiniMax-H3 VAE encoder cudnn_conv path.
 
-        Requests with quality == "high" run the fast paths; the "lossless"
-        default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        Requests with quality == "high" run the decoder fast paths; the
+        "lossless" default runs the original module path bit-for-bit. See
+        flux2_vae_cuda_opt and wan_vae_cuda_opt for details. The MiniMax-H3
+        encoder path is server-level: on by default when cudnn_conv is
+        available, MINIMAX_H3_VAE_ENCODER_CUDNN_CONV=0/1 to opt out / fail
+        loud. See minimax_h3_vae_cuda_opt for details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
@@ -671,6 +674,16 @@ class CudaPlatformBase(Platform):
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",
                 exc_info=True,
             )
+
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+            maybe_optimize_minimax_h3_vae_encoder,
+        )
+
+        # Outside the try above: the gate handles auto-mode fallback itself,
+        # and MINIMAX_H3_VAE_ENCODER_CUDNN_CONV=1 must fail loud. Keep this
+        # call last so load-time weight folds precede the channels_last_3d
+        # weight conversion done at install.
+        vae = maybe_optimize_minimax_h3_vae_encoder(vae)
         return vae
 
 

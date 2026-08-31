@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 
-from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
+from .vit_utils import _env_flag, apply_rotary_pos_emb_qk, fused_qknorm_rope_qk
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
@@ -117,7 +117,10 @@ class Attention(nn.Module):
                     AttentionBackendEnum.FA,
                     AttentionBackendEnum.TORCH_SDPA,
                 },
-                default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+                # FA3 measured 1.48x faster than SDPA's FA2 dispatch at the
+                # decode shape (fp16 [1797, 32, 64]) on H200; re-check when
+                # kernels or head sizes change.
+                default_attention_backend=AttentionBackendEnum.FA,
                 skip_sequence_parallel=True,
             )
             if current_platform.is_cuda()
@@ -138,13 +141,25 @@ class Attention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
         query, key, value = torch.chunk(qkv, 3, dim=-1)
 
-        if self.norm_q is not None:
-            query = _apply_qk_norm(self.norm_q, query)
-        if self.norm_k is not None:
-            key = _apply_qk_norm(self.norm_k, key)
+        fused = (
+            self.norm_q is not None
+            and self.norm_k is not None
+            and fused_qknorm_rope_qk(
+                query,
+                key,
+                rotary_pos_emb,
+                norm_q=self.norm_q,
+                norm_k=self.norm_k,
+            )
+        )
+        if not fused:
+            if self.norm_q is not None:
+                query = _apply_qk_norm(self.norm_q, query)
+            if self.norm_k is not None:
+                key = _apply_qk_norm(self.norm_k, key)
 
-        if rotary_pos_emb is not None:
-            query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+            if rotary_pos_emb is not None:
+                query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)

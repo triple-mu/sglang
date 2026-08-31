@@ -2,7 +2,7 @@
 # ViT runtime helpers for the MiniMax H3 visual VAE.
 import os
 from collections.abc import Sequence
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from diffusers.utils import logging
@@ -207,6 +207,182 @@ def apply_rotary_pos_emb(
             _COMPILED_APPLY_ROTARY_POS_EMB = None
             return _apply_rotary_pos_emb_impl(t, rotary_pos_emb)
         raise
+
+
+_FUSED_QKNORM_ROPE_ENV = "MINIMAX_H3_VAE_DECODER_VIT_FUSED_QKNORM_ROPE"
+_FUSED_TRIPLE_ENV = "MINIMAX_H3_VAE_DECODER_VIT_FUSED_TRIPLE"
+_QKNORM_ONES_WEIGHTS: dict = {}
+_TRIPLE_ONES_WEIGHTS: dict = {}
+
+
+def _triple_ones_weight(dim: int, device: torch.device) -> torch.Tensor:
+    key = (dim, device)
+    weight = _TRIPLE_ONES_WEIGHTS.get(key)
+    if weight is None:
+        # aten skips the gamma multiply for weightless RMSNorm; multiplying
+        # the fp32 result by 1.0 is an exact identity, so ones == weightless.
+        weight = torch.ones(dim, device=device, dtype=torch.float32)
+        _TRIPLE_ONES_WEIGHTS[key] = weight
+    return weight
+
+
+def fused_vit_triple_enabled() -> bool:
+    """Gate for the deferred-residual block loop (see TransformerBlock)."""
+    return _env_flag(_FUSED_TRIPLE_ENV, "1")
+
+
+def fused_add_rmsnorm_cast_site(
+    residual: torch.Tensor,
+    branch: torch.Tensor,
+    norm,
+) -> Optional[torch.Tensor]:
+    """Fuse one decoder triple: residual += branch (fp32, in place), RMSNorm,
+    and the autocast-dtype cast the next Linear would issue.
+
+    Returns the normalized autocast-dtype tensor, or None when the fused
+    kernel does not apply (callers run the eager triple). Bit-exact vs the
+    eager chain: the kernel replicates aten's fp32 rms reduction.
+    """
+    if (
+        not isinstance(norm, torch.nn.RMSNorm)
+        or norm.eps is None
+        or not residual.is_cuda
+        or residual.dtype != torch.float32
+        or not residual.is_contiguous()
+        or branch.shape != residual.shape
+        or branch.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or not branch.is_contiguous()
+        or not torch.is_autocast_enabled("cuda")
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or residual.data_ptr() % 16
+        or branch.data_ptr() % 16
+    ):
+        return None
+    weight = norm.weight
+    if weight is not None and (
+        weight.dtype != torch.float32 or not weight.is_contiguous()
+    ):
+        return None
+    out_dtype = torch.get_autocast_dtype("cuda")
+    dim = residual.shape[-1]
+
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_residual_rmsnorm_cast,
+        fused_residual_rmsnorm_cast_,
+    )
+
+    if not can_use_fused_residual_rmsnorm_cast(dim, branch.dtype, out_dtype):
+        return None
+    if weight is None:
+        weight = _triple_ones_weight(dim, residual.device)
+    return fused_residual_rmsnorm_cast_(
+        residual, branch, weight, eps=norm.eps, out_dtype=out_dtype
+    )
+
+
+def _qknorm_ones_weight(
+    head_dim: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    key = (head_dim, device, dtype)
+    weight = _QKNORM_ONES_WEIGHTS.get(key)
+    if weight is None:
+        # The fused kernel API requires an affine weight; multiplying the fp32
+        # accumulator by 1.0 is an exact identity, so ones == weightless.
+        weight = torch.ones(head_dim, device=device, dtype=dtype)
+        _QKNORM_ONES_WEIGHTS[key] = weight
+    return weight
+
+
+def _is_weightless_rms_norm(module) -> bool:
+    return (
+        isinstance(module, torch.nn.RMSNorm)
+        and module.weight is None
+        and module.eps is not None
+    )
+
+
+def fused_qknorm_rope_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    rotary_pos_emb: Sequence[torch.Tensor],
+    *,
+    norm_q,
+    norm_k,
+) -> bool:
+    """Fuse the weightless RMSNorm + NeoX rotary chain into one in-place kernel.
+
+    Returns True when applied; callers fall back to the eager chain otherwise.
+    aten_norm_order keeps the fused output bit-exact vs the released chain
+    (aten fp16 RMSNorm then sgl_kernel rotary_embedding).
+    """
+    if not _env_flag(_FUSED_QKNORM_ROPE_ENV, "1"):
+        return False
+    if (
+        rotary_pos_emb is None
+        or len(rotary_pos_emb) != 4
+        or not _is_weightless_rms_norm(norm_q)
+        or not _is_weightless_rms_norm(norm_k)
+        or norm_q.eps != norm_k.eps
+        or not query.is_cuda
+        or query.dim() != 4
+        or query.shape[0] != 1
+        or query.shape != key.shape
+        or query.dtype != key.dtype
+        or query.dtype not in (torch.float16, torch.bfloat16)
+        or query.stride(-1) != 1
+        or key.stride(-1) != 1
+        or query.stride(2) != key.stride(2)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+    ):
+        return False
+    seq_len, head_dim = query.shape[1], query.shape[-1]
+    cache, positions = rotary_pos_emb[2], rotary_pos_emb[3]
+    if (
+        not cache.is_cuda
+        or cache.dtype != query.dtype
+        or cache.dim() != 2
+        or cache.shape[0] != seq_len
+        or cache.shape[1] > head_dim
+        or not positions.is_cuda
+        or positions.shape != (seq_len,)
+    ):
+        return False
+
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_inplace_qknorm_rope,
+        fused_inplace_qknorm_rope,
+    )
+
+    rope_dim = int(cache.shape[1])
+    if not can_use_fused_inplace_qknorm_rope(
+        head_dim,
+        rope_dim,
+        True,
+        query.dtype,
+        cache_dtype=cache.dtype,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    ):
+        return False
+
+    ones = _qknorm_ones_weight(head_dim, query.device, query.dtype)
+    fused_inplace_qknorm_rope(
+        query[0],
+        key[0],
+        ones,
+        ones,
+        cache,
+        positions,
+        is_neox=True,
+        eps=norm_q.eps,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    )
+    return True
 
 
 def apply_rotary_pos_emb_qk(
