@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.decoder_cuda
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_vit import (
     ViT3DDecoder,
+    _merge_unpacked_view,
+    _pack_tensors_3d,
+    _unpack_tensors_3d_view,
 )
 
 requires_cuda = pytest.mark.skipif(
@@ -95,6 +98,50 @@ def _tile(shape=TILE_SHAPE, seed=0) -> torch.Tensor:
 
 def _graph_entries(runner):
     return list(runner._entries.values())
+
+
+@requires_cuda
+@torch.no_grad()
+def test_embed_prefill_matches_linear_cat_reference(monkeypatch):
+    """The suffix-buffer prefill (addmm into the leading rows) must be bitwise
+    equal to the legacy F.linear + register/cls torch.cat construction."""
+    _ensure_test_runtime(monkeypatch)
+    decoder = _make_decoder()
+    x = _tile(seed=7)
+    with _forward_context(), _autocast():
+        packed = _pack_tensors_3d(x, 1, 1)
+        num_suffix = 1 + decoder.num_register_tokens
+        got = decoder._embed_with_suffix_tokens(packed, num_suffix)
+
+        with torch.autocast("cuda", enabled=False):
+            hidden = decoder.x_embedder(packed.to(decoder.x_embedder.weight.dtype)).to(
+                packed.dtype
+            )
+        reference = torch.cat(
+            [
+                hidden,
+                decoder.register_tokens.expand(1, -1, -1),
+                torch.zeros_like(hidden[:, 0:1, :]),
+            ],
+            dim=1,
+        )
+    assert got.shape == reference.shape
+    assert torch.equal(got, reference)
+
+
+def test_merge_unpacked_view_copy_never_aliases():
+    """copy=True must return owned memory even when the permuted view is
+    already contiguous (degenerate tile dims), or replays would hand out
+    aliases of the graph's static output."""
+    packed = torch.randn(1, 1, 12)
+    view = _unpack_tensors_3d_view(
+        packed, patch_size=2, patch_size_t=1, temporal=1, height=2, width=2
+    )
+    assert view.is_contiguous()
+    dense = _merge_unpacked_view(view, copy=True)
+    assert dense.data_ptr() != packed.data_ptr()
+    assert torch.equal(dense, _merge_unpacked_view(view, copy=False))
+    assert dense.shape == (1, 3, 1, 2, 2)
 
 
 @requires_cuda

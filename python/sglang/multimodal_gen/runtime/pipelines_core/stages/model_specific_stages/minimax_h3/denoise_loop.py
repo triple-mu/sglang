@@ -20,6 +20,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_persist import (
+    adaln_plan_key,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -446,6 +452,54 @@ class MiniMaxH3DenoiseBranch:
         ]
 
 
+def _adaln_prewarm_step_timesteps(
+    model: Any,
+    positive: MiniMaxH3DenoiseBranch,
+    *,
+    base_step_timesteps: list[torch.Tensor],
+    adaln_prewarm_sigmas: dict[str, list[float]] | None,
+    imgvid_cond_noise_aug: float,
+    audio_ref_cond_noise_aug: float,
+) -> list[torch.Tensor]:
+    """Serving-schedule step timesteps a warmup request should co-build.
+
+    Returns [] unless the model runs the online AdaLN rebuild and the whole
+    warmup+serving plan union fits the rebuild slab -- a partial prewarm saves
+    nothing because any later miss re-reads the full checkpoint anyway.
+    """
+    if adaln_prewarm_sigmas is None:
+        return []
+    cache = model.adaln_cache
+    if cache is None or cache.weight_files is None:
+        return []
+    sigmas_video = [float(value) for value in adaln_prewarm_sigmas["video"]]
+    sigmas_audio = [float(value) for value in adaln_prewarm_sigmas["audio"]]
+    prewarm_plan = positive.prepare_timestep_plan(
+        video_timesteps=[1.0 - sigma for sigma in sigmas_video[:-1]],
+        audio_timesteps=[1.0 - sigma for sigma in sigmas_audio[:-1]],
+        imgvid_cond_noise_aug=imgvid_cond_noise_aug,
+        audio_ref_cond_noise_aug=audio_ref_cond_noise_aug,
+    )
+    prewarm_step_timesteps = [entry[0] for entry in prewarm_plan]
+    # Mirror build()'s per-request capacity checks so the warmup request can
+    # never fail on plans it does not itself need.
+    wanted = {adaln_plan_key(timesteps) for timesteps in base_step_timesteps}
+    wanted.update(adaln_plan_key(timesteps) for timesteps in prewarm_step_timesteps)
+    widest = max(timesteps.numel() for timesteps in prewarm_step_timesteps)
+    if len(wanted) > cache.max_plans or widest > cache.max_plan_width:
+        logger.warning(
+            "MiniMax H3 AdaLN warmup prewarm skipped: %d plans (width %d) "
+            "exceed the rebuild slab (max_plans %d, max plan width %d); the "
+            "first real request will pay a full AdaLN rebuild",
+            len(wanted),
+            widest,
+            cache.max_plans,
+            cache.max_plan_width,
+        )
+        return []
+    return prewarm_step_timesteps
+
+
 def minimax_h3_denoise_loop(
     *,
     model: Any,
@@ -459,6 +513,7 @@ def minimax_h3_denoise_loop(
     audio_ref_rows: torch.Tensor | None = None,
     sigmas_video: list[float],
     sigmas_audio: list[float],
+    adaln_prewarm_sigmas: dict[str, list[float]] | None = None,
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
@@ -540,8 +595,18 @@ def minimax_h3_denoise_loop(
     )
     # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
     # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in
-    # one pass here instead of topping up step by step inside the loop.
-    model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
+    # one pass here instead of topping up step by step inside the loop. A
+    # warmup request folds its serving-steps plans into the same pass.
+    step_timesteps = [entry[0] for entry in timestep_plan]
+    prewarm_step_timesteps = _adaln_prewarm_step_timesteps(
+        model,
+        positive,
+        base_step_timesteps=step_timesteps,
+        adaln_prewarm_sigmas=adaln_prewarm_sigmas,
+        imgvid_cond_noise_aug=float(imgvid_cond_noise_aug_for_inference),
+        audio_ref_cond_noise_aug=float(audio_cond_noise_aug_for_inference),
+    )
+    model.prepare_adaln_plans(step_timesteps + prewarm_step_timesteps)
 
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 import os
-import struct
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import ExitStack
@@ -33,6 +32,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_bf16_to_fp32,
     per_head_quant_fp8,
     rmsnorm_indexed_scale_shift,
 )
@@ -53,6 +53,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_tp_rank,
     get_ulysses_ctx,
+    get_world_rank,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_persist import (
+    adaln_plan_key,
+    load_adaln_plans,
+    make_adaln_persist_spec,
+    save_adaln_plans,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
@@ -82,6 +89,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -344,6 +352,33 @@ def _modulate_scale_shift(
     ).to(dtype)
 
 
+def _modulate_scale_shift_to_fp32(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Indexed affine modulation fused with the final-layer fp32 widening.
+
+    One kernel reads the bf16 activation once and stores fp32; bitwise equal
+    to ``_modulate_scale_shift(..., dtype=bf16)`` followed by ``.to(fp32)``
+    (the fused kernel keeps every bf16 rounding boundary and the bf16 -> fp32
+    widening is exact).
+    """
+    if (
+        x.is_cuda
+        and x.dtype == _BF16_DTYPE
+        and shift.dtype == _BF16_DTYPE
+        and scale.dtype == _BF16_DTYPE
+        and x.is_contiguous()
+        and not torch.compiler.is_compiling()
+    ):
+        return indexed_scale_shift_bf16_to_fp32(x, shift, scale, indices)
+    return _modulate_scale_shift(x, shift, scale, indices, dtype=_BF16_DTYPE).to(
+        _FP32_DTYPE
+    )
+
+
 def _modulate_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -574,6 +609,53 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         hidden = nn.functional.silu(hidden)
         out, _ = self.proj_out(hidden)
         return out
+
+
+def _qkv_native_order_mode() -> str:
+    """Resolve MINIMAX_H3_QKV_NATIVE_ORDER into one of three modes.
+
+    'off': explicitly disabled. 'auto': default-on -- unsupported configs fall
+    back to the legacy reordered rows with one log line. 'strict': explicitly
+    enabled -- unsupported configs raise instead of falling back (debugging).
+    """
+    if not envs.MINIMAX_H3_QKV_NATIVE_ORDER:
+        return "off"
+    if "MINIMAX_H3_QKV_NATIVE_ORDER" in os.environ:
+        return "strict"
+    return "auto"
+
+
+def _startup_lora_configured() -> bool:
+    """Whether serving was launched with a startup LoRA adapter (--lora-path).
+
+    Adapter rows assume the reordered [q_all, k_all, v_all] qkv layout, so
+    native order must fall back before weights load. Dynamic ``set_lora`` on a
+    server launched without --lora-path is still rejected at conversion time
+    (see LoRAPipeline._reject_lora_on_packed_weights).
+    """
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        # Direct model construction without serving config (unit tests,
+        # library callers): no startup adapter exists.
+        return False
+    return server_args.lora_path is not None
+
+
+_qkv_native_order_fallback_logged = False
+
+
+def _log_qkv_native_order_fallback(reason: str) -> None:
+    global _qkv_native_order_fallback_logged
+    if _qkv_native_order_fallback_logged:
+        return
+    _qkv_native_order_fallback_logged = True
+    logger.info(
+        "MiniMax H3 qkv native order stays on the legacy reordered rows for "
+        "this run: %s (set MINIMAX_H3_QKV_NATIVE_ORDER=1 to make this an "
+        "error instead)",
+        reason,
+    )
 
 
 def _attn_out_direct_staging_enabled(attention: MiniMaxH3Attention) -> bool:
@@ -853,16 +935,23 @@ class MiniMaxH3Attention(nn.Module):
             checkpoint_qkv_is_native or arch.checkpoint_uses_diffusers_layout
         )
         self._qkv_rows_interleaved = False
-        if checkpoint_qkv_is_native:
-            if envs.MINIMAX_H3_QKV_NATIVE_ORDER:
-                raise ValueError(
+        native_order_mode = _qkv_native_order_mode()
+        if native_order_mode != "off":
+            if checkpoint_qkv_is_native:
+                reason = (
                     "MINIMAX_H3_QKV_NATIVE_ORDER applies to the official "
                     "interleaved qkv checkpoints only; this checkpoint already "
                     "stores [q_all, k_all, v_all] rows."
                 )
-        elif envs.MINIMAX_H3_QKV_NATIVE_ORDER:
-            self._install_qkv_native_order(quant_config)
-        else:
+            else:
+                reason = self._qkv_native_order_unsupported_reason(quant_config)
+            if reason is None:
+                self._install_qkv_native_order(quant_config)
+            elif native_order_mode == "strict":
+                raise ValueError(reason)
+            else:
+                _log_qkv_native_order_fallback(reason)
+        if not self._qkv_rows_interleaved and not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
@@ -877,6 +966,21 @@ class MiniMaxH3Attention(nn.Module):
                 _BF16_DTYPE,
                 cache_dtype=_BF16_DTYPE,
                 round_norm_before_rope=True,
+            )
+        )
+        # Opt-in wide variant (two heads per warp): near-lossless, not
+        # bitwise vs the split-chain contract; see MINIMAX_H3_QKNORM_ROPE_WIDE.
+        self._qknorm_rope_wide = (
+            self._use_fused_qknorm_rope
+            and envs.MINIMAX_H3_QKNORM_ROPE_WIDE
+            and can_use_fused_inplace_qknorm_rope(
+                arch.attention_head_dim,
+                rope_dim,
+                True,
+                _BF16_DTYPE,
+                cache_dtype=_BF16_DTYPE,
+                round_norm_before_rope=True,
+                wide_head=True,
             )
         )
         self.out_proj = RowParallelLinear(
@@ -956,6 +1060,39 @@ class MiniMaxH3Attention(nn.Module):
                 continue
             _install_qkv_row_reorder(param, _reorder_checkpoint_weight, qkv_rows)
 
+    def _qkv_native_order_unsupported_reason(
+        self, quant_config: QuantizationConfig | None
+    ) -> str | None:
+        """First reason the native qkv row order cannot serve this config.
+
+        Everything that assumes the reordered [q_all, k_all, v_all] layout is
+        unsupported: quantized checkpoints (row-indexed scale metadata moves
+        with the reorder), TP sharding (rows are sliced per logical Q/K/V
+        matrix), non-CUDA platforms (the MPS streamed path splits contiguous
+        Q/K/V segments), and startup LoRA adapters (adapter rows are sliced
+        assuming the reordered layout).
+        """
+        if not current_platform.is_cuda():
+            return "MINIMAX_H3_QKV_NATIVE_ORDER requires a CUDA platform."
+        if quant_config is not None:
+            return (
+                "MINIMAX_H3_QKV_NATIVE_ORDER does not support quantized "
+                f"checkpoints (quantization={quant_config.get_name()!r}); "
+                "row-indexed scale metadata assumes the reordered layout."
+            )
+        if self.tp_size > 1:
+            return (
+                "MINIMAX_H3_QKV_NATIVE_ORDER requires DiT tp_size == 1, got "
+                f"{self.tp_size}."
+            )
+        if _startup_lora_configured():
+            return (
+                "MINIMAX_H3_QKV_NATIVE_ORDER does not support LoRA adapters "
+                "(--lora-path is configured); adapter rows assume the "
+                "reordered [q_all, k_all, v_all] layout."
+            )
+        return None
+
     def _install_qkv_native_order(
         self, quant_config: QuantizationConfig | None
     ) -> None:
@@ -965,26 +1102,15 @@ class MiniMaxH3Attention(nn.Module):
         layout: destination w's [T, h_local, 3*head_dim] slab is the w-th
         contiguous row block of the weight, so the projection can write the
         A2A send buffer directly and the pack kernel becomes a no-op.
-        Everything that assumes the reordered [q_all, k_all, v_all] layout
-        fails closed here: quantized checkpoints (row-indexed scale metadata
-        moves with the reorder), TP sharding (rows are sliced per logical
-        Q/K/V matrix), and non-CUDA platforms (the MPS streamed path splits
-        contiguous Q/K/V segments). LoRA adapters are rejected at conversion
-        time via the weight marker read by the LoRA pipeline.
+        Unsupported configs raise here; under the default-on auto mode the
+        constructor checks the same preconditions first and falls back to the
+        legacy reordered rows instead. Dynamic LoRA attached after startup is
+        rejected at conversion time via the weight marker read by the LoRA
+        pipeline.
         """
-        if not current_platform.is_cuda():
-            raise ValueError("MINIMAX_H3_QKV_NATIVE_ORDER requires a CUDA platform.")
-        if quant_config is not None:
-            raise ValueError(
-                "MINIMAX_H3_QKV_NATIVE_ORDER does not support quantized "
-                f"checkpoints (quantization={quant_config.get_name()!r}); "
-                "row-indexed scale metadata assumes the reordered layout."
-            )
-        if self.tp_size > 1:
-            raise ValueError(
-                "MINIMAX_H3_QKV_NATIVE_ORDER requires DiT tp_size == 1, got "
-                f"{self.tp_size}."
-            )
+        reason = self._qkv_native_order_unsupported_reason(quant_config)
+        if reason is not None:
+            raise ValueError(reason)
         self._qkv_rows_interleaved = True
         self.qkv_proj.weight.qkv_rows_interleaved = True
 
@@ -1007,6 +1133,7 @@ class MiniMaxH3Attention(nn.Module):
             head_dim=self.head_dim,
             rope_dim=cos_sin_cache.shape[-1],
             round_norm_before_rope=True,
+            wide_head=self._qknorm_rope_wide,
         )
 
     def _project_qkv_interleaved(
@@ -1450,12 +1577,9 @@ class MiniMaxH3AdalnProj(nn.Module):
 MINIMAX_H3_ADALN_MAX_PLAN_WIDTH = 4
 
 
-def _plan_key(timesteps: torch.Tensor) -> tuple[int, ...]:
-    """One denoise step's unique timesteps as their exact fp32 bit patterns."""
-    return tuple(
-        struct.unpack("<I", struct.pack("<f", float(value)))[0]
-        for value in timesteps.tolist()
-    )
+# Canonical plan-key definition lives with the persist store so the on-disk
+# format and the in-memory slab can never disagree on key semantics.
+_plan_key = adaln_plan_key
 
 
 class MiniMaxH3AdalnCache(nn.Module):
@@ -1502,6 +1626,20 @@ class MiniMaxH3AdalnCache(nn.Module):
         # Rebuild path only: plan bit pattern -> slot, tracked on the host.
         self._slots: dict[tuple[int, ...], int] = {}
         self.rebuilds = 0
+        self.persist_loads = 0
+        persist_dir = envs.MINIMAX_H3_ADALN_PERSIST_DIR
+        self._persist_spec = (
+            make_adaln_persist_spec(
+                directory=persist_dir,
+                weight_files=weight_files,
+                tp_size=get_tp_world_size(),
+                num_layers=self.num_layers,
+                block_width=self.block_width,
+                final_width=self.final_width,
+            )
+            if weight_files is not None and persist_dir
+            else None
+        )
 
     def load(self, device: torch.device) -> None:
         if self.path is None:
@@ -1614,7 +1752,9 @@ class MiniMaxH3AdalnCache(nn.Module):
 
         The pass reads all 50 adaln_proj layers regardless of how many plans are
         missing, so a request builds everything it needs before denoising rather
-        than filling in step by step.
+        than filling in step by step. When a persist store holds every missing
+        plan (MINIMAX_H3_ADALN_PERSIST_DIR), the checkpoint pass is skipped and
+        the previously built slabs are read back instead.
         """
         wanted: dict[tuple[int, ...], torch.Tensor] = {}
         for timesteps in step_timesteps:
@@ -1644,6 +1784,9 @@ class MiniMaxH3AdalnCache(nn.Module):
             self.plan_lengths.zero_()
 
         device = self.block_params.device
+        if self._load_plans_from_persist_store(plans_to_build, device=device):
+            return
+
         slots = []
         pending_slots: dict[tuple[int, ...], int] = {}
         for offset, (key, timesteps) in enumerate(plans_to_build.items()):
@@ -1708,6 +1851,78 @@ class MiniMaxH3AdalnCache(nn.Module):
             self.max_plans,
             self.rebuilds,
         )
+        self._save_plans_to_persist_store(plans_to_build)
+
+    def _load_plans_from_persist_store(
+        self,
+        plans_to_build: dict[tuple[int, ...], torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> bool:
+        """Fill the requested slots from disk instead of the checkpoint pass."""
+        if self._persist_spec is None:
+            return False
+        loaded = load_adaln_plans(
+            self._persist_spec, list(plans_to_build), device=device
+        )
+        if loaded is None:
+            return False
+        pending_slots: dict[tuple[int, ...], int] = {}
+        lengths: list[tuple[int, int]] = []
+        for offset, (key, entry) in enumerate(zip(plans_to_build, loaded)):
+            plan_timesteps, block_params, final_params = entry
+            slot = len(self._slots) + offset
+            length = plan_timesteps.numel()
+            pending_slots[key] = slot
+            self.plan_timesteps[slot, :length] = plan_timesteps
+            self.block_params[slot, :length] = block_params
+            self.final_params[slot, :length] = final_params
+            lengths.append((slot, length))
+        for slot, length in lengths:
+            self.plan_lengths[slot] = length
+        self._slots.update(pending_slots)
+        self.persist_loads += 1
+        logger.info(
+            "MiniMax H3 AdaLN: loaded %d plan(s) from the persist store, "
+            "%d/%d resident",
+            len(plans_to_build),
+            len(self._slots),
+            self.max_plans,
+        )
+        return True
+
+    def _save_plans_to_persist_store(
+        self,
+        plans_built: dict[tuple[int, ...], torch.Tensor],
+    ) -> None:
+        """Best-effort persist of freshly built plans, first world rank only."""
+        if self._persist_spec is None or get_world_rank() != 0:
+            return
+        try:
+            saved = save_adaln_plans(
+                self._persist_spec,
+                (
+                    (
+                        key,
+                        self.plan_timesteps[self._slots[key], : timesteps.numel()],
+                        self.block_params[self._slots[key], : timesteps.numel()],
+                        self.final_params[self._slots[key], : timesteps.numel()],
+                    )
+                    for key, timesteps in plans_built.items()
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "MiniMax H3 AdaLN: persisting built plans failed; continuing",
+                exc_info=True,
+            )
+            return
+        if saved:
+            logger.info(
+                "MiniMax H3 AdaLN: persisted %d plan(s) to %s",
+                saved,
+                self._persist_spec.directory,
+            )
 
     def lookup(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
         num_timesteps = unique_timesteps.shape[0]
@@ -1729,6 +1944,27 @@ class MiniMaxH3AdalnCache(nn.Module):
         params = self.block_params[cache_plan_index, :num_timesteps, index]
         params = params.reshape(-1, 6, self.hidden_size)
         return tuple(params.unbind(dim=1))
+
+    def block_all(
+        self,
+        cache_plan_index: torch.Tensor,
+        num_timesteps: int,
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Every block's parameters through one batched slab gather.
+
+        Per-block ``block()`` calls run one advanced-index gather each -- with
+        a device plan index that is num_layers small latency-bound kernels per
+        step. One gather over the plan's whole [num_layers, width] slab keeps
+        the same elements and hands each block the same views ``block()``
+        returns; the remaining per-block consumption is view-only.
+        """
+        # The permute-first gather materializes [num_layers, num_timesteps,
+        # block_width] contiguous in a single indexing kernel.
+        params = self.block_params.permute(2, 0, 1, 3)[
+            :, cache_plan_index, :num_timesteps
+        ]
+        params = params.reshape(self.num_layers, -1, 6, self.hidden_size)
+        return tuple(tuple(layer.unbind(dim=1)) for layer in params)
 
     def final(
         self,
@@ -2135,9 +2371,9 @@ class MiniMaxH3FinalLayer(nn.Module):
             assert video is not None and audio is not None
             return video, audio, None
         h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
-        # Preserve full precision through both final output projections.
-        h = h.to(_FP32_DTYPE)
+        # Preserve full precision through both final output projections; the
+        # fused kernel widens the modulated bf16 values to fp32 in one pass.
+        h = _modulate_scale_shift_to_fp32(h, shift, scale, inverse_indices)
         merged_params = self._merged_out_params()
         if merged_params is None:
             video, _ = self.video_out(h)
@@ -3149,13 +3385,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             adaln_cache_plan_index = self.adaln_cache.lookup(
                 unique_timesteps.view(-1).to(device)
             )
-            block_adaln_params = tuple(
-                self.adaln_cache.block(
-                    index,
-                    adaln_cache_plan_index,
-                    num_unique_timesteps,
-                )
-                for index in range(len(self.blocks))
+            block_adaln_params = self.adaln_cache.block_all(
+                adaln_cache_plan_index,
+                num_unique_timesteps,
             )
         elif self._can_batch_block_adaln():
             local_adaln = torch.stack(

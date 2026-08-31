@@ -189,6 +189,64 @@ def test_ulysses1_forward_matches_legacy_bitwise(monkeypatch):
 
 
 @requires_cuda
+def test_default_auto_mode_enables_native_order(monkeypatch):
+    """With the env var unset, a supported config gets native order by default."""
+    _ensure_single_process_parallel_runtime()
+    monkeypatch.delenv("MINIMAX_H3_QKV_NATIVE_ORDER", raising=False)
+    arch = MiniMaxH3DiTArchConfig(**_ARCH_KWARGS)
+    with torch.device("cuda"):
+        attention = MiniMaxH3Attention(
+            arch, None, prefix="blocks.0.attn", bcg_breakpoint=False
+        )
+    assert attention._qkv_rows_interleaved
+    assert attention.qkv_proj.weight.qkv_rows_interleaved
+
+
+@requires_cuda
+def test_default_auto_mode_falls_back_on_quantized_checkpoints(monkeypatch):
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+
+    _ensure_single_process_parallel_runtime()
+    monkeypatch.delenv("MINIMAX_H3_QKV_NATIVE_ORDER", raising=False)
+    arch = MiniMaxH3DiTArchConfig(**_ARCH_KWARGS)
+    with torch.device("meta"):
+        attention = MiniMaxH3Attention(arch, Fp8Config(), prefix="blocks.0.attn")
+    assert not attention._qkv_rows_interleaved
+
+
+@requires_cuda
+def test_default_auto_mode_falls_back_on_already_reordered_checkpoints(monkeypatch):
+    _ensure_single_process_parallel_runtime()
+    monkeypatch.delenv("MINIMAX_H3_QKV_NATIVE_ORDER", raising=False)
+    arch = MiniMaxH3DiTArchConfig(checkpoint_uses_diffusers_layout=True, **_ARCH_KWARGS)
+    with torch.device("meta"):
+        attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
+    assert not attention._qkv_rows_interleaved
+
+
+def test_default_auto_mode_falls_back_on_startup_lora(monkeypatch):
+    monkeypatch.delenv("MINIMAX_H3_QKV_NATIVE_ORDER", raising=False)
+    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.tp_size = 1
+    with (
+        patch.object(minimax_h3.current_platform, "is_cuda", return_value=True),
+        patch.object(minimax_h3, "_startup_lora_configured", return_value=True),
+    ):
+        reason = attention._qkv_native_order_unsupported_reason(None)
+    assert reason is not None and "LoRA" in reason
+
+
+def test_native_order_mode_resolution(monkeypatch):
+    monkeypatch.delenv("MINIMAX_H3_QKV_NATIVE_ORDER", raising=False)
+    assert minimax_h3._qkv_native_order_mode() == "auto"
+    monkeypatch.setenv("MINIMAX_H3_QKV_NATIVE_ORDER", "1")
+    assert minimax_h3._qkv_native_order_mode() == "strict"
+    monkeypatch.setenv("MINIMAX_H3_QKV_NATIVE_ORDER", "0")
+    assert minimax_h3._qkv_native_order_mode() == "off"
+
+
+@requires_cuda
 def test_flag_rejects_quantized_checkpoints(monkeypatch):
     from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 

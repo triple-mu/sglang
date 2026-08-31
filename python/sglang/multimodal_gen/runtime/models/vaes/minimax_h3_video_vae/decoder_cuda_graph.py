@@ -25,6 +25,7 @@ from diffusers.utils import logging
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
+from .vae_vit import _merge_unpacked_view
 from .vit_utils import _env_flag
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -173,7 +174,10 @@ class DecoderTileCudaGraphRunner:
 
         entry.static_input.copy_(z)
         entry.graph.replay()
-        return entry.static_output.clone()
+        # The unpack permute-copy runs here instead of inside the graph: the
+        # caller needs a private copy of the static output anyway, so the two
+        # 22 MB passes (unpack contiguous + clone) collapse into one.
+        return _merge_unpacked_view(entry.static_output, copy=True)
 
     def _capture_verify_replay(
         self, entry: _ShapeEntry, z: torch.Tensor
@@ -193,10 +197,12 @@ class DecoderTileCudaGraphRunner:
             # Side-stream warmup (torch's capture recipe): settles cuBLASLt
             # algorithm selection and lazy JIT state, and primes the rotary
             # cache for this signature so no cache build lands in the graph.
+            # The capture stops at the unpack permute view; the materializing
+            # copy runs outside the graph as the caller's private-copy clone.
             side_stream = torch.cuda.Stream(device=device)
             side_stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(side_stream):
-                decoder(static_input)
+                decoder._forward_unpacked_view(static_input)
             torch.cuda.current_stream(device).wait_stream(side_stream)
 
             # Captured kernels read the cached rotary tensors by raw pointer;
@@ -207,7 +213,7 @@ class DecoderTileCudaGraphRunner:
             if self._pool is None:
                 self._pool = torch.cuda.graph_pool_handle()
             with torch.cuda.graph(graph, pool=self._pool):
-                static_output = decoder(static_input)
+                static_output = decoder._forward_unpacked_view(static_input)
         except Exception as exc:
             decoder._rotary_pos_emb_cache = rotary_record_before
             self._disable(f"capture failed: {type(exc).__name__}: {exc}")
@@ -223,7 +229,9 @@ class DecoderTileCudaGraphRunner:
         # the eager output bit-for-bit before any graphed result is trusted.
         static_input.copy_(entry.saved_input)
         graph.replay()
-        if not torch.equal(static_output, entry.saved_output):
+        if not torch.equal(
+            _merge_unpacked_view(static_output, copy=True), entry.saved_output
+        ):
             self._disable("replay output is not bit-exact vs the retained eager tile")
             return decoder(z)
 
@@ -236,4 +244,4 @@ class DecoderTileCudaGraphRunner:
 
         static_input.copy_(z)
         graph.replay()
-        return static_output.clone()
+        return _merge_unpacked_view(static_output, copy=True)

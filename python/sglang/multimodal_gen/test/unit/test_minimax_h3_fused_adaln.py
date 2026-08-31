@@ -447,6 +447,42 @@ def test_cpp_indexed_scale_shift_bitwise_vs_triton(
 
 
 @requires_cuda
+@pytest.mark.parametrize(("rows", "groups"), [(20992, 4), (997, 3), (1, 1)])
+def test_indexed_scale_shift_fp32_out_matches_modulate_then_cast(
+    rows: int, groups: int
+):
+    """The fused fp32-out modulate (final layer, R10) must be bitwise equal to
+    the in-place bf16 modulate followed by the .to(fp32) widening, including
+    for the strided shift/scale row views the final layer passes."""
+    from sglang.kernels.ops.diffusion import (
+        indexed_scale_shift_bf16_to_fp32,
+    )
+
+    x, _, scale, shift, _, _, indices, _ = _random_case(rows, groups, 23)
+    reference = indexed_scale_shift_bf16_(x.clone(), shift, scale, indices).to(
+        torch.float32
+    )
+
+    fused = indexed_scale_shift_bf16_to_fp32(x, shift, scale, indices)
+    assert fused.dtype is torch.float32
+    assert torch.equal(fused, reference)
+
+    # Strided modulation rows, as unbound from the AdaLN cache's [M, 2, H]
+    # final() views.
+    packed = torch.stack((shift, scale), dim=1)
+    strided_shift, strided_scale = packed.unbind(dim=1)
+    if groups > 1:
+        assert not strided_shift.is_contiguous()
+    fused_strided = indexed_scale_shift_bf16_to_fp32(
+        x, strided_shift, strided_scale, indices
+    )
+    assert torch.equal(fused_strided, reference)
+
+    empty = indexed_scale_shift_bf16_to_fp32(x[:0], shift, scale, indices[:0])
+    assert empty.shape == (0, x.shape[1]) and empty.dtype is torch.float32
+
+
+@requires_cuda
 @pytest.mark.parametrize(("rows", "groups"), [(20992, 9), (4096, 3)])
 def test_cpp_rmsnorm_indexed_contract_vs_triton(rows: int, groups: int):
     """Plan A/B C++ vs Triton: the residual write-back is bitwise, the norm

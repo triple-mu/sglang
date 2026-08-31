@@ -404,7 +404,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         f"LoRA is not supported on {module_name}.{name}: "
                         "MINIMAX_H3_QKV_NATIVE_ORDER keeps its qkv rows in the "
                         "checkpoint's per-head interleaved order, which adapter "
-                        "rows cannot be merged into. Unset the flag to use LoRA."
+                        "rows cannot be merged into. Launch with --lora-path "
+                        "(native order then falls back automatically) or set "
+                        "MINIMAX_H3_QKV_NATIVE_ORDER=0 to use LoRA."
                     )
 
     def convert_to_lora_layers(self, snapshot_base: bool = True) -> None:

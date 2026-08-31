@@ -24,6 +24,8 @@ from sglang.kernels.ops.diffusion import (
     fuse_scale_shift_kernel,
     indexed_gate_bf16,
     indexed_gate_bf16_,
+    indexed_scale_shift_bf16_,
+    indexed_scale_shift_bf16_to_fp32,
     ltx2_ada_values9,
     modulate_scale_shift,
     modulate_scale_shift_cuda,
@@ -599,6 +601,40 @@ def test_indexed_gate_dispatch_prefers_cpp_and_falls_back_to_triton():
     ):
         indexed_gate_bf16_(x.clone(), gate, other, indices)
         triton_spy.assert_called_once()
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize(
+    ("rows", "hidden", "groups"),
+    [(20992, 5376, 4), (997, 512, 3)],  # H3 final-layer production width
+)
+def test_indexed_scale_shift_fp32_out_matches_modulate_then_cast(
+    rows, hidden, groups, idx_dtype
+):
+    """The fused fp32-out modulate must be bitwise equal to the in-place bf16
+    modulate followed by the exact .to(fp32) widening, including for strided
+    shift/scale row views (the H3 final layer unbinds them from [M, 2, H])."""
+    generator = torch.Generator(device=DEVICE).manual_seed(11)
+    x = torch.randn((rows, hidden), generator=generator, device=DEVICE).to(
+        torch.bfloat16
+    )
+    packed = torch.randn((groups, 2, hidden), generator=generator, device=DEVICE).to(
+        torch.bfloat16
+    )
+    shift, scale = packed.unbind(dim=1)
+    indices = torch.randint(0, groups, (rows,), generator=generator, device=DEVICE).to(
+        idx_dtype
+    )
+
+    reference = indexed_scale_shift_bf16_(
+        x.clone(), shift.contiguous(), scale.contiguous(), indices
+    ).to(torch.float32)
+    fused = indexed_scale_shift_bf16_to_fp32(x, shift, scale, indices)
+    assert fused.dtype is torch.float32
+    assert torch.equal(fused, reference)
+
+    empty = indexed_scale_shift_bf16_to_fp32(x[:0], shift, scale, indices[:0])
+    assert empty.shape == (0, hidden) and empty.dtype is torch.float32
 
 
 if __name__ == "__main__":

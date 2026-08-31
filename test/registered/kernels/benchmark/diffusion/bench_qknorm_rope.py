@@ -34,6 +34,9 @@ class CaseSpec:
     round_norm_before_rope: bool = False
     aten_norm_order: bool = False
     dtype: torch.dtype = DEFAULT_DTYPE
+    # Fused path consumes the cache in the activation dtype (H3 production);
+    # the split baseline keeps fp32 because FlashInfer rope requires it.
+    cache_in_activation_dtype: bool = False
 
 
 BENCH_CASES = (
@@ -56,6 +59,19 @@ BENCH_CASES = (
         round_norm_before_rope=True,
         aten_norm_order=True,
         dtype=torch.float16,
+        cache_in_activation_dtype=True,
+    ),
+    # MiniMax-H3 DiT (2xH200 ulysses=2 local shard): bf16, neox partial rope.
+    CaseSpec(
+        "minimax_h3_dit",
+        1,
+        20992,
+        56,
+        128,
+        96,
+        True,
+        round_norm_before_rope=True,
+        cache_in_activation_dtype=True,
     ),
 )
 CASE_BY_NAME = {case.name: case for case in BENCH_CASES}
@@ -139,10 +155,10 @@ def make_inputs(case: CaseSpec) -> dict[str, torch.Tensor | bool]:
             dtype=torch.int64,
             generator=generator,
         ),
-        # aten_norm_order pairs with a half-precision cache in production;
-        # the split baseline keeps fp32 because FlashInfer rope requires it.
         "cos_sin_cache": (
-            cos_sin_cache.to(case.dtype) if case.aten_norm_order else cos_sin_cache
+            cos_sin_cache.to(case.dtype)
+            if case.cache_in_activation_dtype
+            else cos_sin_cache
         ),
         "cos_sin_cache_split": cos_sin_cache,
         "is_neox": case.is_neox,

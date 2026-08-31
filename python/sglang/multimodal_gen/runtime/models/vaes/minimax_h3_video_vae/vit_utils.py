@@ -2,7 +2,7 @@
 # ViT runtime helpers for the MiniMax H3 visual VAE.
 import os
 from collections.abc import Sequence
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from diffusers.utils import logging
@@ -210,7 +210,75 @@ def apply_rotary_pos_emb(
 
 
 _FUSED_QKNORM_ROPE_ENV = "MINIMAX_H3_VAE_DECODER_VIT_FUSED_QKNORM_ROPE"
+_FUSED_TRIPLE_ENV = "MINIMAX_H3_VAE_DECODER_VIT_FUSED_TRIPLE"
 _QKNORM_ONES_WEIGHTS: dict = {}
+_TRIPLE_ONES_WEIGHTS: dict = {}
+
+
+def _triple_ones_weight(dim: int, device: torch.device) -> torch.Tensor:
+    key = (dim, device)
+    weight = _TRIPLE_ONES_WEIGHTS.get(key)
+    if weight is None:
+        # aten skips the gamma multiply for weightless RMSNorm; multiplying
+        # the fp32 result by 1.0 is an exact identity, so ones == weightless.
+        weight = torch.ones(dim, device=device, dtype=torch.float32)
+        _TRIPLE_ONES_WEIGHTS[key] = weight
+    return weight
+
+
+def fused_vit_triple_enabled() -> bool:
+    """Gate for the deferred-residual block loop (see TransformerBlock)."""
+    return _env_flag(_FUSED_TRIPLE_ENV, "1")
+
+
+def fused_add_rmsnorm_cast_site(
+    residual: torch.Tensor,
+    branch: torch.Tensor,
+    norm,
+) -> Optional[torch.Tensor]:
+    """Fuse one decoder triple: residual += branch (fp32, in place), RMSNorm,
+    and the autocast-dtype cast the next Linear would issue.
+
+    Returns the normalized autocast-dtype tensor, or None when the fused
+    kernel does not apply (callers run the eager triple). Bit-exact vs the
+    eager chain: the kernel replicates aten's fp32 rms reduction.
+    """
+    if (
+        not isinstance(norm, torch.nn.RMSNorm)
+        or norm.eps is None
+        or not residual.is_cuda
+        or residual.dtype != torch.float32
+        or not residual.is_contiguous()
+        or branch.shape != residual.shape
+        or branch.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or not branch.is_contiguous()
+        or not torch.is_autocast_enabled("cuda")
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or residual.data_ptr() % 16
+        or branch.data_ptr() % 16
+    ):
+        return None
+    weight = norm.weight
+    if weight is not None and (
+        weight.dtype != torch.float32 or not weight.is_contiguous()
+    ):
+        return None
+    out_dtype = torch.get_autocast_dtype("cuda")
+    dim = residual.shape[-1]
+
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_residual_rmsnorm_cast,
+        fused_residual_rmsnorm_cast_,
+    )
+
+    if not can_use_fused_residual_rmsnorm_cast(dim, branch.dtype, out_dtype):
+        return None
+    if weight is None:
+        weight = _triple_ones_weight(dim, residual.device)
+    return fused_residual_rmsnorm_cast_(
+        residual, branch, weight, eps=norm.eps, out_dtype=out_dtype
+    )
 
 
 def _qknorm_ones_weight(

@@ -613,6 +613,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         construction, condition noise augmentation, initial-row expansion,
         the denoise loop itself, and output publication.
         """
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+            MINIMAX_H3_ADALN_PREWARM_SIGMAS_EXTRA_KEY,
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
             MiniMaxH3DenoiseBranch,
             _minimax_h3_subblock_video_query_indices,
@@ -724,6 +727,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     audio_ref_rows=ctx.audio_ref_rows,
                     sigmas_video=sigmas_video,
                     sigmas_audio=[float(v) for v in ctx.sigmas["audio"]],
+                    adaln_prewarm_sigmas=batch.extra.get(
+                        MINIMAX_H3_ADALN_PREWARM_SIGMAS_EXTRA_KEY
+                    ),
                     device=device,
                     imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),

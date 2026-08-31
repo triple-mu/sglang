@@ -16,12 +16,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-from ..constants import MINIMAX_H3_SIGMAS_EXTRA_KEY
+from ..constants import (
+    MINIMAX_H3_ADALN_PREWARM_SIGMAS_EXTRA_KEY,
+    MINIMAX_H3_SIGMAS_EXTRA_KEY,
+)
 
 
 class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
-    deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
+    deduplicated_extra_tensor_tree_output_keys = (
+        MINIMAX_H3_SIGMAS_EXTRA_KEY,
+        MINIMAX_H3_ADALN_PREWARM_SIGMAS_EXTRA_KEY,
+    )
 
     def __init__(self, sigma_shift_scales=None) -> None:
         super().__init__()
@@ -42,6 +48,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 "and has no implementation yet."
             )
         self._generate_sigmas_from_plan(batch, plan)
+        self._maybe_generate_adaln_prewarm_sigmas(batch, plan, server_args)
         self._publish_native_timestep_state(batch)
         return batch
 
@@ -63,6 +70,10 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
+            # AdaLN prewarm inputs: only warmup requests stage the extra
+            # serving-steps schedule, keyed by the pre-trim step count.
+            bool(batch.is_warmup),
+            batch.extra.get("cache_dit_num_inference_steps"),
         )
 
     @staticmethod
@@ -111,6 +122,16 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 f"{requested_num_steps!r}"
             )
 
+        scales = self._resolve_sigma_shift_scales(plan)
+        sigmas: dict[str, list[float]] = {}
+        for modality in ("video", "audio"):
+            sigmas[modality] = minimax_h3_time_shift_sigmas(
+                num_steps=requested_num_steps,
+                shift_scale=scales[modality],
+            )
+        batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
+
+    def _resolve_sigma_shift_scales(self, plan) -> dict[str, float]:
         model_scales = self.sigma_shift_scales
         if model_scales is not None and not isinstance(model_scales, Mapping):
             raise ValueError("model sigma_shift_scales must be an object")
@@ -139,7 +160,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 raise ValueError(f"{source} must be a positive finite number")
             return scale
 
-        scales = {
+        return {
             "video": resolved_scale(
                 modality="video",
                 request_value=plan.flow_shift,
@@ -151,13 +172,47 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 task_default=plan.default_audio_flow_shift,
             ),
         }
-        sigmas: dict[str, list[float]] = {}
-        for modality in ("video", "audio"):
-            sigmas[modality] = minimax_h3_time_shift_sigmas(
-                num_steps=requested_num_steps,
+
+    def _maybe_generate_adaln_prewarm_sigmas(
+        self, batch: Req, plan, server_args: ServerArgs
+    ) -> None:
+        """Stage the untrimmed serving-steps schedules on a warmup request.
+
+        The online AdaLN plan cache keys on exact fp32 step timesteps, so a
+        warmup request trimmed to --warmup-steps would prebuild plans no real
+        request ever looks up. The denoise loop folds these schedules into the
+        warmup rebuild pass so the first real request is a plan-cache hit.
+        """
+        from sglang.multimodal_gen import envs
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+            minimax_h3_time_shift_sigmas,
+        )
+
+        if not server_args.minimax_h3_adaln_online:
+            return
+        if not envs.MINIMAX_H3_ADALN_WARMUP_MATCH_STEPS:
+            return
+        if not batch.is_warmup:
+            return
+        if MINIMAX_H3_ADALN_PREWARM_SIGMAS_EXTRA_KEY in batch.extra:
+            return
+        # set_as_warmup records the pre-trim step count under this key.
+        serving_steps = batch.extra.get("cache_dit_num_inference_steps")
+        if (
+            isinstance(serving_steps, bool)
+            or not isinstance(serving_steps, int)
+            or serving_steps <= 0
+            or serving_steps == batch.num_inference_steps
+        ):
+            return
+        scales = self._resolve_sigma_shift_scales(plan)
+        batch.extra[MINIMAX_H3_ADALN_PREWARM_SIGMAS_EXTRA_KEY] = {
+            modality: minimax_h3_time_shift_sigmas(
+                num_steps=serving_steps,
                 shift_scale=scales[modality],
             )
-        batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
+            for modality in ("video", "audio")
+        }
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

@@ -46,6 +46,49 @@ def _indexed_scale_shift_bf16_kernel(
 
 
 @triton.jit
+def _indexed_scale_shift_bf16_to_fp32_kernel(
+    output_ptr,
+    x_ptr,
+    shift_ptr,
+    scale_ptr,
+    indices_ptr,
+    hidden_size,
+    stride_output_row,
+    stride_x_row,
+    stride_shift_row,
+    stride_scale_row,
+    stride_indices,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK_N)
+    mask = columns < hidden_size
+    index = tl.load(indices_ptr + row * stride_indices)
+
+    x = tl.load(x_ptr + row * stride_x_row + columns, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    shift = tl.load(
+        shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0
+    ).to(tl.float32)
+    scale = tl.load(
+        scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0
+    ).to(tl.float32)
+
+    one_plus_scale = round_bf16_to_fp32(1.0 + scale)
+    scaled = round_bf16_to_fp32(x * one_plus_scale)
+    # The bf16 kernel stores (scaled + shift) with an implicit RNE round to
+    # bf16; rounding explicitly and widening keeps the fp32 output bitwise
+    # equal to that bf16 store followed by a .to(fp32) cast.
+    modulated = round_bf16_to_fp32(scaled + shift)
+    tl.store(
+        output_ptr + row * stride_output_row + columns,
+        modulated,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _indexed_gate_bf16_kernel(
     output_ptr,
     x_ptr,
@@ -108,6 +151,40 @@ def indexed_scale_shift_bf16_(
         num_warps=8,
     )
     return x
+
+
+def indexed_scale_shift_bf16_to_fp32(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Indexed modulate fused with the fp32 widening cast, out of place.
+
+    Bitwise equal to ``indexed_scale_shift_bf16_`` followed by ``.to(float32)``
+    for finite values, in one read of ``x`` instead of two.
+    """
+    rows, hidden_size = x.shape
+    output = torch.empty((rows, hidden_size), dtype=torch.float32, device=x.device)
+    if rows == 0:
+        return output
+    block_n = triton.next_power_of_2(hidden_size)
+    _indexed_scale_shift_bf16_to_fp32_kernel[(rows,)](
+        output,
+        x,
+        shift,
+        scale,
+        indices,
+        hidden_size,
+        output.stride(0),
+        x.stride(0),
+        shift.stride(0),
+        scale.stride(0),
+        indices.stride(0),
+        BLOCK_N=block_n,
+        num_warps=8,
+    )
+    return output
 
 
 def _indexed_gate_bf16(
