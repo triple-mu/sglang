@@ -10,6 +10,7 @@ pack/scatter, causal Conv3d cat+pad (CUDA and Triton), and the Wan causal-VAE
 cache kernels.
 """
 
+import importlib
 import sys
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import (
     build_inv_indices,
+    can_use_pack_qkv_destination_major_cuda,
     can_use_usp_merge_heads,
     cat_pad_channels_last_3d,
     dup_up3d_add,
@@ -151,6 +153,73 @@ def test_pack_qkv_destination_major_validates_inputs():
         pack_qkv_destination_major(q, q, q, 3)
     with pytest.raises(ValueError, match="expected shape"):
         pack_qkv_destination_major(q, q, q, 2, out=torch.empty_like(q))
+
+
+def _h3_strided_qkv(rows, heads, head_size, dtype):
+    """Row-strided split views of one fused qkv GEMM buffer (H3 layout)."""
+    qkv = torch.randn(rows, 3 * heads * head_size, device=DEVICE, dtype=dtype)
+    hd = heads * head_size
+    return (
+        qkv[:, :hd].view(rows, heads, head_size),
+        qkv[:, hd : 2 * hd].view(rows, heads, head_size),
+        qkv[:, 2 * hd :].view(rows, heads, head_size),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("world", [2, 4])
+def test_pack_qkv_cpp_matches_triton_bitwise(dtype, world):
+    """The cpp-jit default and the Triton fallback must stay bitwise
+    interchangeable on the production row-strided split views, or the
+    dispatch gate would silently change the all_to_all payload."""
+    if not can_use_pack_qkv_destination_major_cuda(dtype):
+        pytest.skip("cpp-jit pack unavailable on this platform")
+    torch.manual_seed(11)
+    q, k, v = _h3_strided_qkv(384, 56, 128, dtype)
+
+    cpp = pack_qkv_destination_major(q, k, v, world)
+    jit_mod = importlib.import_module(
+        "sglang.kernels.ops.diffusion.layout.ulysses_qkv_jit"
+    )
+    with patch.object(
+        jit_mod, "can_use_pack_qkv_destination_major_cuda", return_value=False
+    ):
+        triton = pack_qkv_destination_major(q, k, v, world)
+    assert torch.equal(cpp, triton)
+
+
+def test_pack_qkv_dispatch_prefers_cpp_and_falls_back_to_triton():
+    """Dispatch-order contract: cpp-jit is the default when its gate is open,
+    and a closed gate must actually reach the Triton kernel."""
+    torch.manual_seed(12)
+    q, k, v = _h3_strided_qkv(16, 8, 64, torch.bfloat16)
+    jit_mod = importlib.import_module(
+        "sglang.kernels.ops.diffusion.layout.ulysses_qkv_jit"
+    )
+
+    with patch.object(
+        jit_mod,
+        "_pack_qkv_destination_major_triton",
+        wraps=jit_mod._pack_qkv_destination_major_triton,
+    ) as triton_spy:
+        pack_qkv_destination_major(q, k, v, 2)
+        if can_use_pack_qkv_destination_major_cuda(torch.bfloat16):
+            triton_spy.assert_not_called()
+        else:
+            triton_spy.assert_called_once()
+
+    with (
+        patch.object(
+            jit_mod, "can_use_pack_qkv_destination_major_cuda", return_value=False
+        ),
+        patch.object(
+            jit_mod,
+            "_pack_qkv_destination_major_triton",
+            wraps=jit_mod._pack_qkv_destination_major_triton,
+        ) as triton_spy,
+    ):
+        pack_qkv_destination_major(q, k, v, 2)
+        triton_spy.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

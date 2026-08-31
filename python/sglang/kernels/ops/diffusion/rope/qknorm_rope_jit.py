@@ -33,7 +33,19 @@ def _jit_qknorm_rope_module(
     round_norm_before_rope: bool,
     pack_kv: bool = False,
     cache_has_full_width: bool = False,
+    aten_norm_order: bool = False,
+    wide_head: bool = False,
 ) -> Module:
+    if wide_head and (
+        # Near-lossless opt-in (norm reduction tree changes); mapped for the
+        # rounded NeoX compact-cache path only -- see the kernel's asserts.
+        pack_kv
+        or aten_norm_order
+        or cache_has_full_width
+        or not round_norm_before_rope
+        or not is_neox
+    ):
+        raise RuntimeError("wide_head is limited to the rounded NeoX path")
     args = make_cpp_args(
         head_dim,
         rope_dim,
@@ -43,14 +55,19 @@ def _jit_qknorm_rope_module(
         cache_dtype,
         round_norm_before_rope,
         cache_has_full_width,
+        aten_norm_order,
     )
     op_name = "qknorm_rope_pack_kv" if pack_kv else "qknorm_rope"
-    kernel_name = "QKNormRopePackKVKernel" if pack_kv else "QKNormRopeKernel"
+    if pack_kv:
+        kernel = f"QKNormRopePackKVKernel<{args}>"
+    else:
+        kernel = f"QKNormRopeKernel<{args}, {'true' if wide_head else 'false'}>"
     return load_jit(
         op_name,
         *args,
+        wide_head,
         cuda_files=["diffusion/qknorm_rope.cuh"],
-        cuda_wrappers=[(op_name, f"{kernel_name}<{args}>::run")],
+        cuda_wrappers=[(op_name, f"{kernel}::run")],
     )
 
 
@@ -63,7 +80,44 @@ def _can_use_fused_qknorm_rope(
     round_norm_before_rope: bool,
     pack_kv: bool,
     cache_has_full_width: bool,
+    aten_norm_order: bool,
+    wide_head: bool = False,
 ) -> bool:
+    if wide_head:
+        if (
+            pack_kv
+            or aten_norm_order
+            or cache_has_full_width
+            or not round_norm_before_rope
+            or not is_neox
+        ):
+            logger.warning(
+                "wide_head fused QKNorm+RoPE is limited to the rounded NeoX path"
+            )
+            return False
+        wide_elems = head_dim // 16
+        wide_rotary = rope_dim // wide_elems if wide_elems else 0
+        if (
+            head_dim % 16
+            or wide_elems % 2
+            or rope_dim % wide_elems
+            or wide_rotary % 2
+            or wide_rotary > 16
+        ):
+            logger.warning(
+                "wide_head fused QKNorm+RoPE does not map head_dim=%s rope_dim=%s",
+                head_dim,
+                rope_dim,
+            )
+            return False
+    if aten_norm_order and (head_dim != 64 or torch.version.hip is not None):
+        # The aten-order reduction replicates torch's CUDA RMSNorm kernel for
+        # 64-wide rows only; other widths and ROCm use different aten kernels.
+        logger.warning(
+            "aten_norm_order fused QKNorm+RoPE requires CUDA and head_dim=64, "
+            f"got head_dim={head_dim}"
+        )
+        return False
     if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
         logger.warning(
             "Unsupported dtype pair (%s, %s) for JIT fused QKNorm+RoPE",
@@ -117,6 +171,8 @@ def _can_use_fused_qknorm_rope(
             round_norm_before_rope,
             pack_kv,
             cache_has_full_width,
+            aten_norm_order,
+            wide_head,
         )
         return True
     except Exception as e:
@@ -136,6 +192,8 @@ def can_use_fused_inplace_qknorm_rope(
     round_norm_before_rope: bool = False,
     pack_kv: bool = False,
     cache_has_full_width: bool = False,
+    aten_norm_order: bool = False,
+    wide_head: bool = False,
 ) -> bool:
     return _can_use_fused_qknorm_rope(
         head_dim,
@@ -146,6 +204,8 @@ def can_use_fused_inplace_qknorm_rope(
         round_norm_before_rope,
         pack_kv,
         cache_has_full_width,
+        aten_norm_order,
+        wide_head,
     )
 
 
@@ -164,6 +224,8 @@ def fused_inplace_qknorm_rope(
     rope_dim: int = 0,
     round_norm_before_rope: bool = False,
     cache_has_full_width: bool = False,
+    aten_norm_order: bool = False,
+    wide_head: bool = False,
 ) -> None:
     head_dim = head_dim or q.size(-1)
     if not rope_dim:
@@ -178,6 +240,8 @@ def fused_inplace_qknorm_rope(
         round_norm_before_rope,
         False,
         cache_has_full_width,
+        aten_norm_order,
+        wide_head,
     )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
 

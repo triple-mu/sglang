@@ -247,6 +247,175 @@ def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
     assert torch.equal(k_ref, k_fused)
 
 
+def test_qknorm_rope_aten_order_matches_torch_rms_norm_fp16() -> None:
+    """MiniMax-H3 VAE decoder contract: aten_norm_order replicates torch's
+    weightless fp16 nn.RMSNorm reduction bit-for-bit before the shared NeoX
+    rope, at the production decode-tile shape."""
+    from sgl_kernel import rotary_embedding
+
+    num_tokens, num_heads, head_dim, rope_dim = 1797, 32, 64, 48
+    dtype = torch.float16
+    norm = torch.nn.RMSNorm(head_dim, eps=1e-5, elementwise_affine=False).to(DEVICE)
+    weight = torch.ones(head_dim, device=DEVICE, dtype=dtype)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, num_tokens).to(dtype)
+
+    q = torch.randn(num_tokens, num_heads, head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+
+    q_ref, k_ref = norm(q), norm(k)
+    rotary_embedding(
+        positions,
+        q_ref.view(num_tokens, -1),
+        k_ref.view(num_tokens, -1),
+        head_dim,
+        cos_sin_cache,
+        True,
+    )
+    fused_inplace_qknorm_rope(
+        q,
+        k,
+        weight,
+        weight,
+        cos_sin_cache,
+        positions,
+        is_neox=True,
+        eps=1e-5,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    )
+
+    assert torch.equal(q_ref, q)
+    assert torch.equal(k_ref, k)
+
+
+def test_qknorm_rope_wide_head_is_near_lossless_and_gated() -> None:
+    """Opt-in wide variant (16 lanes/head, two heads per warp): the fp32
+    sum-of-squares reduction tree changes, so it is *not* part of the bitwise
+    split-chain contract -- it must stay within one norm-factor rounding step
+    of the contract-exact kernel, and must be rejected off its mapped path."""
+    num_tokens, num_heads, head_dim, rope_dim = 515, 8, 128, 96
+    q = torch.randn(num_tokens, num_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.randn_like(q)
+    weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cache = create_cos_sin_cache(rope_dim, num_tokens).to(DTYPE)
+
+    results = []
+    for wide_head in (False, True):
+        assert can_use_fused_inplace_qknorm_rope(
+            head_dim,
+            rope_dim,
+            True,
+            DTYPE,
+            cache_dtype=DTYPE,
+            round_norm_before_rope=True,
+            wide_head=wide_head,
+        )
+        q_run, k_run = q.clone(), k.clone()
+        fused_inplace_qknorm_rope(
+            q_run,
+            k_run,
+            weight,
+            weight,
+            cache,
+            positions,
+            is_neox=True,
+            eps=1e-5,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+            wide_head=wide_head,
+        )
+        results.append((q_run, k_run))
+    (q_ref, k_ref), (q_wide, k_wide) = results
+    # The two variants differ by at most one bf16 ulp on the normed value;
+    # after the rope's subtract that can cancel to a small absolute residue,
+    # so this uses the file's split-baseline tolerance plus a near-total
+    # exact-match requirement (measured 99.9998% at the production shape).
+    triton.testing.assert_close(q_ref, q_wide, atol=ATOL, rtol=RTOL)
+    triton.testing.assert_close(k_ref, k_wide, atol=ATOL, rtol=RTOL)
+    exact = ((q_ref == q_wide).float().mean() + (k_ref == k_wide).float().mean()) / 2
+    assert exact.item() > 0.99
+
+    # Off the mapped path (aten-order, full-width cache, unrounded, gptj) the
+    # wide variant must fail closed rather than silently change numerics.
+    assert not can_use_fused_inplace_qknorm_rope(
+        64,
+        48,
+        True,
+        torch.float16,
+        cache_dtype=torch.float16,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+        wide_head=True,
+    )
+    assert not can_use_fused_inplace_qknorm_rope(
+        128, 96, True, DTYPE, cache_dtype=DTYPE, wide_head=True
+    )
+    assert not can_use_fused_inplace_qknorm_rope(
+        128,
+        96,
+        False,
+        DTYPE,
+        cache_dtype=DTYPE,
+        round_norm_before_rope=True,
+        wide_head=True,
+    )
+
+
+def test_qknorm_rope_wide_misaligned_cache_matches_aligned() -> None:
+    """The wide variant's lane cos/sin span is one vector load only when the
+    host proved the cache base/stride alignment; an offset cache view must
+    fall back to the element loads and still produce identical values (not
+    crash or diverge)."""
+    num_tokens, num_heads, head_dim, rope_dim = 257, 8, 128, 96
+    q = torch.randn(num_tokens, num_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.randn_like(q)
+    weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cache = create_cos_sin_cache(rope_dim, num_tokens).to(DTYPE)
+    storage = torch.empty(num_tokens * rope_dim + 8, device=DEVICE, dtype=DTYPE)
+    cache_offset = (
+        storage[1:].view(-1)[: num_tokens * rope_dim].view(num_tokens, rope_dim)
+    )
+    cache_offset.copy_(cache)
+
+    results = []
+    for cache_arg in (cache, cache_offset):
+        q_run, k_run = q.clone(), k.clone()
+        fused_inplace_qknorm_rope(
+            q_run,
+            k_run,
+            weight,
+            weight,
+            cache_arg,
+            positions,
+            is_neox=True,
+            eps=1e-5,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+            wide_head=True,
+        )
+        results.append((q_run, k_run))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+
+
+def test_qknorm_rope_aten_order_requires_head_dim_64() -> None:
+    # The aten-order reduction is mapped for torch's 64-wide rows only; wider
+    # heads must be rejected rather than silently diverge from aten.
+    assert not can_use_fused_inplace_qknorm_rope(
+        128,
+        96,
+        True,
+        torch.float16,
+        cache_dtype=torch.float16,
+        round_norm_before_rope=True,
+        aten_norm_order=True,
+    )
+
+
 def test_qknorm_rope_preserves_full_width_neox_cache() -> None:
     from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 

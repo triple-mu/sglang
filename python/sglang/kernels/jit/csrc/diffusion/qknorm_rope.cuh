@@ -29,6 +29,9 @@ struct QKNormRopeParams {
   uint32_t num_kv_heads;
   uint32_t num_tokens;
   float eps;
+  // Wide variant only: whether every lane's cos/sin span is one aligned
+  // vector load (base, row stride, and cos->sin offset all span-aligned).
+  bool cache_vec_aligned;
 };
 
 struct QKNormRopePackKVParams : QKNormRopeParams {
@@ -70,6 +73,47 @@ SGL_DEVICE CacheDType load_cache_value(const CacheDType* ptr, int64_t idx) {
 #else
   return __ldg(ptr + idx);
 #endif
+}
+
+/// \brief Load one lane's contiguous cos/sin span, as one vector when the
+/// caller proved alignment (values identical to the per-element loads).
+template <uint32_t kSpan, typename CacheDType>
+SGL_DEVICE void load_cache_span(const CacheDType* __restrict__ ptr, CacheDType (&dst)[kSpan], bool vec_aligned) {
+  constexpr uint32_t kSpanBytes = kSpan * sizeof(CacheDType);
+  if constexpr ((kSpan & (kSpan - 1)) == 0 && kSpanBytes <= 16) {
+    if (vec_aligned) {
+      device::AlignedVector<CacheDType, kSpan> vec;
+      vec.load(ptr);
+#pragma unroll
+      for (uint32_t i = 0; i < kSpan; ++i) {
+        dst[i] = vec[i];
+      }
+      return;
+    }
+  }
+#pragma unroll
+  for (uint32_t i = 0; i < kSpan; ++i) {
+    dst[i] = load_cache_value(ptr, i);
+  }
+}
+
+/// Elements each of the 16 lanes of a half-warp head group owns in the wide
+/// (two heads per warp) variant.
+template <int64_t kHeadDim>
+constexpr uint32_t wide_elems_per_lane() {
+  return kHeadDim / (device::kWarpThreads / 2);
+}
+
+/// Host check for the wide variant's cos/sin span loads: the cache base, the
+/// per-position row stride, and the cos->sin offset must all be span-aligned
+/// (lane offsets within a row are span multiples already).
+template <int64_t kHeadDim, int64_t kRopeDim, typename CacheDType>
+inline bool wide_cache_span_aligned(const void* cache_ptr) {
+  constexpr int64_t kSpanBytes = wide_elems_per_lane<kHeadDim>() * static_cast<int64_t>(sizeof(CacheDType));
+  constexpr int64_t kStrideBytes = kRopeDim * static_cast<int64_t>(sizeof(CacheDType));
+  constexpr int64_t kSinOffsetBytes = kRopeDim / 2 * static_cast<int64_t>(sizeof(CacheDType));
+  return reinterpret_cast<uintptr_t>(cache_ptr) % kSpanBytes == 0 && kStrideBytes % kSpanBytes == 0 &&
+         kSinOffsetBytes % kSpanBytes == 0;
 }
 
 template <typename T>
@@ -189,6 +233,131 @@ SGL_DEVICE T rotary_sub_fp32(T x, float cos, T y, float sin) {
 #endif
 }
 
+// Replicates the sum-of-squares reduction of aten's
+// vectorized_layer_norm_kernel<c10::Half, float, true> (torch nn.RMSNorm on
+// half inputs, N == 64): 4 contiguous elements per thread summed sequentially
+// in fp32, xor-tree combine, rsqrtf. Verified bit-exact vs torch 2.13 on
+// H200; retire if torch changes that kernel's reduction.
+template <int64_t kHeadDim, typename Storage>
+SGL_DEVICE float aten_order_rms_norm_factor(const Storage& input_vec, float eps, uint32_t lane_id) {
+  using namespace device;
+  static_assert(kHeadDim == 64, "aten-order norm replication is only mapped for head_dim 64");
+#ifdef USE_ROCM
+  // aten dispatches a different kernel on ROCm; this replication is CUDA-only.
+  return 0.0f;
+#else
+  // Each lane holds elements [2*lane, 2*lane+1]; aten groups 4 contiguous
+  // elements per thread, so even lanes fold in the odd neighbor's squares.
+  // fp16 squares are exact in fp32, so only the addition order matters.
+  const auto [x0, x1] = cast<fp32x2_t>(input_vec[0]);
+  const float sq0 = x0 * x0;
+  const float sq1 = x1 * x1;
+  const float nsq0 = __shfl_down_sync(warp::kFullMask, sq0, 1);
+  const float nsq1 = __shfl_down_sync(warp::kFullMask, sq1, 1);
+  float partial = ((sq0 + sq1) + nsq0) + nsq1;
+#pragma unroll
+  for (uint32_t offset = 16; offset >= 2; offset >>= 1) {
+    partial += __shfl_xor_sync(warp::kFullMask, partial, offset);
+  }
+  const float total = __shfl_sync(warp::kFullMask, partial, lane_id & ~1u);
+  return math::rsqrt(total / static_cast<float>(kHeadDim) + eps);
+#endif
+}
+
+/**
+ * \brief Wide-variant work: 16 lanes per head, two heads per warp.
+ *
+ * Shares every warp instruction between two heads (and doubles the per-lane
+ * load width) on this issue-bound kernel, at the cost of the bitwise
+ * contract: the sum-of-squares partials regroup (twice the sequential
+ * elements per lane, xor tree over 16 lanes), so the norm factor may differ
+ * from the contract-exact variant in the last fp32 bit. Everything after the
+ * norm factor is the same per-element arithmetic. Near-lossless; opt-in only
+ * (see the wide_head flag in qknorm_rope_jit.py).
+ *
+ * \param group_lane Lane within this head's 16-lane group.
+ * \param group_base First lane of this group (0 or 16).
+ */
+template <int64_t kHeadDim, int64_t kRopeDim, typename DType, typename CacheDType, typename Storage>
+SGL_DEVICE void qknorm_rope_process_work_wide(
+    Storage& input_vec,
+    const Storage& weight_vec,
+    const void* __restrict__ cos_sin_cache_ptr,
+    int64_t pos,
+    void* __restrict__ output,
+    uint32_t group_lane,
+    uint32_t group_base,
+    float eps,
+    bool cache_vec_aligned) {
+  using namespace device;
+
+  constexpr uint32_t kGroupLanes = kWarpThreads / 2;
+  constexpr uint32_t kElemsPerLane = wide_elems_per_lane<kHeadDim>();
+  constexpr uint32_t kVecSize = kElemsPerLane / 2;
+  constexpr uint32_t kRotaryLanes = kRopeDim / kElemsPerLane;
+  constexpr uint32_t kHalfRotaryLanes = kRotaryLanes / 2;
+  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(CacheDType);
+  using Packed = packed_t<DType>;
+
+  const uint32_t norm_mask = 0xffffu << group_base;
+  const uint32_t rope_mask = ((1u << kRotaryLanes) - 1u) << group_base;
+
+  const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
+  const auto sin_ptr = cos_ptr + kRopeDim / 2;
+
+  // Same accumulation expression as apply_norm_impl, reduced over the 16-lane
+  // group instead of the warp.
+  float sum_of_squares = 0.0f;
+#pragma unroll
+  for (uint32_t j = 0; j < kVecSize; ++j) {
+    const auto fp32_input = cast<fp32x2_t>(input_vec[j]);
+    sum_of_squares += fp32_input.x * fp32_input.x;
+    sum_of_squares += fp32_input.y * fp32_input.y;
+  }
+  sum_of_squares = warp::reduce_sum<kGroupLanes>(sum_of_squares, norm_mask);
+  const float norm_factor = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+
+  Storage output_vec;
+#pragma unroll
+  for (uint32_t j = 0; j < kVecSize; ++j) {
+    const auto [x0, x1] = cast<fp32x2_t>(input_vec[j]);
+    const auto [w0, w1] = cast<fp32x2_t>(weight_vec[j]);
+    output_vec[j] = cast<Packed, fp32x2_t>({x0 * norm_factor * w0, x1 * norm_factor * w1});
+  }
+
+  if (group_lane < kRotaryLanes) {
+    const auto partner_lane =
+        group_base + (group_lane < kHalfRotaryLanes ? group_lane + kHalfRotaryLanes : group_lane - kHalfRotaryLanes);
+    const uint32_t lane_base = (group_lane % kHalfRotaryLanes) * kElemsPerLane;
+    CacheDType cos_lane[kElemsPerLane];
+    CacheDType sin_lane[kElemsPerLane];
+    load_cache_span(cos_ptr + lane_base, cos_lane, cache_vec_aligned);
+    load_cache_span(sin_ptr + lane_base, sin_lane, cache_vec_aligned);
+#pragma unroll
+    for (uint32_t j = 0; j < kVecSize; ++j) {
+      auto partner_vec = output_vec[j];
+      auto partner_bits = reinterpret_cast<const uint32_t&>(partner_vec);
+      partner_bits = __shfl_sync(rope_mask, partner_bits, partner_lane);
+      reinterpret_cast<uint32_t&>(partner_vec) = partner_bits;
+      auto& values = unpack(output_vec[j]);
+      const auto& partner_values = unpack(partner_vec);
+#pragma unroll
+      for (uint32_t i = 0; i < 2; ++i) {
+        const auto cos = cos_lane[2 * j + i];
+        const auto sin = sin_lane[2 * j + i];
+        if constexpr (std::is_same_v<CacheDType, fp32_t>) {
+          values[i] = group_lane < kHalfRotaryLanes ? rotary_sub_fp32(values[i], cos, partner_values[i], sin)
+                                                    : rotary_add_fp32(values[i], cos, partner_values[i], sin);
+        } else {
+          values[i] = group_lane < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
+                                                    : rotary_add(values[i], cos, partner_values[i], sin);
+        }
+      }
+    }
+  }
+  store_as<Storage>(output, output_vec, group_lane);
+}
+
 template <
     int64_t kHeadDim,
     int64_t kRopeDim,
@@ -199,6 +368,8 @@ template <
     bool kRoundNormBeforeRope,
     bool kPackKV,
     bool kCacheHasFullWidth,
+    bool kAtenNormOrder,
+    bool kWideHead,
     typename IdType>
 __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_constant__ params) {
   using namespace device;
@@ -224,11 +395,21 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
   static_assert(
       !kRoundNormBeforeRope || std::is_same_v<DType, CacheDType> || std::is_same_v<CacheDType, fp32_t>,
       "Rounded QKNorm+RoPE requires cache and activation dtypes to match or an FP32 cache");
+  static_assert(!kAtenNormOrder || kHeadDim == 64, "aten-order norm replication is only mapped for head_dim 64");
+  static_assert(
+      !kWideHead || (kIsNeox && kRoundNormBeforeRope && !kAtenNormOrder && !kPackKV && !kCacheHasFullWidth),
+      "The wide (two heads per warp) variant is mapped for the rounded NeoX compact-cache path only");
+  static_assert(
+      !kWideHead ||
+          (kHeadDim % (kWarpThreads / 2) == 0 && wide_elems_per_lane<kHeadDim>() % 2 == 0 &&
+           kRopeDim % wide_elems_per_lane<kHeadDim>() == 0 && (kRopeDim / wide_elems_per_lane<kHeadDim>()) % 2 == 0 &&
+           kRopeDim / wide_elems_per_lane<kHeadDim>() <= kWarpThreads / 2),
+      "Wide-variant lane mapping does not cover this head/rope geometry");
 
   using Packed = packed_t<DType>;
   using Storage = AlignedVector<Packed, kVecSize>;
 
-  const auto& [q_ptr, k_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr, positions, q_stride_bytes, k_stride_bytes, head_stride_bytes, num_qo_heads, num_kv_heads, num_tokens, eps] =
+  const auto& [q_ptr, k_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr, positions, q_stride_bytes, k_stride_bytes, head_stride_bytes, num_qo_heads, num_kv_heads, num_tokens, eps, cache_vec_aligned] =
       static_cast<const QKNormRopeParams&>(params);
 
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
@@ -245,6 +426,75 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
   }
 
   PDLWaitPrimary<kUsePDL>();
+
+  if constexpr (kWideHead) {
+    // Two heads per warp: the low and high 16-lane groups each own one work,
+    // so every warp instruction moves two heads' worth of data.
+    using StorageWide = AlignedVector<Packed, wide_elems_per_lane<kHeadDim>() / 2>;
+    const uint32_t group_id = lane_id >> 4;
+    const uint32_t group_base = group_id << 4;
+    const uint32_t group_lane = lane_id & 15u;
+    const uint32_t iter_stride = num_workers * 2;
+    const uint32_t stride_tokens = iter_stride / num_qk_heads;
+    const uint32_t stride_heads = iter_stride % num_qk_heads;
+    const uint32_t start_work = start_worker_id * 2;
+    uint32_t walk_token = start_work / num_qk_heads;
+    uint32_t walk_head = start_work % num_qk_heads;
+    for (uint32_t base = start_work; base < num_works; base += iter_stride) {
+      uint32_t next_token = walk_token;
+      uint32_t next_head = walk_head + 1;
+      if (next_head == num_qk_heads) {
+        next_head = 0;
+        ++next_token;
+      }
+      const uint32_t token_id = group_id ? next_token : walk_token;
+      const uint32_t head_id = group_id ? next_head : walk_head;
+      if (base + group_id < num_works) {
+        const bool load_q = head_id < num_qo_heads;
+        const void* input = load_q ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
+                                   : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
+        auto input_vec = load_as<StorageWide>(input, group_lane);
+        const auto weight_vec = load_as<StorageWide>(load_q ? q_weight_ptr : k_weight_ptr, group_lane);
+        const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
+        qknorm_rope_process_work_wide<kHeadDim, kRopeDim, DType, CacheDType>(
+            input_vec,
+            weight_vec,
+            cos_sin_cache_ptr,
+            pos,
+            const_cast<void*>(input),
+            group_lane,
+            group_base,
+            eps,
+            cache_vec_aligned);
+      }
+      walk_token += stride_tokens;
+      walk_head += stride_heads;
+      if (walk_head >= num_qk_heads) {
+        walk_head -= num_qk_heads;
+        ++walk_token;
+      }
+    }
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+
+  // The runtime-divisor div/mod per work costs ~20 issue slots each on this
+  // issue-bound kernel; the two divisions run once and the (token, head)
+  // cursor advances by the fixed grid stride instead. Measured -3.4% (hd128
+  // DiT) and -3.5% (hd64 aten) on H200, direct-call ABAB min-of-20. The
+  // packed variant keeps the direct div/mod: its copy works skip the cursor
+  // advance, and its qk section is not the packed path's bottleneck.
+  constexpr bool kWalkCursor = !kPackKV;
+  uint32_t stride_tokens = 0;
+  uint32_t stride_heads = 0;
+  uint32_t walk_token = 0;
+  uint32_t walk_head = 0;
+  if constexpr (kWalkCursor) {
+    stride_tokens = num_workers / num_qk_heads;
+    stride_heads = num_workers % num_qk_heads;
+    walk_token = start_worker_id / num_qk_heads;
+    walk_head = start_worker_id % num_qk_heads;
+  }
 
   for (uint32_t idx = start_worker_id; idx < num_works; idx += num_workers) {
     if constexpr (kPackKV) {
@@ -285,8 +535,21 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
       }
     }
 
-    const uint32_t token_id = idx / num_qk_heads;
-    const uint32_t head_id = idx % num_qk_heads;
+    uint32_t token_id;
+    uint32_t head_id;
+    if constexpr (kWalkCursor) {
+      token_id = walk_token;
+      head_id = walk_head;
+      walk_token += stride_tokens;
+      walk_head += stride_heads;
+      if (walk_head >= num_qk_heads) {
+        walk_head -= num_qk_heads;
+        ++walk_token;
+      }
+    } else {
+      token_id = idx / num_qk_heads;
+      head_id = idx % num_qk_heads;
+    }
     const bool load_q = head_id < num_qo_heads;
     const void* input = load_q ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
                                : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
@@ -310,7 +573,18 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
     const auto weight_vec = load_as<Storage>(weight_ptr, lane_id);
 
     if constexpr (kRoundNormBeforeRope) {
-      auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
+      Storage output_vec;
+      if constexpr (kAtenNormOrder) {
+        const float norm_factor = aten_order_rms_norm_factor<kHeadDim>(input_vec, eps, lane_id);
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          const auto [x0, x1] = cast<fp32x2_t>(input_vec[j]);
+          const auto [w0, w1] = cast<fp32x2_t>(weight_vec[j]);
+          output_vec[j] = cast<Packed, fp32x2_t>({x0 * norm_factor * w0, x1 * norm_factor * w1});
+        }
+      } else {
+        output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
+      }
       const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
       const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
       const auto sin_ptr = cos_ptr + (kCacheHasFullWidth ? kRopeDim : kRopeDim / 2);
@@ -382,8 +656,13 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
       sum_of_squares += x0 * x0 + x1 * x1;
     }
 
-    sum_of_squares = warp::reduce_sum(sum_of_squares);
-    const float norm_factor = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+    float norm_factor;
+    if constexpr (kAtenNormOrder) {
+      norm_factor = aten_order_rms_norm_factor<kHeadDim>(input_vec, eps, lane_id);
+    } else {
+      sum_of_squares = warp::reduce_sum(sum_of_squares);
+      norm_factor = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+    }
 
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -454,7 +733,9 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
-    bool kCacheHasFullWidth>
+    bool kCacheHasFullWidth,
+    bool kAtenNormOrder,
+    bool kWideHead = false>
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   template <typename IdType>
@@ -468,6 +749,8 @@ struct QKNormRopeKernel {
       kRoundNormBeforeRope,
       false,
       kCacheHasFullWidth,
+      kAtenNormOrder,
+      kWideHead,
       IdType>;
 
   static void
@@ -511,6 +794,19 @@ struct QKNormRopeKernel {
     const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
     const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
 
+    if constexpr (kWideHead) {
+      // 16 lanes per head load kHeadDim/16 elements per lane in one vector;
+      // every row must sit on that vector boundary.
+      constexpr int64_t kWideBytes = wide_elems_per_lane<kHeadDim>() * sizeof(DType);
+      for (const auto* tensor : {&q, &k, &q_weight, &k_weight}) {
+        CHECK_HOST(reinterpret_cast<uintptr_t>(tensor->data_ptr()) % kWideBytes == 0)
+            << "wide fused qknorm+rope requires " << kWideBytes << "B-aligned tensors";
+      }
+      CHECK_HOST(
+          q_stride_bytes % kWideBytes == 0 && k_stride_bytes % kWideBytes == 0 && head_stride_bytes % kWideBytes == 0)
+          << "wide fused qknorm+rope requires " << kWideBytes << "B-aligned strides";
+    }
+
     const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * head_stride_bytes;
     const auto params = QKNormRopeParams{
         .q_ptr = q.data_ptr(),
@@ -526,6 +822,8 @@ struct QKNormRopeKernel {
         .num_kv_heads = num_kv_heads,
         .num_tokens = num_tokens,
         .eps = eps,
+        .cache_vec_aligned =
+            kWideHead && wide_cache_span_aligned<kHeadDim, kRopeDim, CacheDType>(cos_sin_cache.data_ptr()),
     };
 
     const auto is_int32 = id_type.is_type<int32_t>();
@@ -537,7 +835,8 @@ struct QKNormRopeKernel {
     };
     const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
-    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
+    constexpr uint32_t kWorksPerWarpIter = kWideHead ? 2 : 1;
+    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock * kWorksPerWarpIter);
     const auto num_blocks = std::min(max_blocks, needed_blocks);
     LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
   }
@@ -551,7 +850,8 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
-    bool kCacheHasFullWidth>
+    bool kCacheHasFullWidth,
+    bool kAtenNormOrder>
 struct QKNormRopePackKVKernel {
   static_assert(!kCacheHasFullWidth, "KV packing does not support full-width cos/sin caches");
   template <typename IdType>
@@ -565,6 +865,8 @@ struct QKNormRopePackKVKernel {
       kRoundNormBeforeRope,
       true,
       kCacheHasFullWidth,
+      kAtenNormOrder,
+      /*kWideHead=*/false,
       IdType>;
 
   static void
