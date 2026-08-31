@@ -177,6 +177,14 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
     _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
+    # One-shot mode knows the real request's step count before warmup runs;
+    # mirror it into the synthetic warmup so step-count-keyed warm state
+    # (e.g. the MiniMax H3 AdaLN plan prewarm) covers the request.
+    request_steps = sampling_params_kwargs.get("num_inference_steps")
+    if server_args.warmup_num_inference_steps is None and isinstance(
+        request_steps, int
+    ):
+        server_args.warmup_num_inference_steps = request_steps
     if sampling_params_kwargs.get("use_diffusion_decoder", False):
         server_args.load_diffusion_decoder = True
 

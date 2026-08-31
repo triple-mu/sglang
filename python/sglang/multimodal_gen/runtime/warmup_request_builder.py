@@ -277,6 +277,24 @@ def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
     return getattr(sampling_defaults, "guidance_scale", None)
 
 
+def _resolve_warmup_serving_steps(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+) -> int | None:
+    """The serving step count the synthetic warmup request mimics.
+
+    This becomes the request's pre-trim num_inference_steps, so step-keyed
+    warm state (e.g. the MiniMax H3 AdaLN plan prewarm) matches serving.
+    """
+    # Most tests and a few lightweight integrations use MagicMock server args,
+    # whose missing attributes resolve to another mock. Only accept a concrete
+    # integer as an explicit override (mirrors _resolve_warmup_num_frames).
+    explicit_steps = getattr(server_args, "warmup_num_inference_steps", None)
+    if isinstance(explicit_steps, int):
+        return explicit_steps
+    return sampling_defaults.num_inference_steps
+
+
 def _resolve_warmup_steps(
     server_args: ServerArgs,
     sampling_defaults: SamplingParams,
@@ -284,7 +302,7 @@ def _resolve_warmup_steps(
     server_based_warmup: bool,
 ) -> int:
     warmup_steps = server_args.warmup_steps
-    default_steps = sampling_defaults.num_inference_steps
+    default_steps = _resolve_warmup_serving_steps(server_args, sampling_defaults)
 
     # Breakable CUDA graph captures one graph per step-branch at warmup so that
     # serving never records a fresh graph. Run the model's full recommended
@@ -303,7 +321,6 @@ def _resolve_warmup_steps(
     ):
         return warmup_steps
 
-    default_steps = sampling_defaults.num_inference_steps
     if default_steps is None or default_steps <= warmup_steps:
         return warmup_steps
 
@@ -398,7 +415,9 @@ def build_warmup_reqs(
             guidance_scale=sampling_defaults.guidance_scale,
             guidance_scale_2=sampling_defaults.guidance_scale_2,
             true_cfg_scale=sampling_defaults.true_cfg_scale,
-            num_inference_steps=sampling_defaults.num_inference_steps,
+            num_inference_steps=_resolve_warmup_serving_steps(
+                server_args, sampling_defaults
+            ),
             num_frames=warmup_num_frames,
         )
         if include_warmup_image:

@@ -196,13 +196,15 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             return
         if MINIMAX_H3_ADALN_PREWARM_SIGMAS_EXTRA_KEY in batch.extra:
             return
-        # set_as_warmup records the pre-trim step count under this key.
+        # set_as_warmup records the pre-trim step count under this key. Stage
+        # the serving schedules even when the warmup runs them untrimmed: the
+        # denoise loop also prebuilds them for the partition's other packed
+        # layout classes, which the warmup's own plans never cover.
         serving_steps = batch.extra.get("cache_dit_num_inference_steps")
         if (
             isinstance(serving_steps, bool)
             or not isinstance(serving_steps, int)
             or serving_steps <= 0
-            or serving_steps == batch.num_inference_steps
         ):
             return
         scales = self._resolve_sigma_shift_scales(plan)

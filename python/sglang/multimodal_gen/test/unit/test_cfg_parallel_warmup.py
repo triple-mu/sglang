@@ -169,6 +169,38 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             )[0]
         self.assertEqual(req.num_inference_steps, 2)
 
+    def test_warmup_num_inference_steps_sets_pre_trim_step_count(self):
+        """--warmup-num-inference-steps must become the recorded pre-trim
+        count so step-count-keyed warm state matches real serving requests."""
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        server_args.warmup_num_inference_steps = 9
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=50),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertEqual(req.num_inference_steps, 2)
+        self.assertEqual(req.extra["cache_dit_num_inference_steps"], 9)
+
+    def test_warmup_pre_trim_step_count_defaults_to_sampling_default(self):
+        # MagicMock server args leave warmup_num_inference_steps as a mock;
+        # only a concrete int overrides the model's sampling default.
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=50),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertEqual(req.extra["cache_dit_num_inference_steps"], 50)
+
     def test_torch_compile_respects_explicit_server_warmup_steps(self):
         server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
         server_args.enable_torch_compile = True
