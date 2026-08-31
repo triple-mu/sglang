@@ -382,17 +382,114 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def supports_per_token_prequant_input(self, layer: torch.nn.Module) -> bool:
+        """Whether ``apply`` accepts a producer-quantized per-token tuple.
+
+        True when this layer's non-block CUTLASS channelwise path with dynamic
+        per-token activation quant is active, i.e. exactly the configuration
+        whose separated chain ``_apply_per_token_prequant_fp8_linear``
+        reproduces bitwise. Callable at layer-construction time (checks only
+        config facts and layer geometry, not loaded weights).
+        """
+        return (
+            _is_cuda
+            and self.cutlass_fp8_supported
+            and not self.block_quant
+            and not self.use_marlin
+            and isinstance(self.quant_config, SRTFp8Config)
+            and self.quant_config.activation_scheme == "dynamic"
+            # cutlass_compatible_b in srt apply_fp8_linear; weight is [K, N]
+            # after the load-time transpose.
+            and layer.input_size_per_partition % 16 == 0
+            and layer.output_size_per_partition % 16 == 0
+        )
+
+    def _apply_per_token_prequant_fp8_linear(
+        self,
+        layer: torch.nn.Module,
+        x: tuple,
+        bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """GEMM for a producer-quantized ``(fp8_payload, per_row_scale)`` input.
+
+        srt's ``apply_fp8_linear`` pre-quantized hook asserts a per-tensor
+        input scale, so the per-row form dispatches here instead, mirroring
+        its channelwise CUTLASS branch (same tuned-Triton override, same
+        ``fp8_scaled_mm`` call): the GEMM output is bitwise equal to the
+        separated quant-then-GEMM chain.
+        """
+        from sglang.kernels.ops.gemm import fp8_scaled_mm
+        from sglang.srt.environ import envs as srt_envs
+        from sglang.srt.layers.quantization.fp8_utils import (
+            get_w8a8_channelwise_fp8_config,
+            triton_scaled_mm,
+            use_triton_w8a8_fp8_kernel,
+        )
+
+        qinput, x_scale = x[0], x[1]
+        out_dtype = x[2] if len(x) > 2 else torch.bfloat16
+        weight = layer.weight  # [K, N] fp8, transposed at load time
+        weight_scale = layer.weight_scale
+        if (
+            qinput.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            or x_scale.dtype != torch.float32
+            or x_scale.numel() != qinput.shape[0]
+            or weight_scale.numel() != weight.shape[1]
+            or not self.supports_per_token_prequant_input(layer)
+        ):
+            raise RuntimeError(
+                "per-token pre-quantized fp8 input requires the dynamic "
+                "channelwise CUTLASS path (payload [M, K] fp8 + scale [M, 1] "
+                "fp32 against a per-channel weight scale)"
+            )
+        if use_triton_w8a8_fp8_kernel:
+            return triton_scaled_mm(
+                qinput, weight, x_scale, weight_scale, out_dtype, bias
+            )
+        tuned_config = (
+            get_w8a8_channelwise_fp8_config(
+                N=weight.shape[1], K=weight.shape[0], M=qinput.shape[0]
+            )
+            if srt_envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
+            else None
+        )
+        if tuned_config is not None:
+            return triton_scaled_mm(
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                out_dtype,
+                bias,
+                block_size_m=tuned_config["BLOCK_SIZE_M"],
+                block_size_n=tuned_config["BLOCK_SIZE_N"],
+                block_size_k=tuned_config["BLOCK_SIZE_K"],
+                use_heuristic=False,
+                num_warps=tuned_config["num_warps"],
+                num_stages=tuned_config["num_stages"],
+            )
+        return fp8_scaled_mm(
+            qinput, weight, x_scale, weight_scale, out_dtype=out_dtype, bias=bias
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, tuple],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple) and not self.block_quant:
+            # Producer-quantized (fp8_payload, per_row_scale[, out_dtype]);
+            # the block-quant tuple form keeps its branch below.
+            return self._apply_per_token_prequant_fp8_linear(
+                layer=layer, x=x, bias=bias
+            )
+
         # The activation quantization kernels assert on row-major input, and
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by
         # changing which GEMM kernel it picks. No-op when already contiguous.
-        if not x.is_contiguous():
+        if not isinstance(x, tuple) and not x.is_contiguous():
             x = x.contiguous()
 
         if self.use_marlin:

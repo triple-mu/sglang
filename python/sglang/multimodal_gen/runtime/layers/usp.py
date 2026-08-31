@@ -4,12 +4,20 @@ import logging
 import math
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.kernels.ops.diffusion import (
+    can_use_merge_two_sources_per_token_quant_fp8,
+    can_use_usp_merge_heads_per_token_quant_fp8,
+    merge_two_sources_per_token_quant_fp8,
+    pack_qkv_destination_major,
+    usp_merge_heads,
+    usp_merge_heads_per_token_quant_fp8,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -172,6 +180,87 @@ def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
     out[:, :, r * h_local : (r + 1) * h_local].copy_(x.narrow(1, off[r], my_len))
     IPC_A2A.wait()
     return out
+
+
+class _AttnOutputDirectStaging(msgspec.Struct):
+    """Views over one IPC staging slot pre-acquired for attention ``out=``.
+
+    The slot is viewed as the merged output extended to every sequence row,
+    [s_global, 2*h_local, d]; ``attn_out`` is its local-heads column slice, so
+    one kernel store lands this rank's sequence half exactly where the merged
+    result needs it and stages the peer half as the NVLink source.
+    """
+
+    attn_out: torch.Tensor  # [s_global, h_local, d] strided kernel destination
+    merged: torch.Tensor  # [s_local, 2*h_local, d] this rank's merged output
+    nvlink_src: torch.Tensor  # [s_peer, h_local, d] my heads of the peer's half
+    nvlink_dst: torch.Tensor  # same-shape view of the peer's merged region
+
+
+def _usp_attn_output_direct_begin(
+    *, s_global: int, h_local: int, head_dim: int, dtype: torch.dtype
+) -> _AttnOutputDirectStaging | None:
+    """Pre-acquire the 2-rank IPC output staging so the attention kernel can
+    write it directly, replacing the local merge copy of the
+    ``_ipc_varlen_fast`` "output" branch. None when the transport, an even
+    sequence split, or an eligible slot is unavailable; callers then run the
+    regular ``_usp_output_all_to_all``. Must be paired with
+    ``_usp_attn_output_direct_finish`` on both ranks: it consumes a slot, so
+    an unfinished exchange desyncs the slot/signal sequence.
+    """
+    if get_ulysses_parallel_world_size() != 2 or s_global % 2:
+        return None
+    if torch.compiler.is_compiling():
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    half = s_global // 2
+    r = IPC_A2A.rank
+    n = s_global * 2 * h_local * head_dim
+    pair = IPC_A2A.get_staging(n, n, dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
+    slot = IPC_A2A.next_slot()
+    big = local[slot].narrow(0, 0, n).view(s_global, 2 * h_local, head_dim)
+    peer_big = peer[slot].narrow(0, 0, n).view(s_global, 2 * h_local, head_dim)
+    local_heads = slice(r * h_local, (r + 1) * h_local)
+    peer_rows = slice((1 - r) * half, (2 - r) * half)
+    return _AttnOutputDirectStaging(
+        attn_out=big[:, local_heads],
+        merged=big[r * half : (r + 1) * half],
+        nvlink_src=big[peer_rows, local_heads],
+        nvlink_dst=peer_big[peer_rows, local_heads],
+    )
+
+
+def _usp_attn_output_direct_finish(
+    staging: _AttnOutputDirectStaging, attn_out: torch.Tensor
+) -> torch.Tensor:
+    """Complete the exchange begun by ``_usp_attn_output_direct_begin``.
+
+    Same signal ordering as ``_ipc_varlen_fast``: the NVLink write is enqueued
+    before bump_signal on this stream, so the peer's spin_wait still orders
+    its read of the merged result after my write. The local half needs no
+    signal -- the kernel stored it in stream order before this call.
+    """
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    if attn_out.data_ptr() != staging.attn_out.data_ptr():
+        # The kernel declined the buffer (``out=`` TypeError fallback or an
+        # internal reallocation); land the bytes at the legacy path's cost.
+        staging.attn_out.copy_(attn_out)
+    staging.nvlink_dst.copy_(staging.nvlink_src, non_blocking=True)
+    IPC_A2A.signal()
+    IPC_A2A.wait()
+    return staging.merged
 
 
 def _ipc_input_a2a_qkv(q, k, v):
@@ -374,11 +463,32 @@ def _usp_input_all_to_all_packed_qkv(
             device=q.device,
         )
         for index, tensor in enumerate((q, k, v)):
-            head_shards = tensor.view(s_local, world_size, h_local, head_size).permute(
-                1, 0, 2, 3
-            )
+            # reshape: the native-row-order projection hands strided head views.
+            head_shards = tensor.reshape(
+                s_local, world_size, h_local, head_size
+            ).permute(1, 0, 2, 3)
             packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
 
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
+    q, k, v = packed.split(head_size, dim=-1)
+    return q, k, v
+
+
+def _usp_input_all_to_all_prepacked_qkv(
+    packed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange a QKV send buffer that is already destination-major.
+
+    ``packed`` is ``[world, s_local, h_local, 3*head_size]`` in the exact
+    layout ``pack_qkv_destination_major`` produces (destination w holds the
+    w-th contiguous block of heads). The MiniMax-H3 native-row-order qkv
+    projection writes this buffer directly, so only the collective and the
+    receive-side views of ``_usp_input_all_to_all_packed_qkv`` remain.
+    """
+    world_size, s_local, h_local, packed_head_size = packed.shape
+    assert world_size == get_ulysses_parallel_world_size()
+    head_size = packed_head_size // 3
     packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
     packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
     q, k, v = packed.split(head_size, dim=-1)
@@ -597,6 +707,91 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
 
     return x
+
+
+def _ipc_output_merge_quant_fp8(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """2-rank IPC output exchange fused with per-token FP8 quantization.
+
+    Mirrors ``_ipc_varlen_fast(x[None], [half, half], 2, "output")`` except
+    that the local head half is never copied into the staging: after the
+    NVLink write + wait, one kernel quantizes straight from (local FA3 rows,
+    peer-written staging half) in output-column order. Payload and scale are
+    bitwise equal to quantizing the legacy merged bf16 rows. None when the
+    transport or an eligible slot is unavailable; every eligibility check runs
+    before ``next_slot`` so a bail-out never desyncs the slot sequence.
+    """
+    s_global, h_local, d = x.shape
+    if s_global % 2 or not x.is_contiguous():
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    half = s_global // 2
+    r = IPC_A2A.rank
+    inner = h_local * d
+    mine = x.narrow(0, r * half, half).view(half, inner)
+    n = half * 2 * inner
+    pair = IPC_A2A.get_staging(n, n, x.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
+    slot = IPC_A2A.next_slot()
+    pst = peer[slot].narrow(0, 0, n).view(half, 2 * h_local, d)
+    pst[:, r * h_local : (r + 1) * h_local].copy_(
+        x.narrow(0, (1 - r) * half, half), non_blocking=True
+    )
+    IPC_A2A.signal()
+    IPC_A2A.wait()
+    theirs = (
+        local[slot]
+        .narrow(0, 0, n)
+        .view(half, 2 * h_local, d)[:, (1 - r) * h_local : (2 - r) * h_local]
+        .view(half, inner)
+    )
+    first, second = (mine, theirs) if r == 0 else (theirs, mine)
+    return merge_two_sources_per_token_quant_fp8(first, second)
+
+
+def _usp_output_all_to_all_quant_fp8(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Ulysses output exchange fused with per-token FP8 quantization.
+
+    ``x`` is one rank's attention output ``[s_global, h_local, d]`` (the 3D
+    form ``_usp_output_all_to_all(x[None], head_dim=2)[0]`` consumes).
+    Returns ``(payload, scale)`` with ``payload`` fp8 ``[s_local,
+    world*h_local*d]`` and ``scale`` fp32 ``[s_local, 1]`` -- out_proj's
+    pre-quantized input -- bitwise equal to running the bf16 exchange and
+    ``sgl_per_token_quant_fp8`` separately. None when the fused form does not
+    apply; callers then run the unfused exchange.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1 or torch.compiler.is_compiling():
+        return None
+    if not x.is_cuda or x.dtype is not torch.bfloat16 or x.ndim != 3:
+        return None
+    s_global, h_local, d = x.shape
+    if s_global % world_size:
+        return None
+
+    if world_size == 2 and s_global % 2 == 0 and x.is_contiguous():
+        mine = x.narrow(0, 0, s_global // 2).view(s_global // 2, h_local * d)
+        if can_use_merge_two_sources_per_token_quant_fp8(mine, mine):
+            fused = _ipc_output_merge_quant_fp8(x)
+            if fused is not None:
+                return fused
+
+    recv = _usp_all_to_all_single(x.reshape(s_global, 1, h_local, d), role="usp_output")
+    recv = recv.reshape(world_size, s_global // world_size, 1, h_local, d)
+    if not can_use_usp_merge_heads_per_token_quant_fp8(recv):
+        return None
+    return usp_merge_heads_per_token_quant_fp8(recv)
 
 
 def _usp_output_all_to_all_varlen(
