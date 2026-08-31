@@ -15,12 +15,22 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
+
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_silu_mul_per_token_quant_fp8,
     fused_silu_mul_per_token_quant_fp8,
+)
+
+# Deep imports pin the C++ JIT backend against its Triton fallback directly
+# (allowlisted in test_import_surface.py).
+from sglang.kernels.ops.diffusion.activation import (
+    silu_mul_quant_jit as _silu_mul_quant_jit,
+)
+from sglang.kernels.ops.diffusion.activation import (
+    silu_mul_quant_triton as _silu_mul_quant_triton,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -127,6 +137,64 @@ def test_rejects_unsupported_inputs():
     assert not can_use_fused_silu_mul_per_token_quant_fp8(good.t())  # column strides
     with pytest.raises(RuntimeError, match="unsupported"):
         fused_silu_mul_per_token_quant_fp8(good.half())
+
+
+# ---------------------------------------------------------------------------
+# C++ JIT backend vs the Triton fallback, and the dispatch-order gate.  The
+# public symbol dispatches C++ -> Triton; these pin the backends directly.
+# ---------------------------------------------------------------------------
+
+
+def _skip_unless_cpp_backend(x: torch.Tensor) -> None:
+    if not _silu_mul_quant_jit.can_use_silu_mul_quant_cuda(x):
+        pytest.skip("JIT C++ backend unavailable (needs SM90 CUDA)")
+
+
+@pytest.mark.parametrize("rows", [17, 20992])
+def test_cpp_matches_triton_bitwise(rows):
+    """The C++ port replicates the Triton replica's exact arithmetic bitwise
+    across both reference dispatch regimes (rows above/below the warp-dispatch
+    threshold flip the zero-scale guard) and the adversarial scale corners."""
+    torch.manual_seed(4)
+    x = _adversarial_fill(
+        torch.randn(rows, 2 * HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    )
+    _skip_unless_cpp_backend(x)
+    _assert_bitwise_equal(
+        _silu_mul_quant_jit.silu_mul_quant_cuda(x),
+        _silu_mul_quant_triton.fused_silu_mul_per_token_quant_fp8(x),
+    )
+
+
+def test_silu_mul_quant_dispatch_order(monkeypatch):
+    """Supported input runs the C++ backend; unsupported falls back to Triton."""
+    torch.manual_seed(5)
+    x = torch.randn(64, 2 * HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+    _skip_unless_cpp_backend(x)
+
+    fallback_calls: list[str] = []
+    real_triton = _silu_mul_quant_jit.triton_fused_silu_mul_per_token_quant_fp8
+
+    def fallback_stub(value):
+        fallback_calls.append("triton")
+        return real_triton(value)
+
+    monkeypatch.setattr(
+        _silu_mul_quant_jit,
+        "triton_fused_silu_mul_per_token_quant_fp8",
+        fallback_stub,
+    )
+    _assert_bitwise_equal(fused_silu_mul_per_token_quant_fp8(x), _separated_chain(x))
+    assert not fallback_calls, "supported input must not reach the Triton fallback"
+
+    # hidden % 8 != 0 is outside the C++ gate; the call must route to Triton.
+    narrow = torch.randn(64, 2 * 12, dtype=torch.bfloat16, device=DEVICE)
+    assert can_use_fused_silu_mul_per_token_quant_fp8(narrow)
+    assert not _silu_mul_quant_jit.can_use_silu_mul_quant_cuda(narrow)
+    _assert_bitwise_equal(
+        fused_silu_mul_per_token_quant_fp8(narrow), _separated_chain(narrow)
+    )
+    assert fallback_calls == ["triton"]
 
 
 if __name__ == "__main__":

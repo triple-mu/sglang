@@ -13,12 +13,20 @@ import sys
 
 import pytest
 import torch
+
 from sglang.kernels.ops.diffusion import (
     can_use_merge_two_sources_per_token_quant_fp8,
     can_use_usp_merge_heads_per_token_quant_fp8,
     merge_two_sources_per_token_quant_fp8,
     usp_merge_heads,
     usp_merge_heads_per_token_quant_fp8,
+)
+
+# Deep imports on purpose (allowlisted in test_import_surface): the
+# backend-equality and dispatch-order cases pin one backend each.
+from sglang.kernels.ops.diffusion.layout import (
+    usp_merge_quant_jit,
+    usp_merge_quant_triton,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -139,6 +147,122 @@ def test_two_source_form_accepts_strided_rows():
     )
     _assert_bitwise_equal(
         merge_two_sources_per_token_quant_fp8(first, second), expected
+    )
+
+
+def _ipc_staging_pair(tokens: int, inner: int):
+    """Production 2-rank IPC operands: differing row strides, offset base."""
+    first = torch.randn(tokens, inner, dtype=torch.bfloat16, device=DEVICE)
+    staging = torch.randn(tokens, 2 * inner, dtype=torch.bfloat16, device=DEVICE)
+    return first, staging[:, inner:]
+
+
+@pytest.mark.parametrize("dispatch", ["cta", "warp"])
+def test_two_source_cpp_backend_matches_triton_bitwise(dispatch):
+    """C++ backend vs Triton replica on the production operand layout.
+
+    Regression guard: the two sources' row strides differ in production (the
+    local FA3 rows vs the peer-written staging half); a C++ launcher that pins
+    one stride symbol for both sources rejects exactly this input and the op
+    silently degrades to Triton.  Rows mixing bf16 denormals with tiny normals
+    pin the payload FTZ (a denormal times a huge 1/scale reaches fp8 range).
+    """
+    torch.manual_seed(5)
+    tokens = 257 if dispatch == "cta" else _warp_dispatch_num_tokens()
+    first, second = _ipc_staging_pair(tokens, H_LOCAL * HEAD_DIM)
+    first[::7] = 0
+    second[3::7] = 0
+    denormal = torch.rand_like(first[1::9], dtype=torch.float32) * 9.0e-41
+    first[1::9] = denormal.to(torch.bfloat16)
+    tiny = torch.rand_like(second[1::9], dtype=torch.float32) * 1.1e-38
+    second[1::9] = tiny.to(torch.bfloat16)
+    cpp = usp_merge_quant_jit._cpp_merge_two_sources_quant_fp8(first, second)
+    if cpp is None:
+        pytest.skip("C++ two-source backend unavailable on this device")
+    _assert_bitwise_equal(
+        cpp,
+        usp_merge_quant_triton.merge_two_sources_per_token_quant_fp8(first, second),
+    )
+
+
+def test_two_source_dispatch_order_cpp_then_triton(monkeypatch):
+    """cpp-jit is the default; only inputs it cannot vectorize reach Triton."""
+    calls = []
+    real = usp_merge_quant_triton.merge_two_sources_per_token_quant_fp8
+
+    def spy(first, second):
+        calls.append(first.shape[-1])
+        return real(first, second)
+
+    monkeypatch.setattr(usp_merge_quant_jit, "_triton_merge_two_sources", spy)
+    cpp_ready = usp_merge_quant_jit._merge_two_module_or_none(1) is not None
+    good = torch.randn(64, 512, dtype=torch.bfloat16, device=DEVICE)
+    usp_merge_quant_jit.merge_two_sources_per_token_quant_fp8(good, good)
+    assert calls == ([] if cpp_ready else [512])
+    odd = torch.randn(64, 44, dtype=torch.bfloat16, device=DEVICE)  # 44 % 8 != 0
+    usp_merge_quant_jit.merge_two_sources_per_token_quant_fp8(odd, odd)
+    assert calls == ([44] if cpp_ready else [512, 44])
+
+
+def test_facade_routes_two_source_through_jit_dispatcher():
+    # The registry must hand callers the dispatching wrapper, not a backend.
+    assert (
+        merge_two_sources_per_token_quant_fp8
+        is usp_merge_quant_jit.merge_two_sources_per_token_quant_fp8
+    )
+
+
+@pytest.mark.parametrize("dispatch", ["cta", "warp"])
+def test_merge_heads_cpp_backend_matches_triton_bitwise(dispatch):
+    """C++ backend vs Triton replica on adversarial head-merge rows.
+
+    The dispatcher exercises only the backend it selects, so the shadowed one
+    could drift from the separated-chain contract unnoticed; pin the two to
+    each other across both reference dispatch regimes and the amax=0 /
+    denormal / overflow corners.
+    """
+    torch.manual_seed(6)
+    seq = 257 if dispatch == "cta" else _warp_dispatch_num_tokens()
+    x = torch.randn(
+        WORLD, seq, 1, H_LOCAL, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
+    )
+    x = _adversarial_fill(x)
+    cpp = usp_merge_quant_jit._cpp_merge_heads_quant_fp8(x)
+    if cpp is None:
+        pytest.skip("C++ head-merge backend unavailable on this device")
+    _assert_bitwise_equal(
+        cpp, usp_merge_quant_triton.usp_merge_heads_per_token_quant_fp8(x)
+    )
+
+
+def test_merge_heads_dispatch_order_cpp_then_triton(monkeypatch):
+    """cpp-jit is the default; only inputs it cannot vectorize reach Triton."""
+    calls = []
+    real = usp_merge_quant_triton.usp_merge_heads_per_token_quant_fp8
+
+    def spy(x):
+        calls.append(x.shape[-1])
+        return real(x)
+
+    monkeypatch.setattr(usp_merge_quant_jit, "_triton_merge_heads", spy)
+    cpp_ready = usp_merge_quant_jit._merge_heads_module_or_none(4) is not None
+    good = torch.randn(
+        WORLD, 64, 1, H_LOCAL, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
+    )
+    usp_merge_heads_per_token_quant_fp8(good)
+    assert calls == ([] if cpp_ready else [HEAD_DIM])
+    narrow = torch.randn(2, 8, 1, 1, 12, dtype=torch.bfloat16, device=DEVICE)
+    _assert_bitwise_equal(  # inner % 8 != 0: Triton serves it, contract holds
+        usp_merge_heads_per_token_quant_fp8(narrow), _separated_chain(narrow)
+    )
+    assert calls[-1:] == [12]
+
+
+def test_facade_routes_merge_heads_through_jit_dispatcher():
+    # The registry must hand callers the dispatching wrapper, not a backend.
+    assert (
+        usp_merge_heads_per_token_quant_fp8
+        is usp_merge_quant_jit.usp_merge_heads_per_token_quant_fp8
     )
 
 

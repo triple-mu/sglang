@@ -7,18 +7,23 @@ select-0/1 LayerNorm fusions compute their statistics differently from the
 reference chain and are asserted with a tolerance.
 """
 
+import importlib
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
+    can_use_indexed_gate_bf16_cuda,
     can_use_modulate_scale_shift_cuda,
     can_use_residual_gate_add_cuda,
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
+    indexed_gate_bf16,
+    indexed_gate_bf16_,
     ltx2_ada_values9,
     modulate_scale_shift,
     modulate_scale_shift_cuda,
@@ -520,6 +525,80 @@ def test_timestep_embedding_matches_diffusers(
         atol=1e-3,
         rtol=1e-3,
     )
+
+
+# ---------------------------------------------------------------------------
+# indexed gate: x + round_bf16(gate[indices] * other)  (MiniMax-H3 adaLN)
+# ---------------------------------------------------------------------------
+
+_INDEXED_GATE_JIT = "sglang.kernels.ops.diffusion.modulate.indexed_gate_jit"
+
+
+def _indexed_gate_case(rows, hidden, groups, idx_dtype=torch.int64, seed=0):
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+
+    def randn(*shape, scale=1.0):
+        return (torch.randn(shape, generator=generator, device=DEVICE) * scale).to(
+            torch.bfloat16
+        )
+
+    x = randn(rows, hidden)
+    other = randn(rows, hidden)
+    gate = randn(groups, hidden, scale=0.3)
+    indices = torch.randint(0, groups, (rows,), generator=generator, device=DEVICE).to(
+        idx_dtype
+    )
+    return x, gate, other, indices
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize(
+    ("rows", "hidden", "groups"),
+    [(4096, 5376, 9), (70000, 256, 3)],  # H3 production width; grid.y row loop
+)
+def test_indexed_gate_cpp_matches_triton_bitwise(rows, hidden, groups, idx_dtype):
+    """The cpp-jit default and the Triton fallback share the documented bf16
+    rounding chain, so they must stay bitwise interchangeable; the fused
+    Plan B adaLN kernel asserts bit-equality against this op's output."""
+    x, gate, other, indices = _indexed_gate_case(rows, hidden, groups, idx_dtype)
+    if not can_use_indexed_gate_bf16_cuda(x, gate, other, indices):
+        pytest.skip("cpp-jit indexed_gate unavailable on this platform")
+    jit_mod = importlib.import_module(_INDEXED_GATE_JIT)
+
+    cpp_out = indexed_gate_bf16(x, gate, other, indices)
+    cpp_inplace = x.clone()
+    assert indexed_gate_bf16_(cpp_inplace, gate, other, indices) is cpp_inplace
+    with patch.object(jit_mod, "can_use_indexed_gate_bf16_cuda", return_value=False):
+        triton_out = indexed_gate_bf16(x, gate, other, indices)
+    assert torch.equal(cpp_out, triton_out)
+    assert torch.equal(cpp_inplace, triton_out)
+
+
+def test_indexed_gate_dispatch_prefers_cpp_and_falls_back_to_triton():
+    """Dispatch-order contract: cpp-jit is the default when its gate is open,
+    and a closed gate must actually reach the Triton kernel."""
+    x, gate, other, indices = _indexed_gate_case(64, 512, 2)
+    jit_mod = importlib.import_module(_INDEXED_GATE_JIT)
+
+    with patch.object(
+        jit_mod, "_triton_indexed_gate_bf16", wraps=jit_mod._triton_indexed_gate_bf16
+    ) as triton_spy:
+        indexed_gate_bf16_(x.clone(), gate, other, indices)
+        if can_use_indexed_gate_bf16_cuda(x, gate, other, indices):
+            triton_spy.assert_not_called()
+        else:
+            triton_spy.assert_called_once()
+
+    with (
+        patch.object(jit_mod, "can_use_indexed_gate_bf16_cuda", return_value=False),
+        patch.object(
+            jit_mod,
+            "_triton_indexed_gate_bf16",
+            wraps=jit_mod._triton_indexed_gate_bf16,
+        ) as triton_spy,
+    ):
+        indexed_gate_bf16_(x.clone(), gate, other, indices)
+        triton_spy.assert_called_once()
 
 
 if __name__ == "__main__":

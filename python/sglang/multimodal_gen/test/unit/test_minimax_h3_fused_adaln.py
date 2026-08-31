@@ -23,6 +23,21 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_bf16_,
     rmsnorm_indexed_scale_shift,
 )
+
+# Backend-specific imports: the C++-vs-Triton contract tests below exercise
+# each backend directly (this file is allowlisted in test_import_surface.py).
+from sglang.kernels.ops.diffusion.modulate import (
+    indexed_modulation_jit as _indexed_modulation_jit,
+)
+from sglang.kernels.ops.diffusion.modulate import (
+    indexed_modulation_triton as _indexed_modulation_triton,
+)
+from sglang.kernels.ops.diffusion.norm import (
+    rmsnorm_indexed_modulate_jit as _rmsnorm_indexed_modulate_jit,
+)
+from sglang.kernels.ops.diffusion.norm import (
+    rmsnorm_indexed_modulate_triton as _rmsnorm_indexed_modulate_triton,
+)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
@@ -396,6 +411,159 @@ def test_fused_adaln_param_merge_and_gating(monkeypatch):
     blocks[0].preserve_input_for_cache_dit = True
     assert model._fused_adaln_block_params(params, hidden) is None
     blocks[0].preserve_input_for_cache_dit = False
+
+
+# ---------------------------------------------------------------------------
+# C++ JIT backend vs the Triton fallback, and the dispatch-order gates.
+# The public symbols now dispatch C++ -> Triton; these tests pin the two
+# backends against each other directly.
+# ---------------------------------------------------------------------------
+
+
+def _skip_unless_cpp_backend(x, w_eff, shift, indices) -> None:
+    if not _rmsnorm_indexed_modulate_jit.can_use_rmsnorm_indexed_scale_shift_cuda(
+        x, w_eff, shift, indices
+    ):
+        pytest.skip("JIT C++ backend unavailable (needs SM90+ CUDA)")
+
+
+@requires_cuda
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize(("rows", "groups"), [(20992, 9), (4096, 3)])
+def test_cpp_indexed_scale_shift_bitwise_vs_triton(
+    rows: int, groups: int, index_dtype: torch.dtype
+):
+    """The C++ port replicates the Triton bf16 rounding chain bitwise."""
+    x, _, scale, shift, _, _, indices, _ = _random_case(rows, groups, 17)
+    indices = indices.to(index_dtype)
+    x_cpp, x_tri = x.clone(), x.clone()
+    if not _indexed_modulation_jit.can_use_indexed_scale_shift_cuda(
+        x_cpp, shift, scale, indices
+    ):
+        pytest.skip("JIT C++ backend unavailable (needs SM90+ CUDA)")
+    _indexed_modulation_jit.indexed_scale_shift_bf16_cuda(x_cpp, shift, scale, indices)
+    _indexed_modulation_triton.indexed_scale_shift_bf16_(x_tri, shift, scale, indices)
+    assert torch.equal(x_cpp, x_tri)
+
+
+@requires_cuda
+@pytest.mark.parametrize(("rows", "groups"), [(20992, 9), (4096, 3)])
+def test_cpp_rmsnorm_indexed_contract_vs_triton(rows: int, groups: int):
+    """Plan A/B C++ vs Triton: the residual write-back is bitwise, the norm
+    output near-lossless (the two backends reduce in different tree orders)."""
+    x, weight, scale, shift, gate, update, indices, w_eff = _random_case(
+        rows, groups, 18
+    )
+    _skip_unless_cpp_backend(x, w_eff, shift, indices)
+
+    out_cpp = _rmsnorm_indexed_modulate_jit.rmsnorm_indexed_scale_shift_cuda(
+        x, w_eff, shift, indices, eps=_EPS
+    )
+    out_tri = _rmsnorm_indexed_modulate_triton.rmsnorm_indexed_scale_shift(
+        x, w_eff, shift, indices, eps=_EPS
+    )
+    _, magnitude = _norm_modulate_fp64(x, weight, scale, shift, indices)
+    _report_and_assert_close(
+        out_cpp,
+        out_tri,
+        magnitude,
+        label=f"cpp_vs_triton_a[{rows}x{groups}]",
+        max_scaled_ulp=4.0,
+    )
+
+    res_cpp, res_tri, res_eager = x.clone(), x.clone(), x.clone()
+    out_cpp, returned = (
+        _rmsnorm_indexed_modulate_jit.gate_residual_rmsnorm_indexed_scale_shift_cuda_(
+            res_cpp, update, gate, w_eff, shift, indices, eps=_EPS
+        )
+    )
+    out_tri, _ = (
+        _rmsnorm_indexed_modulate_triton.gate_residual_rmsnorm_indexed_scale_shift_(
+            res_tri, update, gate, w_eff, shift, indices, eps=_EPS
+        )
+    )
+    _indexed_modulation_triton.indexed_gate_bf16_(res_eager, gate, update, indices)
+    assert returned.data_ptr() == res_cpp.data_ptr()
+    assert torch.equal(res_cpp, res_tri), "Plan B residual must be bitwise vs Triton"
+    assert torch.equal(
+        res_cpp, res_eager
+    ), "Plan B residual must be bitwise vs indexed_gate_bf16_"
+    _, magnitude = _norm_modulate_fp64(res_tri, weight, scale, shift, indices)
+    _report_and_assert_close(
+        out_cpp,
+        out_tri,
+        magnitude,
+        label=f"cpp_vs_triton_b[{rows}x{groups}]",
+        max_scaled_ulp=4.0,
+    )
+
+
+@requires_cuda
+def test_indexed_scale_shift_dispatch_order(monkeypatch):
+    """Supported input runs the C++ backend; unsupported falls back to Triton."""
+    x, _, scale, shift, _, _, indices, _ = _random_case(512, 3, 19)
+    if not _indexed_modulation_jit.can_use_indexed_scale_shift_cuda(
+        x, shift, scale, indices
+    ):
+        pytest.skip("JIT C++ backend unavailable (needs SM90+ CUDA)")
+
+    fallback_calls: list[str] = []
+
+    def fallback_stub(*args, **kwargs):
+        fallback_calls.append("triton")
+        return args[0]
+
+    monkeypatch.setattr(
+        _indexed_modulation_jit, "triton_indexed_scale_shift_bf16_", fallback_stub
+    )
+    reference = _indexed_modulation_triton.indexed_scale_shift_bf16_(
+        x.clone(), shift, scale, indices
+    )
+    got = indexed_scale_shift_bf16_(x.clone(), shift, scale, indices)
+    assert not fallback_calls, "supported input must not reach the Triton fallback"
+    assert torch.equal(got, reference)
+
+    # int16 indices are outside the C++ gate; the call must route to Triton.
+    assert not _indexed_modulation_jit.can_use_indexed_scale_shift_cuda(
+        x, shift, scale, indices.to(torch.int16)
+    )
+    indexed_scale_shift_bf16_(x.clone(), shift, scale, indices.to(torch.int16))
+    assert fallback_calls == ["triton"]
+
+
+@requires_cuda
+def test_rmsnorm_indexed_dispatch_order(monkeypatch):
+    """Both fused-adaLN entry points prefer C++ and fail closed to Triton."""
+    x, _, scale, shift, gate, update, indices, w_eff = _random_case(512, 3, 20)
+    _skip_unless_cpp_backend(x, w_eff, shift, indices)
+
+    fallback_calls: list[str] = []
+    monkeypatch.setattr(
+        _rmsnorm_indexed_modulate_jit,
+        "triton_rmsnorm_indexed_scale_shift",
+        lambda *a, **k: fallback_calls.append("plan_a"),
+    )
+    monkeypatch.setattr(
+        _rmsnorm_indexed_modulate_jit,
+        "triton_gate_residual_rmsnorm_indexed_scale_shift_",
+        lambda *a, **k: fallback_calls.append("plan_b"),
+    )
+    rmsnorm_indexed_scale_shift(x, w_eff, shift, indices, eps=_EPS)
+    gate_residual_rmsnorm_indexed_scale_shift_(
+        x.clone(), update, gate, w_eff, shift, indices, eps=_EPS
+    )
+    assert not fallback_calls, "supported input must not reach the Triton fallback"
+
+    # A non-bf16 weight_eff is outside the C++ gate on both entry points.
+    bad_w = w_eff.to(torch.bfloat16)
+    assert not _rmsnorm_indexed_modulate_jit.can_use_rmsnorm_indexed_scale_shift_cuda(
+        x, bad_w, shift, indices
+    )
+    rmsnorm_indexed_scale_shift(x, bad_w, shift, indices, eps=_EPS)
+    gate_residual_rmsnorm_indexed_scale_shift_(
+        x.clone(), update, gate, bad_w, shift, indices, eps=_EPS
+    )
+    assert fallback_calls == ["plan_a", "plan_b"]
 
 
 @requires_cuda

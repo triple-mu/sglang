@@ -1,10 +1,15 @@
 import torch
+
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.diffusion import (
     merge_two_sources_per_token_quant_fp8,
     usp_merge_heads,
     usp_merge_heads_per_token_quant_fp8,
 )
+
+# Deep import on purpose (allowlisted in test_import_surface): pins the Triton
+# backend so the columns compare it against the C++ JIT default dispatch.
+from sglang.kernels.ops.diffusion.layout import usp_merge_quant_triton
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -32,17 +37,35 @@ def _fused_two_source(x: torch.Tensor):
     )
 
 
+def _fused_two_source_triton(x: torch.Tensor):
+    tokens = x.shape[1]
+    return usp_merge_quant_triton.merge_two_sources_per_token_quant_fp8(
+        x[0, :, 0].reshape(tokens, -1), x[1, :, 0].reshape(tokens, -1)
+    )
+
+
 FN_MAP = {
     "fused": usp_merge_heads_per_token_quant_fp8,
+    "fused_triton": usp_merge_quant_triton.usp_merge_heads_per_token_quant_fp8,
     "merge+quant": _merge_then_quant,
     "fused_two_source": _fused_two_source,
+    "fused_two_source_triton": _fused_two_source_triton,
 }
 
 
 # Rows cover both reference dispatch regimes; 20992 is the production
 # fl2va per-rank token count (ulysses=2).
 @marker.parametrize("seq", [1797, 20992], [1797])
-@marker.benchmark("impl", ["fused", "merge+quant", "fused_two_source"])
+@marker.benchmark(
+    "impl",
+    [
+        "fused",
+        "fused_triton",
+        "merge+quant",
+        "fused_two_source",
+        "fused_two_source_triton",
+    ],
+)
 def benchmark(seq: int, impl: str) -> marker.BenchResult:
     x = torch.randn(
         WORLD, seq, 1, H_LOCAL, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE

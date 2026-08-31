@@ -1,10 +1,14 @@
 import torch
 import torch.nn.functional as F
+
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
 from sglang.kernels.ops.diffusion import fused_silu_mul_per_token_quant_fp8
+from sglang.kernels.ops.diffusion.activation.silu_mul_quant_triton import (
+    fused_silu_mul_per_token_quant_fp8 as triton_fused_silu_mul_per_token_quant_fp8,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -29,7 +33,10 @@ def _act_and_mul_then_quant(x: torch.Tensor):
 
 
 FN_MAP = {
+    # the public symbol dispatches C++ JIT -> Triton; the explicit line pins
+    # the Triton backend for comparison
     "fused": fused_silu_mul_per_token_quant_fp8,
+    "fused_triton": triton_fused_silu_mul_per_token_quant_fp8,
     "eager+quant": _eager_then_quant,
     "act_and_mul+quant": _act_and_mul_then_quant,
 }
@@ -38,7 +45,7 @@ FN_MAP = {
 # Rows cover both reference dispatch regimes; 20992 is the production
 # fl2va per-rank token count (ulysses=2).
 @marker.parametrize("rows", [1797, 20992], [1797])
-@marker.benchmark("impl", ["fused", "eager+quant", "act_and_mul+quant"])
+@marker.benchmark("impl", ["fused", "fused_triton", "eager+quant", "act_and_mul+quant"])
 def benchmark(rows: int, impl: str) -> marker.BenchResult:
     x = torch.randn(rows, PACKED, dtype=torch.bfloat16, device=DEVICE)
     # All impls report the fused op's effective payload (read x, write q + s),
