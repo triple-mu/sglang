@@ -8,10 +8,19 @@ SM90+, bf16 contiguous rows) -> Triton; ROCm and pre-SM90 fail closed to
 Triton. The eager fallback lives at the model level -- the fused block loop
 only engages on CUDA bf16 contiguous hidden states.
 
-Numerical contract: the Plan B residual write-back replicates the eager
-``indexed_gate_bf16_`` rounding chain bitwise; the norm/modulate output keeps
-the Triton kernel's near-lossless contract (fp32 sum of squares, one bf16
-round on the store) with an implementation-specific reduction tree.
+Two norm/modulate output contracts:
+
+- Merged-``w_eff`` entry points (near-lossless): the Plan B residual
+  write-back replicates the eager ``indexed_gate_bf16_`` rounding chain
+  bitwise; the norm/modulate output keeps the Triton kernel's near-lossless
+  contract (fp32 sum of squares, one bf16 round on the store) with an
+  implementation-specific reduction tree.
+- ``*_bitexact`` entry points (unmerged bf16 ``gamma`` + ``scale``): bitwise
+  vs the eager chain ``nn.RMSNorm -> indexed_scale_shift_bf16_`` (plus
+  ``indexed_gate_bf16_`` in front for Plan B) by replicating aten's
+  ``vectorized_layer_norm_kernel<BFloat16, float, true>`` reduction order and
+  every eager bf16 rounding boundary. C++ only -- there is no Triton twin, so
+  callers gate on ``can_use_*`` and fall back to the eager kernels themselves.
 """
 
 from __future__ import annotations
@@ -56,6 +65,9 @@ def _block_threads(hidden_size: int) -> int:
 def _jit_rmsnorm_indexed_modulate_module(hidden_size: int, threads: int) -> Module:
     args = make_cpp_args(hidden_size, threads)
     kernel = f"rmsnorm_indexed_modulate::RMSNormIndexedModulateKernel<{args}>"
+    # The aten-order bitexact variant pins its own (32, 4) block geometry, so
+    # it is keyed on the hidden size alone.
+    aten = f"rmsnorm_indexed_modulate::RMSNormIndexedModulateAtenKernel<{hidden_size}>"
     return load_jit(
         "diffusion_rmsnorm_indexed_modulate",
         *args,
@@ -63,6 +75,11 @@ def _jit_rmsnorm_indexed_modulate_module(hidden_size: int, threads: int) -> Modu
         cuda_wrappers=[
             ("rmsnorm_indexed_scale_shift", f"{kernel}::run"),
             ("gate_residual_rmsnorm_indexed_scale_shift", f"{kernel}::run_gated"),
+            ("rmsnorm_indexed_scale_shift_bitexact", f"{aten}::run"),
+            (
+                "gate_residual_rmsnorm_indexed_scale_shift_bitexact",
+                f"{aten}::run_gated",
+            ),
         ],
     )
 
@@ -212,6 +229,136 @@ def gate_residual_rmsnorm_indexed_scale_shift_cuda_(
     return out, residual
 
 
+def _bitexact_rows_supported(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    return (
+        x.dtype is torch.bfloat16
+        and x.is_cuda
+        and x.dim() == 2
+        and x.shape[0] > 0
+        and x.is_contiguous()
+        and _cuda_backend_available(x.shape[1], _block_threads(x.shape[1]))
+        and gamma.dtype is torch.bfloat16
+        and gamma.shape == (x.shape[1],)
+        and gamma.is_contiguous()
+        and scale.dtype is torch.bfloat16
+        and scale.dim() == 2
+        and scale.shape[1] == x.shape[1]
+        and scale.is_contiguous()
+        and shift.dtype is torch.bfloat16
+        and shift.shape == scale.shape
+        and shift.is_contiguous()
+        and indices.dtype in _INDEX_DTYPES
+        and indices.is_contiguous()
+        and indices.shape == (x.shape[0],)
+        and x.data_ptr() % _ALIGN_BYTES == 0
+        and gamma.data_ptr() % _ALIGN_BYTES == 0
+        and scale.data_ptr() % _ALIGN_BYTES == 0
+        and shift.data_ptr() % _ALIGN_BYTES == 0
+    )
+
+
+def can_use_rmsnorm_indexed_scale_shift_bitexact_cuda(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    return _bitexact_rows_supported(x, gamma, scale, shift, indices)
+
+
+def can_use_gate_residual_rmsnorm_indexed_scale_shift_bitexact_cuda(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    return (
+        _bitexact_rows_supported(residual, gamma, scale, shift, indices)
+        and update.dtype is torch.bfloat16
+        and update.shape == residual.shape
+        and update.is_contiguous()
+        and update.data_ptr() != residual.data_ptr()
+        and gate.dtype is torch.bfloat16
+        and gate.shape == scale.shape
+        and gate.is_contiguous()
+        and update.data_ptr() % _ALIGN_BYTES == 0
+        and gate.data_ptr() % _ALIGN_BYTES == 0
+    )
+
+
+def rmsnorm_indexed_scale_shift_bitexact(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """Plan A, bitwise vs eager ``nn.RMSNorm -> indexed_scale_shift_bf16_``.
+
+    C++ backend only; raises on unsupported input instead of falling back --
+    callers gate on ``can_use_rmsnorm_indexed_scale_shift_bitexact_cuda``.
+    """
+    if not can_use_rmsnorm_indexed_scale_shift_bitexact_cuda(
+        x, gamma, scale, shift, indices
+    ):
+        raise RuntimeError(
+            "unsupported input for rmsnorm_indexed_scale_shift_bitexact CUDA"
+        )
+    out = torch.empty_like(x)
+    module = _jit_rmsnorm_indexed_modulate_module(
+        x.shape[1], _plan_a_threads(x.shape[1])
+    )
+    module.rmsnorm_indexed_scale_shift_bitexact(
+        out, x, gamma, scale, shift, indices, eps
+    )
+    return out
+
+
+def gate_residual_rmsnorm_indexed_scale_shift_bitexact_(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plan B, bitwise vs eager ``indexed_gate_bf16_`` then the Plan A chain;
+    ``residual`` is updated in place and returned as ``(out, residual)``.
+
+    C++ backend only; raises on unsupported input instead of falling back.
+    """
+    if not can_use_gate_residual_rmsnorm_indexed_scale_shift_bitexact_cuda(
+        residual, update, gate, gamma, scale, shift, indices
+    ):
+        raise RuntimeError(
+            "unsupported input for gate_residual_rmsnorm_indexed_scale_shift_bitexact"
+            " CUDA"
+        )
+    out = torch.empty_like(residual)
+    module = _jit_rmsnorm_indexed_modulate_module(
+        residual.shape[1], _plan_b_threads(residual.shape[1])
+    )
+    module.gate_residual_rmsnorm_indexed_scale_shift_bitexact(
+        out, residual, update, gate, gamma, scale, shift, indices, eps
+    )
+    return out, residual
+
+
 def rmsnorm_indexed_scale_shift(
     x: torch.Tensor,
     weight_eff: torch.Tensor,
@@ -278,10 +425,14 @@ def gate_residual_rmsnorm_indexed_scale_shift_(
 
 
 __all__ = [
+    "can_use_gate_residual_rmsnorm_indexed_scale_shift_bitexact_cuda",
     "can_use_gate_residual_rmsnorm_indexed_scale_shift_cuda",
+    "can_use_rmsnorm_indexed_scale_shift_bitexact_cuda",
     "can_use_rmsnorm_indexed_scale_shift_cuda",
     "gate_residual_rmsnorm_indexed_scale_shift_",
+    "gate_residual_rmsnorm_indexed_scale_shift_bitexact_",
     "gate_residual_rmsnorm_indexed_scale_shift_cuda_",
     "rmsnorm_indexed_scale_shift",
+    "rmsnorm_indexed_scale_shift_bitexact",
     "rmsnorm_indexed_scale_shift_cuda",
 ]

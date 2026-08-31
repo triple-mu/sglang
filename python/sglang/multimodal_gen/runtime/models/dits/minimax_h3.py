@@ -25,16 +25,20 @@ from sglang.kernels.ops.activation.activation import (
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     can_use_fused_silu_mul_per_token_quant_fp8,
+    can_use_gate_residual_rmsnorm_indexed_scale_shift_bitexact_cuda,
     can_use_per_head_quant_fp8,
+    can_use_rmsnorm_indexed_scale_shift_bitexact_cuda,
     fused_inplace_qknorm_rope,
     fused_silu_mul_per_token_quant_fp8,
     gate_residual_rmsnorm_indexed_scale_shift_,
+    gate_residual_rmsnorm_indexed_scale_shift_bitexact_,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_bf16_to_fp32,
     per_head_quant_fp8,
     rmsnorm_indexed_scale_shift,
+    rmsnorm_indexed_scale_shift_bitexact,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -54,12 +58,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_rank,
     get_ulysses_ctx,
     get_world_rank,
-)
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_persist import (
-    adaln_plan_key,
-    load_adaln_plans,
-    make_adaln_persist_spec,
-    save_adaln_plans,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
@@ -85,6 +83,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_persist import (
+    adaln_plan_key,
+    load_adaln_plans,
+    make_adaln_persist_spec,
+    save_adaln_plans,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -403,6 +407,61 @@ def _modulate_gate(
             return indexed_gate_bf16_(x, gate, other, indices)
         return indexed_gate_bf16(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
+
+
+def _fused_norm_modulate(
+    x: torch.Tensor,
+    weight: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """Fused-adaLN Plan A site: a ``(gamma, scale)`` pair runs the bitexact
+    kernel (falling back to the equivalent eager chain per call), a merged
+    fp32 ``w_eff`` tensor the near-lossless one."""
+    if isinstance(weight, tuple):
+        gamma, scale = weight
+        if can_use_rmsnorm_indexed_scale_shift_bitexact_cuda(
+            x, gamma, scale, shift, indices
+        ):
+            return rmsnorm_indexed_scale_shift_bitexact(
+                x, gamma, scale, shift, indices, eps=eps
+            )
+        h = nn.functional.rms_norm(x, gamma.shape, gamma, eps)
+        return _modulate_scale_shift(h, shift, scale, indices, dtype=_BF16_DTYPE)
+    return rmsnorm_indexed_scale_shift(x, weight, shift, indices, eps=eps)
+
+
+def _fused_gate_norm_modulate_(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused-adaLN Plan B site (see ``_fused_norm_modulate``); ``residual`` is
+    updated in place on every branch and returned as ``(out, residual)``."""
+    if isinstance(weight, tuple):
+        gamma, scale = weight
+        if can_use_gate_residual_rmsnorm_indexed_scale_shift_bitexact_cuda(
+            residual, update, gate, gamma, scale, shift, indices
+        ):
+            return gate_residual_rmsnorm_indexed_scale_shift_bitexact_(
+                residual, update, gate, gamma, scale, shift, indices, eps=eps
+            )
+        residual = _modulate_gate(residual, gate, update, indices, dtype=_BF16_DTYPE)
+        h = nn.functional.rms_norm(residual, gamma.shape, gamma, eps)
+        return (
+            _modulate_scale_shift(h, shift, scale, indices, dtype=_BF16_DTYPE),
+            residual,
+        )
+    return gate_residual_rmsnorm_indexed_scale_shift_(
+        residual, update, gate, weight, shift, indices, eps=eps
+    )
 
 
 def _linear_accepts_per_token_prequant_fp8(linear) -> bool:
@@ -1964,7 +2023,12 @@ class MiniMaxH3AdalnCache(nn.Module):
             :, cache_plan_index, :num_timesteps
         ]
         params = params.reshape(self.num_layers, -1, 6, self.hidden_size)
-        return tuple(tuple(layer.unbind(dim=1)) for layer in params)
+        # One transpose-copy makes every per-param [groups, hidden] row
+        # contiguous, which the C++ modulation kernels require; without it
+        # each unbound view keeps the interleaved (6*hidden, 1) stride and
+        # every fused site would fall back or re-copy per block.
+        params = params.transpose(1, 2).contiguous()
+        return tuple(tuple(layer.unbind(dim=0)) for layer in params)
 
     def final(
         self,
@@ -2174,26 +2238,28 @@ class MiniMaxH3DiTBlock(nn.Module):
         ring_active: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Fused-adaLN ``forward``: norm + indexed scale/shift run as one
-        kernel over merged ``w_eff`` rows, absorbing the preceding indexed
-        gated-residual add where one exists (see the fused block loop in
+        kernel per site, absorbing the preceding indexed gated-residual add
+        where one exists (see the fused block loop in
         ``MiniMaxH3DiTModel.forward``).
 
         ``fused_adaln`` is ``(w_msa, shift_msa, gate_msa, w_mlp, shift_mlp,
-        gate_mlp)`` with ``w_* = norm_weight * (1 + scale_*)`` in fp32.
-        ``pending_gate`` carries the previous block's ``(gate, update)`` whose
-        gated-residual add lands in this block's first fused norm; the return
-        value ``(residual, (gate_mlp, update))`` defers this block's trailing
-        gate to the caller the same way.
+        gate_mlp)``, where ``w_*`` is either a bitexact ``(gamma, scale_*)``
+        pair or a merged ``norm_weight * (1 + scale_*)`` fp32 tensor (see
+        ``_fused_adaln_block_params``). ``pending_gate`` carries the previous
+        block's ``(gate, update)`` whose gated-residual add lands in this
+        block's first fused norm; the return value ``(residual, (gate_mlp,
+        update))`` defers this block's trailing gate to the caller the same
+        way.
         """
         w_msa, shift_msa, gate_msa, w_mlp, shift_mlp, gate_mlp = fused_adaln
         if pending_gate is None:
             residual = x
-            h = rmsnorm_indexed_scale_shift(
+            h = _fused_norm_modulate(
                 x, w_msa, shift_msa, combined_indices, eps=self.norm1.eps
             )
         else:
             prev_gate, prev_update = pending_gate
-            h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+            h, residual = _fused_gate_norm_modulate_(
                 x,
                 prev_update,
                 prev_gate,
@@ -2212,7 +2278,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+        h, residual = _fused_gate_norm_modulate_(
             residual,
             h,
             gate_msa,
@@ -2525,16 +2591,21 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self,
         block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None,
         hidden: torch.Tensor,
+        indices: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
-        """Per-step merged AdaLN parameters for the fused block loop.
+        """Per-step AdaLN parameters for the fused block loop.
 
-        Folds each block's RMSNorm weight into the step's ``(1 + scale)``
-        modulation rows once per forward -- ``w_* = gamma * (1 + scale_*)`` in
-        fp32, ~50 us over the 50-block slab -- so every norm + scale/shift
-        (+ preceding gate) site runs as a single indexed kernel. Returns None
+        Default (``MINIMAX_H3_FUSED_ADALN_BITEXACT``): per-site bitexact
+        ``(gamma, scale)`` pairs, unmerged -- the aten-order kernel reproduces
+        every eager rounding boundary, which forbids the ``w_eff`` premerge
+        (the gamma multiply must round to bf16 inside the norm). Opting out
+        folds each block's RMSNorm weight into the step's ``(1 + scale)``
+        rows -- ``w_* = gamma * (1 + scale_*)`` in fp32, ~50 us over the
+        50-block slab -- for the faster near-lossless kernels. Returns None
         whenever the fused chain cannot engage (flag off, fp32 curve-AdaLN
-        island, Cache-DiT / offload wrappers, non-CUDA input, compile), which
-        keeps the eager loop fully authoritative.
+        island, Cache-DiT / offload wrappers, non-CUDA input, compile,
+        missing bitexact backend), which keeps the eager loop fully
+        authoritative.
         """
         if (
             block_adaln_params is None
@@ -2554,6 +2625,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             or any(param.dtype is not _BF16_DTYPE for param in block_adaln_params[0])
         ):
             return None
+        if envs.MINIMAX_H3_FUSED_ADALN_BITEXACT:
+            return self._log_fused_adaln_engaged(
+                self._bitexact_adaln_block_params(block_adaln_params, hidden, indices),
+                mode="bitexact",
+            )
         gammas = self._stacked_norm_weights()
         if gammas is None:
             return None
@@ -2562,9 +2638,61 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         scale_mlp = torch.stack([params[4] for params in block_adaln_params])
         w_msa = (scale_msa.to(_FP32_DTYPE) + 1.0).mul_(gamma1.unsqueeze(1))
         w_mlp = (scale_mlp.to(_FP32_DTYPE) + 1.0).mul_(gamma2.unsqueeze(1))
+        return self._log_fused_adaln_engaged(
+            tuple(
+                (w_msa[index], params[0], params[2], w_mlp[index], params[3], params[5])
+                for index, params in enumerate(block_adaln_params)
+            ),
+            mode="merged w_eff",
+        )
+
+    def _log_fused_adaln_engaged(
+        self,
+        fused: tuple[tuple[torch.Tensor, ...], ...] | None,
+        *,
+        mode: str,
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        """One-shot serving-visibility marker: without it a silent gate
+        failure (fused loop falling back to eager) is indistinguishable from
+        the fused chain running."""
+        if fused is not None and not self._fused_adaln_mode_logged:
+            self._fused_adaln_mode_logged = True
+            logger.info("MiniMax H3 fused adaLN chain engaged (%s)", mode)
+        return fused
+
+    def _bitexact_adaln_block_params(
+        self,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...],
+        hidden: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        """Bitexact fused params: ``((gamma, scale), shift, gate, ...)`` per
+        block, gated on the C++ aten-order backend accepting the serving
+        shape (probed once on the first block's rows)."""
+        if any(
+            norm.weight.dtype is not _BF16_DTYPE or isinstance(norm.weight, DTensor)
+            for block in self.blocks
+            for norm in (block.norm1, block.norm2)
+        ):
+            return None
+        rows = tuple(
+            tuple(row.contiguous() for row in params) for params in block_adaln_params
+        )
+        first = rows[0]
+        if not can_use_rmsnorm_indexed_scale_shift_bitexact_cuda(
+            hidden, self.blocks[0].norm1.weight, first[1], first[0], indices
+        ):
+            return None
         return tuple(
-            (w_msa[index], params[0], params[2], w_mlp[index], params[3], params[5])
-            for index, params in enumerate(block_adaln_params)
+            (
+                (block.norm1.weight, params[1]),
+                params[0],
+                params[2],
+                (block.norm2.weight, params[4]),
+                params[3],
+                params[5],
+            )
+            for block, params in zip(self.blocks, rows)
         )
 
     def _validate_tp_config(
@@ -2782,6 +2910,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self._fused_adaln_gamma_key: tuple[int, ...] | None = None
         self._fused_adaln_gamma1: torch.Tensor | None = None
         self._fused_adaln_gamma2: torch.Tensor | None = None
+        self._fused_adaln_mode_logged = False
         # Component overrides disappear when the loader context exits. Preserve
         # only that selection; process-wide overrides are resolved at first use.
         self._component_attention_backend_override = (
@@ -3403,7 +3532,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # (Ulysses) and/or ring-rotates KV across ring ranks; everything
         # else, including the final layer, is row-local. Only the narrow
         # video/audio logits are gathered after the final layer.
-        fused_block_adaln = self._fused_adaln_block_params(block_adaln_params, hidden)
+        fused_block_adaln = self._fused_adaln_block_params(
+            block_adaln_params, hidden, block_combined
+        )
         if fused_block_adaln is not None:
             # Each block defers its trailing gated-residual add into the next
             # block's fused norm (Plan B); block 0's first norm has no

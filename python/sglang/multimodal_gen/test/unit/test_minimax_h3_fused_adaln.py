@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused adaLN chain (A1) for the MiniMax-H3 DiT.
 
-Kernel level: the fused RMSNorm + indexed scale/shift (Plan A) and the
-gate+residual+RMSNorm+scale/shift three-way fusion (Plan B) must stay
-near-lossless against the eager chain (nn.RMSNorm -> indexed_scale_shift_bf16_,
-with indexed_gate_bf16_ in front for Plan B) at production shapes, and the
-Plan B residual write-back must stay bit-exact with indexed_gate_bf16_.
+Kernel level: the bitexact (aten-order) fused RMSNorm + indexed scale/shift
+(Plan A) and gate+residual+RMSNorm+scale/shift (Plan B) kernels must be
+bitwise equal to the eager chain (nn.RMSNorm -> indexed_scale_shift_bf16_,
+with indexed_gate_bf16_ in front for Plan B) at production shapes and on
+adversarial values. The opt-out merged-w_eff kernels must stay near-lossless
+against the same chain, and every Plan B residual write-back must stay
+bit-exact with indexed_gate_bf16_.
 
-Module level: a fused block chain (forward_fused + deferred trailing gate)
-must match the eager block forward within the same tolerance, and with
+Module level: the default (bitexact) fused block chain (forward_fused +
+deferred trailing gate) must be bitwise equal to the eager block forward, the
+opt-out near-lossless chain must match within tolerance, and with
 MINIMAX_H3_FUSED_ADALN=0 the model must not build fused parameters at all,
 leaving the untouched eager path authoritative.
 """
@@ -18,10 +21,13 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    can_use_rmsnorm_indexed_scale_shift_bitexact_cuda,
     gate_residual_rmsnorm_indexed_scale_shift_,
+    gate_residual_rmsnorm_indexed_scale_shift_bitexact_,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
     rmsnorm_indexed_scale_shift,
+    rmsnorm_indexed_scale_shift_bitexact,
 )
 
 # Backend-specific imports: the C++-vs-Triton contract tests below exercise
@@ -208,6 +214,125 @@ def test_plan_b_matches_eager_chain(rows: int, groups: int):
     _assert_fused_at_least_as_accurate(fused_out, eager_out, reference, label=label)
 
 
+def _skip_unless_bitexact_backend(x, weight, scale, shift, indices) -> None:
+    if not can_use_rmsnorm_indexed_scale_shift_bitexact_cuda(
+        x, weight, scale, shift, indices
+    ):
+        pytest.skip("bitexact JIT C++ backend unavailable (needs SM90+ CUDA)")
+
+
+def _eager_plan_a(x, norm, scale, shift, indices):
+    with torch.no_grad():
+        return indexed_scale_shift_bf16_(norm(x), shift, scale, indices)
+
+
+def _adversarial_case(groups: int):
+    """Rows and modulation built from reduction-order-hostile values: zero
+    rows (rms == sqrt(eps)), fp32-overflowing squares, bf16 subnormals, and
+    alternating huge/tiny magnitudes that make the summation order visible."""
+    rows = 2048
+    generator = torch.Generator(device="cuda").manual_seed(99)
+    x = (torch.randn(rows, _HIDDEN, generator=generator, device="cuda") * 4.0).to(
+        torch.bfloat16
+    )
+    x[0].zero_()
+    x[1].fill_(3.0e38)  # sum of squares overflows fp32 -> rstd 0 on both paths
+    x[2].fill_(1.0e-40)  # bf16 subnormal
+    x[3, ::2] = 1.0e18
+    x[3, 1::2] = 1.0e-18
+    x[4, :7] = 6.0e17  # partial-row extremes across thread boundaries
+    weight = (1.0 + 2.0 * torch.randn(_HIDDEN, generator=generator, device="cuda")).to(
+        torch.bfloat16
+    )
+    weight[::17] = 0.0
+    scale = (torch.randn(groups, _HIDDEN, generator=generator, device="cuda") * 8.0).to(
+        torch.bfloat16
+    )
+    scale[0, ::5] = -1.0  # (1 + scale) rounds to exact zero
+    shift = (
+        torch.randn(groups, _HIDDEN, generator=generator, device="cuda") * 1.0e4
+    ).to(torch.bfloat16)
+    gate = (torch.randn(groups, _HIDDEN, generator=generator, device="cuda") * 16.0).to(
+        torch.bfloat16
+    )
+    update = (torch.randn(rows, _HIDDEN, generator=generator, device="cuda") * 4.0).to(
+        torch.bfloat16
+    )
+    update[5].fill_(2.0e19)
+    indices = _packed_indices(rows, groups, 99)
+    return x, weight, scale, shift, gate, update, indices
+
+
+@requires_cuda
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize(("rows", "groups"), [(20992, 12), (20992, 6), (4096, 2)])
+def test_plan_a_bitexact_torch_equal(rows: int, groups: int, index_dtype: torch.dtype):
+    x, weight, scale, shift, _, _, indices, _ = _random_case(rows, groups, 31)
+    indices = indices.to(index_dtype)
+    _skip_unless_bitexact_backend(x, weight, scale, shift, indices)
+    eager = _eager_plan_a(x, _eager_norm(weight), scale, shift, indices)
+    fused = rmsnorm_indexed_scale_shift_bitexact(
+        x, weight, scale, shift, indices, eps=_EPS
+    )
+    assert fused.dtype is torch.bfloat16 and fused.shape == x.shape
+    assert torch.equal(fused, eager), "Plan A bitexact must equal the eager chain"
+
+
+@requires_cuda
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize(("rows", "groups"), [(20992, 12), (20992, 6), (4096, 2)])
+def test_plan_b_bitexact_torch_equal(rows: int, groups: int, index_dtype: torch.dtype):
+    x, weight, scale, shift, gate, update, indices, _ = _random_case(rows, groups, 32)
+    indices = indices.to(index_dtype)
+    _skip_unless_bitexact_backend(x, weight, scale, shift, indices)
+    eager_res = indexed_gate_bf16_(x.clone(), gate, update, indices)
+    eager_out = _eager_plan_a(eager_res, _eager_norm(weight), scale, shift, indices)
+
+    fused_res = x.clone()
+    fused_out, returned = gate_residual_rmsnorm_indexed_scale_shift_bitexact_(
+        fused_res, update, gate, weight, scale, shift, indices, eps=_EPS
+    )
+    assert returned.data_ptr() == fused_res.data_ptr(), "residual is in-place"
+    assert torch.equal(fused_res, eager_res), "Plan B residual must be bitwise"
+    assert torch.equal(fused_out, eager_out), "Plan B bitexact must equal eager"
+
+
+@requires_cuda
+def test_bitexact_adversarial_values():
+    groups = 5
+    x, weight, scale, shift, gate, update, indices = _adversarial_case(groups)
+    _skip_unless_bitexact_backend(x, weight, scale, shift, indices)
+    norm = _eager_norm(weight)
+
+    eager_a = _eager_plan_a(x, norm, scale, shift, indices)
+    fused_a = rmsnorm_indexed_scale_shift_bitexact(
+        x, weight, scale, shift, indices, eps=_EPS
+    )
+    assert torch.equal(fused_a, eager_a), "Plan A bitexact on adversarial values"
+
+    eager_res = indexed_gate_bf16_(x.clone(), gate, update, indices)
+    eager_b = _eager_plan_a(eager_res, norm, scale, shift, indices)
+    fused_res = x.clone()
+    fused_b, _ = gate_residual_rmsnorm_indexed_scale_shift_bitexact_(
+        fused_res, update, gate, weight, scale, shift, indices, eps=_EPS
+    )
+    assert torch.equal(fused_res, eager_res), "Plan B residual on adversarial values"
+    assert torch.equal(fused_b, eager_b), "Plan B bitexact on adversarial values"
+
+
+@requires_cuda
+def test_bitexact_deterministic_across_runs():
+    x, weight, scale, shift, _, _, indices, _ = _random_case(4096, 6, 33)
+    _skip_unless_bitexact_backend(x, weight, scale, shift, indices)
+    first = rmsnorm_indexed_scale_shift_bitexact(
+        x, weight, scale, shift, indices, eps=_EPS
+    )
+    second = rmsnorm_indexed_scale_shift_bitexact(
+        x, weight, scale, shift, indices, eps=_EPS
+    )
+    assert torch.equal(first, second)
+
+
 @requires_cuda
 def test_fused_kernels_handle_zero_rows():
     _, _, scale, shift, gate, _, _, w_eff = _random_case(4, 2, 2)
@@ -279,6 +404,7 @@ def _model_shell(blocks) -> MiniMaxH3DiTModel:
     model._fused_adaln_gamma_key = None
     model._fused_adaln_gamma1 = None
     model._fused_adaln_gamma2 = None
+    model._fused_adaln_mode_logged = False
     return model
 
 
@@ -310,19 +436,9 @@ def _block_chain_fp64(
     return hidden
 
 
-@requires_cuda
-def test_fused_block_chain_matches_eager_forward(monkeypatch):
-    monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN", "1")
-    rows, groups, num_blocks = 4096, 12, 3
-    blocks = [_stub_block(seed) for seed in range(num_blocks)]
-    params = _block_adaln_params(num_blocks, groups, 42)
-    model = _model_shell(blocks)
-    indices = _packed_indices(rows, groups, 3)
-    generator = torch.Generator(device="cuda").manual_seed(7)
-    x = torch.randn(rows, _HIDDEN, generator=generator, device="cuda").to(
-        torch.bfloat16
-    )
-
+def _run_block_chains(blocks, params, indices, x, model, rows):
+    """Run the eager block chain and the fused chain (with its deferred
+    trailing gate) on clones of ``x``; returns ``(eager, fused)``."""
     eager = x.clone()
     for block, block_params in zip(blocks, params):
         eager = block(
@@ -333,7 +449,7 @@ def test_fused_block_chain_matches_eager_forward(monkeypatch):
             **_block_kwargs(rows),
         )
 
-    fused_params = model._fused_adaln_block_params(params, x)
+    fused_params = model._fused_adaln_block_params(params, x, indices)
     assert fused_params is not None
     fused = x.clone()
     pending = None
@@ -347,6 +463,46 @@ def test_fused_block_chain_matches_eager_forward(monkeypatch):
         )
     last_gate, last_update = pending
     fused = _modulate_gate(fused, last_gate, last_update, indices, dtype=torch.bfloat16)
+    return eager, fused
+
+
+@requires_cuda
+def test_fused_block_chain_bitexact_matches_eager_bitwise(monkeypatch):
+    """Default mode: the whole fused block loop is bitwise vs eager forward."""
+    monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN", "1")
+    monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN_BITEXACT", "1")
+    rows, groups, num_blocks = 4096, 12, 3
+    blocks = [_stub_block(seed) for seed in range(num_blocks)]
+    params = _block_adaln_params(num_blocks, groups, 42)
+    model = _model_shell(blocks)
+    indices = _packed_indices(rows, groups, 3)
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    x = torch.randn(rows, _HIDDEN, generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    _skip_unless_bitexact_backend(
+        x, blocks[0].norm1.weight, params[0][1], params[0][0], indices
+    )
+    eager, fused = _run_block_chains(blocks, params, indices, x, model, rows)
+    assert torch.equal(fused, eager), "bitexact fused chain must be bitwise vs eager"
+
+
+@requires_cuda
+def test_fused_block_chain_matches_eager_forward(monkeypatch):
+    monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN", "1")
+    # Opt-out mode: the merged-w_eff kernels are near-lossless, not bitwise.
+    monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN_BITEXACT", "0")
+    rows, groups, num_blocks = 4096, 12, 3
+    blocks = [_stub_block(seed) for seed in range(num_blocks)]
+    params = _block_adaln_params(num_blocks, groups, 42)
+    model = _model_shell(blocks)
+    indices = _packed_indices(rows, groups, 3)
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    x = torch.randn(rows, _HIDDEN, generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+
+    eager, fused = _run_block_chains(blocks, params, indices, x, model, rows)
 
     label = f"block_chain[{num_blocks}]"
     reference = _block_chain_fp64(x, blocks, params, indices)
@@ -374,12 +530,14 @@ def test_fused_adaln_param_merge_and_gating(monkeypatch):
     params = _block_adaln_params(2, groups, 5)
     model = _model_shell(blocks)
     hidden = torch.zeros(rows, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+    indices = _packed_indices(rows, groups, 4)
 
     monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN", "0")
-    assert model._fused_adaln_block_params(params, hidden) is None
+    assert model._fused_adaln_block_params(params, hidden, indices) is None
 
     monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN", "1")
-    fused = model._fused_adaln_block_params(params, hidden)
+    monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN_BITEXACT", "0")
+    fused = model._fused_adaln_block_params(params, hidden, indices)
     assert fused is not None and len(fused) == 2
     for index, (block, block_params) in enumerate(zip(blocks, params)):
         w_msa, shift_msa, gate_msa, w_mlp, shift_mlp, gate_mlp = fused[index]
@@ -395,22 +553,39 @@ def test_fused_adaln_param_merge_and_gating(monkeypatch):
 
     # gamma stack cache is reused while weights are unchanged, rebuilt on edit
     key = model._fused_adaln_gamma_key
-    model._fused_adaln_block_params(params, hidden)
+    model._fused_adaln_block_params(params, hidden, indices)
     assert model._fused_adaln_gamma_key == key
     with torch.no_grad():
         blocks[0].norm1.weight.mul_(2.0)
-    model._fused_adaln_block_params(params, hidden)
+    model._fused_adaln_block_params(params, hidden, indices)
     assert model._fused_adaln_gamma_key != key
+
+    # default bitexact mode: (gamma, scale) pairs, no premerge, raw rows
+    monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN_BITEXACT", "1")
+    if can_use_rmsnorm_indexed_scale_shift_bitexact_cuda(
+        hidden, blocks[0].norm1.weight, params[0][1], params[0][0], indices
+    ):
+        fused = model._fused_adaln_block_params(params, hidden, indices)
+        assert fused is not None and len(fused) == 2
+        for index, (block, block_params) in enumerate(zip(blocks, params)):
+            w_msa, shift_msa, gate_msa, w_mlp, shift_mlp, gate_mlp = fused[index]
+            assert isinstance(w_msa, tuple) and isinstance(w_mlp, tuple)
+            assert w_msa[0] is block.norm1.weight and w_msa[1] is block_params[1]
+            assert w_mlp[0] is block.norm2.weight and w_mlp[1] is block_params[4]
+            assert shift_msa is block_params[0] and gate_msa is block_params[2]
+            assert shift_mlp is block_params[3] and gate_mlp is block_params[5]
 
     # the fused loop must not engage on non-bf16 params, non-contiguous or
     # non-CUDA hidden states, or blocks held by Cache-DiT
-    fp32_params = tuple(tuple(p.float() for p in block) for block in params)
-    assert model._fused_adaln_block_params(fp32_params, hidden) is None
-    assert model._fused_adaln_block_params(params, hidden.t()) is None
-    assert model._fused_adaln_block_params(params, hidden.cpu()) is None
-    blocks[0].preserve_input_for_cache_dit = True
-    assert model._fused_adaln_block_params(params, hidden) is None
-    blocks[0].preserve_input_for_cache_dit = False
+    for bitexact in ("0", "1"):
+        monkeypatch.setenv("MINIMAX_H3_FUSED_ADALN_BITEXACT", bitexact)
+        fp32_params = tuple(tuple(p.float() for p in block) for block in params)
+        assert model._fused_adaln_block_params(fp32_params, hidden, indices) is None
+        assert model._fused_adaln_block_params(params, hidden.t(), indices) is None
+        assert model._fused_adaln_block_params(params, hidden.cpu(), indices) is None
+        blocks[0].preserve_input_for_cache_dit = True
+        assert model._fused_adaln_block_params(params, hidden, indices) is None
+        blocks[0].preserve_input_for_cache_dit = False
 
 
 # ---------------------------------------------------------------------------

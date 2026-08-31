@@ -78,11 +78,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
-    # Default off: the fused norm output is ~4 bf16 ulp from eager and the
-    # denoise trajectory diverges over 8 NFE (e2e gate SSIM 0.89 vs 0.99 with
-    # it off, for a 0.14 s/request saving). Re-enable once an eager-order
-    # bitwise variant lands (same replication approach as V1/R3).
-    MINIMAX_H3_FUSED_ADALN: bool = False
+    MINIMAX_H3_FUSED_ADALN: bool = True
+    MINIMAX_H3_FUSED_ADALN_BITEXACT: bool = True
     MINIMAX_H3_QKV_NATIVE_ORDER: bool = True
     MINIMAX_H3_ATTN_OUT_DIRECT_STAGING: bool = True
     MINIMAX_H3_FUSED_SILU_QUANT: bool = True
@@ -363,10 +360,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
     ),
-    # Kill-switch for the MiniMax-H3 fused adaLN chain (merged-w_eff RMSNorm +
-    # indexed scale/shift, and the gated-residual Plan B variant). Set 0 to
-    # fall back to the eager norm/modulate/gate kernels.
-    "MINIMAX_H3_FUSED_ADALN": _lazy_bool("MINIMAX_H3_FUSED_ADALN", "false"),
+    # Kill-switch for the MiniMax-H3 fused adaLN chain (RMSNorm + indexed
+    # scale/shift, and the gated-residual Plan B variant). Set 0 to fall back
+    # to the eager norm/modulate/gate kernels. Default on: with the bitexact
+    # flag below at its default the chain is bitwise vs eager (frame-md5
+    # verified on the t2va e2e).
+    "MINIMAX_H3_FUSED_ADALN": _lazy_bool("MINIMAX_H3_FUSED_ADALN", "true"),
+    # Fused-adaLN numeric contract. Default (1): the aten-order bitexact
+    # kernels, bitwise vs the eager chain, so the flag above is output
+    # neutral. 0 opts into the faster merged-w_eff kernels whose norm output
+    # is ~4 bf16 ulp from eager -- enough to diverge the denoise trajectory
+    # over 8 NFE (e2e gate SSIM 0.89 vs 0.99).
+    "MINIMAX_H3_FUSED_ADALN_BITEXACT": _lazy_bool(
+        "MINIMAX_H3_FUSED_ADALN_BITEXACT", "true"
+    ),
     # Keep the MiniMax-H3 checkpoint's per-head [q|k|v] qkv row interleave
     # resident and write the Ulysses A2A send buffer directly from one qkv
     # GEMM per destination rank (the destination-major pack kernel becomes a
