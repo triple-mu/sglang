@@ -177,6 +177,79 @@ def test_local_text_layout_is_a_contiguous_prefix_per_ulysses_rank():
                 assert expected.tolist() == list(range(start, stop))
 
 
+def test_local_layout_target_rows_match_update_masks():
+    """Target-row subsets drive the per-step embed rewrite; condition and
+    reference rows must never be in them."""
+    for mode in ("t2va", "fl2va", "ref2va"):
+        branch = _branch(mode)
+        text_len = int(branch.static_kwargs["prompt_embeds"].shape[0])
+        branch_layout = branch.static_kwargs["local_embedding_layout"]
+        for world_size in (1, 2, 4):
+            for rank in range(world_size):
+                layout = _build_local_embedding_layout(
+                    seq_len=branch.seq_len,
+                    text_pos=torch.arange(text_len),
+                    img_pos=branch.img_pos,
+                    audio_pos=branch.audio_pos,
+                    world_size=world_size,
+                    rank=rank,
+                    device=torch.device("cpu"),
+                    img_update_mask=branch.update_mask,
+                    audio_update_mask=branch.audio_update_mask,
+                )
+                row_start = rank * (branch.seq_len // world_size)
+                row_stop = row_start + branch.seq_len // world_size
+                img_in_shard = (branch.img_pos >= row_start) & (
+                    branch.img_pos < row_stop
+                )
+                expected_img = branch.img_pos[img_in_shard & branch.update_mask]
+                assert torch.equal(layout["img_target_global_ids"], expected_img)
+                assert torch.equal(
+                    layout["img_target_row_ids"], expected_img - row_start
+                )
+                audio_in_shard = (branch.audio_pos >= row_start) & (
+                    branch.audio_pos < row_stop
+                )
+                expected_audio = branch.audio_pos[
+                    audio_in_shard & branch.audio_update_mask
+                ]
+                assert torch.equal(layout["audio_target_global_ids"], expected_audio)
+                assert torch.equal(
+                    layout["audio_target_row_ids"], expected_audio - row_start
+                )
+                assert torch.equal(
+                    layout["img_global_ids"], branch.img_pos[img_in_shard]
+                )
+
+
+def test_local_text_layout_is_a_contiguous_prefix_per_ulysses_rank():
+    for mode in ("t2va", "fl2va", "ref2va"):
+        branch = _branch(mode)
+        text_len = int(branch.static_kwargs["prompt_embeds"].shape[0])
+        for world_size in (1, 2, 4, 8):
+            for rank in range(world_size):
+                layout = _build_local_embedding_layout(
+                    seq_len=branch.seq_len,
+                    text_pos=torch.arange(text_len),
+                    img_pos=branch.img_pos,
+                    audio_pos=branch.audio_pos,
+                    world_size=world_size,
+                    rank=rank,
+                    device=torch.device("cpu"),
+                )
+                start = int(layout["text_source_start"])
+                stop = int(layout["text_source_stop"])
+                row_start = rank * (branch.seq_len // world_size)
+                expected = torch.nonzero(
+                    (torch.arange(text_len) >= row_start)
+                    & (
+                        torch.arange(text_len)
+                        < row_start + branch.seq_len // world_size
+                    )
+                ).view(-1)
+                assert expected.tolist() == list(range(start, stop))
+
+
 def test_rank_local_token_tags_match_reference_slice():
     for mode in ("t2va", "fl2va", "ref2va"):
         seq_len = _branch(mode).seq_len

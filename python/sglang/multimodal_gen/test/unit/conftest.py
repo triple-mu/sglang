@@ -42,6 +42,7 @@ def _make_unit_server_args():
         enable_layerwise_nvtx_marker=False,
         enable_torch_compile=False,
         kv_gather_degree=1,
+        lora_path=None,
         sp_split_auto=False,
         model_loaded={},
         model_paths={},

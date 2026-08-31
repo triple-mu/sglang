@@ -127,6 +127,47 @@ def test_minimax_h3_adaln_cache_matches_bf16_embedding(tmp_path):
     assert torch.equal(torch.cat(final, dim=-1), final_params[1])
 
 
+def test_block_all_matches_per_block_gathers(tmp_path):
+    """One batched slab gather must reproduce every per-block gather exactly."""
+    cache_path = tmp_path / "adaln.safetensors"
+    plans, width = 3, 2
+    plan_timesteps = torch.tensor([[0.5, 0.0], [1.0, 2.0], [3.0, 4.0]])
+    plan_lengths = torch.tensor([1, 2, 2], dtype=torch.int64)
+    block_params = (
+        torch.arange(
+            plans * width * _ARCH.num_layers * _BLOCK_WIDTH, dtype=torch.float32
+        )
+        .reshape(plans, width, _ARCH.num_layers, _BLOCK_WIDTH)
+        .bfloat16()
+    )
+    final_params = torch.zeros(plans, width, _FINAL_WIDTH, dtype=torch.bfloat16)
+    save_file(
+        {
+            "plan_timesteps": plan_timesteps,
+            "plan_lengths": plan_lengths,
+            "block_params": block_params,
+            "final_params": final_params,
+        },
+        cache_path,
+        metadata={"format_version": "2"},
+    )
+    cache = MiniMaxH3AdalnCache(_ARCH, path=str(cache_path))
+    cache.load(torch.device("cpu"))
+
+    for plan in (plan_timesteps[0, :1], plan_timesteps[1], plan_timesteps[2]):
+        cache_plan_index = cache.lookup(plan)
+        num_timesteps = plan.shape[0]
+        batched = cache.block_all(cache_plan_index, num_timesteps)
+        assert len(batched) == _ARCH.num_layers
+        for layer in range(_ARCH.num_layers):
+            reference = cache.block(layer, cache_plan_index, num_timesteps)
+            assert len(batched[layer]) == len(reference) == 6
+            for got, want in zip(batched[layer], reference, strict=True):
+                assert got.shape == want.shape
+                assert got.dtype == want.dtype
+                assert torch.equal(got, want)
+
+
 def test_online_cache_reset_rebuilds_previously_resident_request_plans(tmp_path):
     """A capacity reset must not drop plans reused by the current request."""
     cache = _online_cache(tmp_path, max_plan_width=1)
