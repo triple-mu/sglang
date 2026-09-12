@@ -93,6 +93,22 @@ def maybe_nvtx_range(name: str, enabled: bool = True) -> Iterator[None]:
         nvtx.range_pop()
 
 
+def hot_path_nvtx_enabled() -> bool:
+    """Whether model code should emit its explicit NVTX ranges.
+
+    Model and denoise-loop code sits below the stage layer that owns the
+    ``ServerArgs`` handle, so it reads the switch off the process-global args
+    instead. Returns ``False`` when the global is unset -- a module constructed
+    directly by a unit test stays silent rather than failing.
+    """
+    # Imported lazily: ``server_args`` pulls in the platform, quantization, and
+    # memory-manager packages, several of which import this module.
+    from sglang.multimodal_gen.runtime.server_args import maybe_get_global_server_args
+
+    server_args = maybe_get_global_server_args()
+    return server_args is not None and server_args.enable_nvtx_marker
+
+
 class DiffusionNvtxHooks:
     """Register NVTX markers around each submodule forward pass.
 

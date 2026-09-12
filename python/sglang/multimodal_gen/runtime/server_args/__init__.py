@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.server_args.server_args import (
     _normalize_ltx2_two_stage_device_mode,
     get_global_server_args,
     is_ltx2_two_stage_pipeline_name,
+    maybe_get_global_server_args,
     prepare_server_args,
     set_global_server_args,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "_normalize_ltx2_two_stage_device_mode",
     "get_global_server_args",
     "is_ltx2_two_stage_pipeline_name",
+    "maybe_get_global_server_args",
     "prepare_server_args",
     "set_global_server_args",
 ]

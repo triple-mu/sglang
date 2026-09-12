@@ -768,17 +768,19 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 video_query_indices=video_query_indices,
                 device=device,
             )
-            _precompute_refined_prompt_embeds(
-                model,
-                positive,
-                device=device,
-                shared_conditioning=emb,
-            )
-            _precompute_rope_cache(
-                model,
-                positive,
-                device=device,
-            )
+            with maybe_nvtx_range("h3_precompute_prompt_embeds", self.current_use_nvtx):
+                _precompute_refined_prompt_embeds(
+                    model,
+                    positive,
+                    device=device,
+                    shared_conditioning=emb,
+                )
+            with maybe_nvtx_range("h3_precompute_rope_cache", self.current_use_nvtx):
+                _precompute_rope_cache(
+                    model,
+                    positive,
+                    device=device,
+                )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
