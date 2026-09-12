@@ -8,7 +8,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 class NamedNoOpStage(PipelineStage):
     def __init__(self):
         self.server_args = SimpleNamespace(
-            comfyui_mode=True, enable_layerwise_nvtx_marker=False
+            comfyui_mode=True,
+            enable_layerwise_nvtx_marker=False,
+            enable_nvtx_marker=False,
         )
 
     def forward(self, batch: Req, server_args) -> Req:

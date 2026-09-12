@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 def _server_args(*, supports_auto_residency=True):
     return SimpleNamespace(
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
         pipeline_config=SimpleNamespace(
             supports_auto_residency=supports_auto_residency,
         ),
@@ -229,7 +230,7 @@ def test_request_tail_uses_dynamic_component_instance():
     )
     manager = ComponentResidencyManager(
         pipeline,
-        SimpleNamespace(enable_layerwise_nvtx_marker=False),
+        SimpleNamespace(enable_layerwise_nvtx_marker=False, enable_nvtx_marker=False),
     )
     strategy = Mock()
     strategy.prefetch_for_use.return_value = False
@@ -248,6 +249,7 @@ def test_request_tail_uses_dynamic_component_instance():
 def test_strategy_cache_replaces_stale_component_instance():
     server_args = SimpleNamespace(
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
         residency_mode=lambda _component_name: "resident",
     )
     pipeline = SimpleNamespace(
@@ -276,7 +278,7 @@ def test_forget_module_clears_active_manager_references():
     )
     manager = ComponentResidencyManager(
         pipeline,
-        SimpleNamespace(enable_layerwise_nvtx_marker=False),
+        SimpleNamespace(enable_layerwise_nvtx_marker=False, enable_nvtx_marker=False),
     )
     module = torch.nn.Linear(2, 2)
     use = ComponentUse("stage", "transformer")
@@ -572,7 +574,9 @@ def _manager_for_stage(stage, modules):
         _stage_name_mapping={"stage": stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, enable_nvtx_marker=False
+    )
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.refresh_pipeline(pipeline)
     manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
@@ -770,7 +774,9 @@ def test_adjacent_stages_reuse_the_same_component_interval():
         _stage_name_mapping={"first": first_stage, "second": second_stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, enable_nvtx_marker=False
+    )
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.refresh_pipeline(pipeline)
     manager.begin_request(
@@ -802,7 +808,9 @@ def test_adjacent_same_component_replacement_finishes_old_instance():
         _stage_name_mapping={"first": first_stage, "second": second_stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, enable_nvtx_marker=False
+    )
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.refresh_pipeline(pipeline)
     manager.begin_request(

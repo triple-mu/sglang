@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, List, Union
 
@@ -89,6 +89,10 @@ from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_a
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
+)
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    maybe_nvtx_range,
+    request_nvtx_marker,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
@@ -246,6 +250,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # default workload resolved once for the per-request residency hint
         self._cached_default_workload: DefaultWorkload | None = None
         self._cached_default_workload_failed = False
+        self._nvtx_request_ordinal = 0
 
     def _default_workload_for_hint(self) -> DefaultWorkload | None:
         if (
@@ -686,6 +691,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
+                stack.enter_context(self._request_nvtx_range(req, log_reqs))
                 try:
                     result = forward_fn()
                 except Exception:
@@ -794,6 +800,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
                 )
         return output_batch
+
+    def _request_nvtx_range(self, req: Req, log_reqs: list[Req]):
+        """One NVTX range per non-warmup forward, named request#<n> by this
+        worker's request count so an nsys NVTX capture range can pick the
+        steady-state request; warmups neither emit nor count."""
+        if req.is_warmup or not self.server_args.enable_nvtx_marker:
+            return nullcontext()
+        self._nvtx_request_ordinal += 1
+        marker = request_nvtx_marker(self._nvtx_request_ordinal)
+        if self.is_output_rank:
+            logger.info(
+                "NVTX %s covers request(s) %s",
+                marker,
+                ", ".join(str(item.request_id) for item in log_reqs),
+            )
+        return maybe_nvtx_range(marker)
 
     def _record_server_warmup_memory(
         self,

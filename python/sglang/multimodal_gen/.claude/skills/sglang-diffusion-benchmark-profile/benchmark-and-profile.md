@@ -819,6 +819,74 @@ This skill intentionally stops here. It tells you whether you are looking at:
 - a configuration or backend problem
 - or a real kernel opportunity worth handing off
 
+## Nsight Systems: steady-state end-to-end capture in serving mode
+
+`nsys profile` around `sglang generate` records model load and warmup too, and
+a per-process NVTX capture range starts at a different moment on every rank,
+which on multi-GPU runs has dropped the GPU rows of some ranks. Serve instead,
+warm up with real requests, and let `nsys start` / `nsys stop` bracket one
+steady-state request for the whole process tree. The same script covers the
+three MiniMax-H3 workloads; only the config differs:
+
+```bash
+SCRIPT=python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/nsys_serving_capture.py
+for task in t2va fl2va ref2va; do
+  python "$SCRIPT" --request-json /workspace/benchmark_inputs/$task/input.json \
+    --output /workspace/nsys/h3_$task --warmup-requests 1 --capture-requests 1 \
+    -- --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --tp-size 1 --ulysses-degree 4 \
+       --warmup-mode off --enable-nvtx-marker true
+done
+```
+
+The script runs `sglang serve` under `nsys launch` (profiler injected,
+collection idle), waits for `/health`, sends the warmup requests through
+`/v1/videos`, then runs `nsys start`, the capture request(s), `nsys stop`, and
+prints the per-device kernel counts and the `request#` / `stage_` ranges of the
+report so a rank missing from the capture is visible immediately.
+
+- The `sglang generate` config drives both sides: its ServerArgs fields
+  (`model_variant`, `backend`, `performance_mode`, ...) become `sglang serve`
+  flags unless the same flag follows `--` (so a config written for eight GPUs
+  serves on four with `--num-gpus 4`), the remaining fields form the request
+  body, `output_path` and `perf_dump_path` point at `--output`, and relative
+  media paths in `conditions[*].uri` (fl2va keyframes, ref2va reference video
+  and audio) are resolved to file URIs next to the config.
+- `--enable-nvtx-marker true` adds one `request#<n>` range per non-warmup
+  request (n counts the requests each worker has run), plus `stage_<Name>`,
+  `denoising_loop` and per-step ranges. `--enable-layerwise-nvtx-marker`
+  implies it and adds a range per module forward, which costs about 8% on a
+  batched H3 VAE decode and 30% on the per-tile path; keep it off when the
+  timing itself matters.
+- The warmup request absorbs first-request costs; with
+  `--minimax-h3-adaln-online` it rebuilds the AdaLN plans from the 24 GB
+  checkpoint, which took 10 minutes when other jobs had evicted the page cache
+  (7 s when cached), so keep the warmup request identical to the captured one.
+- `sglang serve` moves to a free port when the requested one is taken; the
+  script reads the bound port back from the server log.
+- One-shot alternative without serving: `nsys profile --capture-range=nvtx
+  --nvtx-capture=request#2 --capture-range-end=stop
+  --trace-fork-before-exec=true sglang generate ... --enable-nvtx-marker true`
+  captures the second real request (warmups do not count). Check that every
+  rank has GPU rows before trusting a multi-GPU report from this mode.
+- NVTX ranges are CPU-side. Read GPU time from `nsys stats --report
+  cuda_gpu_kern_sum` or the NVTX GPU projection (`nvtx_gpu_proj_sum`), and
+  set `NSYS_NVTX_PROFILER_REGISTER_ONLY=0` (the script does) so unregistered
+  range strings are recorded.
+- Measured on 4x H200 (Ulysses 4, 768p / 5 s / 50 steps, one warmup request,
+  `--minimax-h3-adaln-online true`):
+
+  | workload | ready | warmup request | captured request | kernels per GPU | `request#2` |
+  |---|---:|---:|---:|---:|---:|
+  | t2va | 205 s | 186 s | 78 s (denoise 73.5 s) | 82k-84k, 75 s busy | 4 x 75.7 s |
+  | fl2va (2 keyframes) | 115 s | 176 s | 90 s (denoise 85.9 s) | 89k-91k, 88 s busy | 4 x 88.5 s |
+  | ref2va (video + audio) | 180 s | 345 s | 265 s (denoise 255.1 s) | 109k-128k, 262 s busy | 4 x 262.8 s |
+
+  Every report held all four ranks with the stage ranges nested inside the
+  request range, and the GPU busy time matches the request wall time, so the
+  collection adds no measurable overhead to the captured request. Ready and
+  warmup times depend on the page cache (t2va was ready in 135 s in another
+  run).
+
 ## Minimal Merge Checklist
 
 - [ ] fixed-shape baseline perf dump saved

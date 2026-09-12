@@ -210,7 +210,9 @@ def _test_manager(
         _stage_name_mapping={},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=enable_flag)
+    server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=enable_flag, enable_nvtx_marker=enable_flag
+    )
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.state.batch_is_warmup = is_warmup
     manager.strategy_for = lambda _component_name, _module: _NoOpResidencyStrategy()
@@ -328,6 +330,7 @@ class TestComponentResidencyNvtxHooks(unittest.TestCase):
                     (),
                     {
                         "enable_layerwise_nvtx_marker": True,
+                        "enable_nvtx_marker": True,
                         "comfyui_mode": False,
                     },
                 )()

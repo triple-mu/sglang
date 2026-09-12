@@ -100,9 +100,7 @@ class PipelineExecutor(ABC):
         return getattr(payload, "is_warmup", False)
 
     def _should_use_stage_nvtx(self, payload: Any, server_args: ServerArgs) -> bool:
-        return server_args.enable_layerwise_nvtx_marker and not self._is_warmup_payload(
-            payload
-        )
+        return server_args.enable_nvtx_marker and not self._is_warmup_payload(payload)
 
     def _run_stage_with_executor_hooks(
         self,

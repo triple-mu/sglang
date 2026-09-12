@@ -46,6 +46,15 @@ _DEFAULT_SKIP_TYPES: tuple[type, ...] = (
 )
 
 
+REQUEST_NVTX_PREFIX = "request#"
+
+
+def request_nvtx_marker(ordinal: int) -> str:
+    """Range name of the ordinal-th non-warmup request a worker runs; nsys users
+    pass it to --nvtx-capture to select the steady-state request."""
+    return f"{REQUEST_NVTX_PREFIX}{ordinal}"
+
+
 @contextlib.contextmanager
 def maybe_nvtx_range(name: str, enabled: bool = True) -> Iterator[None]:
     """Context manager that wraps a block of work in an NVTX range.

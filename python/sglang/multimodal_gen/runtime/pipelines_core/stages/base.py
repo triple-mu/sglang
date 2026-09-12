@@ -300,7 +300,7 @@ class PipelineStage(StageDedupMixin, ABC):
         ``ComponentResidencyManager``. Stages use this value only for
         explicit ``maybe_nvtx_range`` blocks.
         """
-        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
+        use_nvtx = self.server_args.enable_nvtx_marker and not is_warmup
         self._current_use_nvtx = use_nvtx
         return use_nvtx
 
