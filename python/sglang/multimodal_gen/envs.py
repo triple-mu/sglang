@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_ULYSSES_NVTX: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -303,6 +304,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
     ),
+    # NVTX ranges around the Ulysses exchange and its layout transforms. The
+    # collective itself has a ncclDevKernel_ for nsys to attribute, but the
+    # pack/merge transforms feeding it are plain elementwise kernels that land
+    # in the report unnamed -- without these ranges an exchange and the reshape
+    # it waits on are indistinguishable.
+    "SGLANG_DIFFUSION_ULYSSES_NVTX": _lazy_bool("SGLANG_DIFFUSION_ULYSSES_NVTX"),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(

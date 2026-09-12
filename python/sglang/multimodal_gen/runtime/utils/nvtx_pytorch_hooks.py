@@ -23,6 +23,7 @@ that emits a richer per-layer parameter dict.
 from __future__ import annotations
 
 import contextlib
+import functools
 from collections.abc import Iterator
 from typing import Any
 
@@ -53,6 +54,20 @@ def request_nvtx_marker(ordinal: int) -> str:
     """Range name of the ordinal-th non-warmup request a worker runs; nsys users
     pass it to --nvtx-capture to select the steady-state request."""
     return f"{REQUEST_NVTX_PREFIX}{ordinal}"
+
+
+@functools.cache
+def ulysses_nvtx_enabled() -> bool:
+    """Whether to emit NVTX ranges around the Ulysses exchange.
+
+    Gated by SGLANG_DIFFUSION_ULYSSES_NVTX rather than a ServerArgs flag: the
+    exchange runs below the stage layer and has no ServerArgs to read. Cached --
+    the exchange runs 100 times per denoising step, and an env lookup on that
+    path would show up in the very profile it exists to produce.
+    """
+    from sglang.multimodal_gen import envs
+
+    return envs.SGLANG_DIFFUSION_ULYSSES_NVTX
 
 
 @contextlib.contextmanager
