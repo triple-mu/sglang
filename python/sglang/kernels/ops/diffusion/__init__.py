@@ -183,6 +183,30 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "BF16-native x + tanh(gate) * RMSNorm(y).",
     ),
     (
+        "diffusion.minimax_h3_vae_rmsnorm_fp8",
+        KernelBackend.JIT,
+        "norm.minimax_h3_vae_residual_norm_jit:minimax_h3_vae_rmsnorm_fp8",
+        _CUDA_SM100_PLUS,
+        "MiniMax-H3 VAE RMSNorm + dynamic per-token FP8; close; "
+        "deployment-gated by the MiniMax-H3 FP8 decoder option.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_residual_rmsnorm_fp8",
+        KernelBackend.JIT,
+        "norm.minimax_h3_vae_residual_norm_jit:minimax_h3_vae_residual_rmsnorm_fp8",
+        _CUDA_SM100_PLUS,
+        "MiniMax-H3 VAE fp32 residual update + RMSNorm + per-token FP8; close; "
+        "deployment-gated by the MiniMax-H3 FP8 decoder option.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_residual_layernorm",
+        KernelBackend.JIT,
+        "norm.minimax_h3_vae_residual_norm_jit:minimax_h3_vae_residual_layernorm",
+        _CUDA_SM100_PLUS,
+        "MiniMax-H3 VAE fp32 residual update + LayerNorm; close; "
+        "deployment-gated by the MiniMax-H3 FP8 decoder option.",
+    ),
+    (
         "diffusion.modulate_scale_shift",
         KernelBackend.JIT,
         "modulate.modulate_scale_shift_jit:modulate_scale_shift",
@@ -335,6 +359,14 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "sites.fused_linear_gelu_site:fused_linear_gelu_tanh",
         _CUDA,
         "Linear + tanh-GELU via the cublasLt epilogue.",
+    ),
+    (
+        "diffusion.silu_mul_quant_fp8",
+        KernelBackend.JIT,
+        "activation.silu_mul_quant_fp8_jit:silu_mul_quant_fp8",
+        _CUDA_SM100_PLUS,
+        "fp32 silu(gate) * up + dynamic per-token FP8; close; "
+        "deployment-gated by the MiniMax-H3 FP8 decoder option.",
     ),
     (
         "diffusion.sparse_linear_attn_fwd",
@@ -573,6 +605,12 @@ _EXPORTS: dict[str, str] = {
     "fused_layernorm_modulate_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_qk_head_layernorm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "is_plain_layer_norm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+    "can_use_minimax_h3_vae_residual_layernorm": "norm.minimax_h3_vae_residual_norm_jit",
+    "can_use_minimax_h3_vae_residual_rmsnorm_fp8": "norm.minimax_h3_vae_residual_norm_jit",
+    "can_use_minimax_h3_vae_rmsnorm_fp8": "norm.minimax_h3_vae_residual_norm_jit",
+    "minimax_h3_vae_residual_layernorm": "norm.minimax_h3_vae_residual_norm_jit",
+    "minimax_h3_vae_residual_rmsnorm_fp8": "norm.minimax_h3_vae_residual_norm_jit",
+    "minimax_h3_vae_rmsnorm_fp8": "norm.minimax_h3_vae_residual_norm_jit",
     "rmsnorm_scale": "norm.native_bf16_rmsnorm_triton",
     "rmsnorm_tanh_residual": "norm.native_bf16_rmsnorm_triton",
     "norm_infer": "norm.norm_triton",
@@ -647,6 +685,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_silu_mul": "activation.silu_mul_bitexact",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
+    "can_use_silu_mul_quant_fp8": "activation.silu_mul_quant_fp8_jit",
+    "silu_mul_quant_fp8": "activation.silu_mul_quant_fp8_jit",
     # Diffusion attention kernels
     "cam_scan_bidi_chunkwise": "attention.sana_wm_gdn_chunkwise_triton",
     "fused_bigdn_func": "attention.sana_wm_gdn_triton",
