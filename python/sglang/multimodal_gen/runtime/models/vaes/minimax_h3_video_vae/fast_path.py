@@ -129,12 +129,13 @@ def minimax_h3_vae_fast_path_scope(vae, *, quality: str, stage: str):
         state.used = 0
         state.fallback = 0
         logger.info(
-            "[H3 VAE] %s fast path mounted: quality=%s caps=enc%d/dec%d/win%d",
+            "[H3 VAE] %s fast path mounted: quality=%s caps=enc%d/dec%d/win%d fp8=%s",
             stage,
             quality,
             state.encoder_tile_batch,
             state.decoder_tile_batch,
             state.window_batch,
+            vae.decoder.fp8_installed,
         )
         try:
             yield
