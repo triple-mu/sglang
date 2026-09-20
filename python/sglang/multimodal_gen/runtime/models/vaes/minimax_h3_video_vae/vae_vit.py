@@ -226,6 +226,8 @@ class ViT3DDecoder(ViTBase):
         self._autocast_linear_dtype = None
         # Filled by minimax_h3_vae_cuda_opt at load; None keeps the eager decoder.
         self.fast_path: MiniMaxH3VaeFastPath | None = None
+        # True once fp8.install_fp8_block_linears has swapped the block linears.
+        self.fp8_installed = False
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
@@ -246,6 +248,11 @@ class ViT3DDecoder(ViTBase):
         output projections stay FP32 because their calls explicitly disable
         autocast.
         """
+
+        if self.fp8_installed:
+            if dtype != torch.float16:
+                raise ValueError("The FP8 decoder requires FP16 autocast")
+            return 0
 
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
