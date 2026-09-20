@@ -7,6 +7,7 @@ from unittest import mock
 
 import pytest
 import torch
+from torch import nn
 
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
@@ -32,6 +33,11 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_path im
     MiniMaxH3VaeFastPath,
     minimax_h3_vae_fast_path_scope,
     resolve_minimax_h3_vae_batch_caps,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
+    LINEAR_SHAPES,
+    inspect_fp8_scope,
+    target_paths,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_cnn import (
     EncoderFCN3D,
@@ -187,6 +193,31 @@ def test_batched_rope_has_reference_fallback_on_cpu():
         assert len(result) == 2
         torch.testing.assert_close(result[0], cos)
         torch.testing.assert_close(result[1], sin)
+
+
+def test_fp8_scope_is_exactly_the_released_144_linears():
+    # Meta parameters validate the real topology without allocating 10 GB.
+    decoder = nn.Module()
+    decoder.transformer_blocks = nn.ModuleList()
+    with torch.device("meta"):
+        for _ in range(36):
+            block = nn.Module()
+            block.attn = nn.Module()
+            block.ff = nn.Module()
+            for path, (out_features, in_features) in LINEAR_SHAPES.items():
+                owner, name = path.split(".")
+                setattr(
+                    getattr(block, owner), name, nn.Linear(in_features, out_features)
+                )
+            decoder.transformer_blocks.append(block)
+        decoder.proj_out = nn.Linear(2048, 3072)
+    paths = inspect_fp8_scope(decoder)
+    assert len(paths) == len(set(paths)) == 144
+    assert paths == target_paths()
+    assert "proj_out" not in paths
+    decoder.transformer_blocks[5].ff.w2 = nn.Linear(1, 1, device="meta")
+    with pytest.raises(ValueError, match="transformer_blocks.5.ff.w2"):
+        inspect_fp8_scope(decoder)
 
 
 def test_install_fills_explicit_slots_and_gate_resets():
