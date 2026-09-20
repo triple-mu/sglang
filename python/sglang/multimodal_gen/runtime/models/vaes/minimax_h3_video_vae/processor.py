@@ -254,6 +254,21 @@ class VAEProcessor:
         return tensor.contiguous()
 
     def revert_tensor(self, tensor):
+        from sglang.kernels.ops.diffusion import (
+            can_use_minimax_h3_vae_denorm,
+            minimax_h3_vae_denorm,
+        )
+
+        from .optimizations import optimization_active
+
+        if self.use_3d_conv and optimization_active(self, tensor):
+            value = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor
+            if can_use_minimax_h3_vae_denorm(
+                value, self.transform_rev.mean, self.transform_rev.std
+            ):
+                return minimax_h3_vae_denorm(
+                    value, self.transform_rev.mean, self.transform_rev.std
+                )
         B, T = None, None
         if self.use_3d_conv:
             tensor = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor

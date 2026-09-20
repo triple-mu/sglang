@@ -166,6 +166,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "quantization": server_args.quantization,
             "transformer_weights_path": server_args.transformer_weights_path,
             "text_encoder_quantization": text_encoder_quantization,
+            "vae_decoder_quantization": self.vae_config.decoder_quantization,
+            "vae_output_projection_precision": self.vae_config.decoder_output_projection_precision,
             "regional_compile": server_args.regional_compile,
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
@@ -189,6 +191,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "quantization": None,
             "transformer_weights_path": None,
             "text_encoder_quantization": None,
+            "vae_decoder_quantization": None,
+            "vae_output_projection_precision": "fp32",
             "regional_compile": False,
             "ring_degree": 1,
             "sp_degree": 4,
@@ -223,6 +227,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        self.vae_config.validate_optimization_options()
         if current_platform.is_mps():
             required_components = (
                 "transformer",

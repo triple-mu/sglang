@@ -239,6 +239,11 @@ class ViT3DDecoder(ViTBase):
         autocast.
         """
 
+        if getattr(self, "_sgl_fp8_installed", False):
+            if dtype != torch.float16:
+                raise ValueError("The FP8 decoder requires FP16 autocast")
+            return 0
+
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
                 f"MiniMax H3 decoder autocast weights require fp16 or bf16, got {dtype}"
@@ -261,6 +266,12 @@ class ViT3DDecoder(ViTBase):
         return converted
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from . import fused_decoder
+        from .fp8 import maybe_prepare_fp8
+        from .optimizations import optimization_active, output_projection_active
+
+        maybe_prepare_fp8(self, x)
+        fast_path = optimization_active(self, x)
         B, C, latent_T, latent_H, latent_W = x.shape
         patch_size = self.config.patch_size
         patch_size_t = self.config.patch_size_t
@@ -306,6 +317,7 @@ class ViT3DDecoder(ViTBase):
             x.device,
             x.dtype,
             rotary_dtype,
+            fast_path,
         )
         cache_record = self._rotary_pos_emb_cache if cache_enabled else None
         cache_hit = cache_record is not None and cache_record[0] == cache_key
@@ -329,6 +341,7 @@ class ViT3DDecoder(ViTBase):
             rotary_pos_emb = prepare_rotary_pos_emb(
                 self.pos_embed(img_ids),
                 dtype=rotary_dtype,
+                allow_batched_native=fast_path,
             )
             if cache_enabled:
                 self._rotary_pos_emb_cache = (
@@ -337,17 +350,29 @@ class ViT3DDecoder(ViTBase):
                     rotary_pos_emb,
                 )
 
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_pos_emb)
-
-        hidden_states = self.norm_out(hidden_states)
+        if fused_decoder.can_use_fused_decoder(self, hidden_states, rotary_pos_emb):
+            for block in self.transformer_blocks:
+                hidden_states = fused_decoder.block_forward(
+                    block, hidden_states, rotary_pos_emb
+                )
+            hidden_states = fused_decoder.finish(hidden_states, self.norm_out)
+        else:
+            for block in self.transformer_blocks:
+                hidden_states = block(hidden_states, rotary_pos_emb)
+            hidden_states = self.norm_out(hidden_states)
 
         hidden_states = self.apply_mask_postprocess(hidden_states, num_patches)
 
         with _cuda_autocast_disabled(hidden_states):
-            output = _linear_with_module_dtype(
-                self.proj_out, hidden_states, hidden_states.dtype
+            output = (
+                fused_decoder.output_projection(self.proj_out, hidden_states)
+                if output_projection_active(self, hidden_states)
+                else None
             )
+            if output is None:
+                output = _linear_with_module_dtype(
+                    self.proj_out, hidden_states, hidden_states.dtype
+                )
 
         output = output[:, :num_patches, :]
 

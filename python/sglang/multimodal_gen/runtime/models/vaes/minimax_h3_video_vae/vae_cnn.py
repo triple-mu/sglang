@@ -14,6 +14,31 @@ from .norm import get_group_norm_3d, get_spatial_norm_3d
 
 
 def norm_silu(x, norm, cond=None):
+    from sglang.kernels.ops.diffusion import (
+        can_use_minimax_h3_vae_group_norm_silu,
+        minimax_h3_vae_group_norm_silu,
+    )
+
+    from .norm import TemporalIsolatedGroupNorm
+    from .optimizations import optimization_active
+
+    if (
+        cond is None
+        and optimization_active(norm, x)
+        and isinstance(norm, (nn.GroupNorm, TemporalIsolatedGroupNorm))
+    ):
+        isolated = isinstance(norm, TemporalIsolatedGroupNorm)
+        if can_use_minimax_h3_vae_group_norm_silu(
+            x, norm.num_groups, norm.weight, norm.bias, norm.eps, time_isolated=isolated
+        ):
+            return minimax_h3_vae_group_norm_silu(
+                x,
+                norm.num_groups,
+                norm.weight,
+                norm.bias,
+                norm.eps,
+                time_isolated=isolated,
+            )
     if cond is None:
         return F.silu(norm(x), inplace=True)
     else:

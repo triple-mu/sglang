@@ -78,6 +78,7 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
     assert kwargs["supported_attention_backends"] == {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.TORCH_CUDNN_SDPA,
     }
 
 

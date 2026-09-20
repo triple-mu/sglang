@@ -216,6 +216,46 @@ class VAEConfig(ModelConfig):
             help="Parallel decode mode for VAE",
         )
 
+        parser.add_argument(
+            f"--{prefix}.enable-optimizations",
+            action=StoreBoolean,
+            dest=f"{prefix.replace('-', '_')}.enable_optimizations",
+            default=None,
+            help="MiniMax-H3: opt in to request-gated batching and CUDA JIT fusion (SM100)",
+        )
+        for name, description in (
+            ("encoder-tile-batch-size", "encoder tile sample cap, 1-64 (default 8)"),
+            (
+                "decoder-tile-batch-size",
+                "decoder tile/window sample cap, 1-64 (default 64)",
+            ),
+            (
+                "decoder-window-batch-size",
+                "adjacent temporal window cap, 0-64; 0 groups all equal-shaped windows",
+            ),
+        ):
+            parser.add_argument(
+                f"--{prefix}.{name}",
+                type=int,
+                default=None,
+                dest=f"{prefix.replace('-', '_')}.{name.replace('-', '_')}",
+                help=f"MiniMax-H3: {description}",
+            )
+        parser.add_argument(
+            f"--{prefix}.decoder-quantization",
+            choices=("fp8",),
+            default=None,
+            dest=f"{prefix.replace('-', '_')}.decoder_quantization",
+            help="MiniMax-H3: online FP8 for the resident decoder's 144 block linears (SM100)",
+        )
+        parser.add_argument(
+            f"--{prefix}.decoder-output-projection-precision",
+            choices=("fp32", "fp16"),
+            default=None,
+            dest=f"{prefix.replace('-', '_')}.decoder_output_projection_precision",
+            help="MiniMax-H3: output projection input precision; fp16 uses FP32 accumulation/output (default fp32)",
+        )
+
         return parser
 
     def get_vae_scale_factor(self):

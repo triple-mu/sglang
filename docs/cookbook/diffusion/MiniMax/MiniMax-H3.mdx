@@ -73,6 +73,60 @@ The builder accepts legal custom GPU counts and topologies, marking them
 Static H3 head or partition violations disable Copy before they reach
 `sglang serve`.
 
+### Opt-in video VAE kernels on B200
+
+On Linux with CUDA SM100, add these options to a resident four-GPU deployment:
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 --tp-size 1 --ulysses-degree 4 --ring-degree 1 \
+  --performance-mode speed \
+  --vae-config.enable-optimizations true \
+  --vae-config.encoder-tile-batch-size 8 \
+  --vae-config.decoder-tile-batch-size 64 \
+  --vae-config.decoder-window-batch-size 0 \
+  --component-attention-backends video_vae=torch_cudnn_sdpa \
+  --port 30010
+```
+
+The command above keeps the existing VAE weight and projection precision.
+To opt into precision changes, independently add either or both startup options:
+
+```bash
+--vae-config.decoder-quantization fp8 \
+--vae-config.decoder-output-projection-precision fp16
+```
+
+Send `"quality": "extra-high"` to enable the optional batching and CUDA/C++ JIT
+fusions. `enable-optimizations` defaults to `false`. A `lossless` request skips
+these paths; it does not undo explicitly selected FP8 weights, projection
+precision, or the configured attention backend. The existing `high` quality audit applies to its
+H200 deployment, not this B200 recipe.
+
+| Option / path | Behavior |
+| --- | --- |
+| Encoder batch, default `8` | Group adjacent equal-shaped complete tiles; preserve sample and posterior sampling order. |
+| Decoder batch, default `64` | Maximum local tile × window × sample batch per decode call; time remains a separate axis. |
+| Window batch, default `0` | Group all adjacent equal-shaped windows; use `1` for one window at a time. First/last boundary windows can form separate groups. |
+| Decoder quantization, default unset | Online FP8 for exactly 144 transformer-block linears. Reuses SGLang's per-token quantizer and scaled GEMM. |
+| JIT fusions | Encoder GN+SiLU; paired Q/K RMSNorm+RoPE; decoder residual/norm/FP8 producers, SiLU/multiply/FP8; spatial and temporal blending; inverse normalization/clamp. |
+| Output projection precision, default `fp32` | Explicit `fp16` rounds inputs/weights to FP16; accumulation, output, and bias remain FP32. Independent of fusion and FP8. |
+| Attention | Uses the existing component-scoped cuDNN SDPA backend. |
+
+Tile caps accept `1–64`; window caps accept `0–64`. They limit work per call,
+not total output memory. Lower the caps if batched activations exceed memory.
+FP8 requires a resident SM100 decoder and FP16 decode autocast; it is independent
+of `enable-optimizations`. Its first decode converts the block weights, so warm up
+before measuring. Reload the unquantized checkpoint to disable FP8. Online
+conversion is an inference deployment option, not a checkpoint export format.
+
+JIT fusions use FP32 reductions but can change rounding order. Unsupported
+layouts and request modes use the reference operators. The tests cover B200
+operators and decoder dataflow; full-video quality and E2E timing must be measured
+for the deployed model, input dimensions, and attention backend.
+
 ### Grace Blackwell
 
 Select **GB300** or **GB200** in the builder. The default is one Linux ARM64

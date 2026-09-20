@@ -7,6 +7,9 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
@@ -16,6 +19,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
@@ -390,10 +394,16 @@ class MiniMaxH3DecodingStage(DecodingStage):
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
-            with autocast_context(
-                video_vae_dtype,
-                server_args.disable_autocast,
-                enabled=visual_autocast_enabled,
+            with (
+                autocast_context(
+                    video_vae_dtype,
+                    server_args.disable_autocast,
+                    enabled=visual_autocast_enabled,
+                ),
+                use_vae_fast_path(
+                    selected_video_vae,
+                    quality_allows_kernel_fusions(batch.sampling_params.quality),
+                ),
             ):
                 video_decode = self._get_vae_decode_fn(
                     selected_video_vae,

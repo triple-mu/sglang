@@ -116,6 +116,7 @@ class Attention(nn.Module):
                 supported_attention_backends={
                     AttentionBackendEnum.FA,
                     AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.TORCH_CUDNN_SDPA,
                 },
                 default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
                 skip_sequence_parallel=True,
@@ -136,15 +137,23 @@ class Attention(nn.Module):
 
         qkv = self.to_qkv(hidden_states)
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
-        query, key, value = torch.chunk(qkv, 3, dim=-1)
+        from .fused_decoder import paired_qk
 
-        if self.norm_q is not None:
-            query = _apply_qk_norm(self.norm_q, query)
-        if self.norm_k is not None:
-            key = _apply_qk_norm(self.norm_k, key)
+        fused = (
+            paired_qk(self, qkv, rotary_pos_emb) if rotary_pos_emb is not None else None
+        )
+        if fused is not None:
+            query, key, value = fused
+        else:
+            query, key, value = torch.chunk(qkv, 3, dim=-1)
 
-        if rotary_pos_emb is not None:
-            query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+            if self.norm_q is not None:
+                query = _apply_qk_norm(self.norm_q, query)
+            if self.norm_k is not None:
+                key = _apply_qk_norm(self.norm_k, key)
+
+            if rotary_pos_emb is not None:
+                query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)

@@ -282,6 +282,20 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             return blended
 
     def _assemble_tiles(self, rows, y_overlap, x_overlap):
+        from sglang.kernels.ops.diffusion import (
+            can_use_minimax_h3_vae_assemble,
+            minimax_h3_vae_assemble,
+        )
+
+        from .optimizations import optimization_active
+
+        if (
+            rows
+            and rows[0]
+            and optimization_active(self, rows[0][0])
+            and can_use_minimax_h3_vae_assemble(rows, y_overlap, x_overlap)
+        ):
+            return minimax_h3_vae_assemble(rows, y_overlap, x_overlap)
         output_height = sum(
             row[0].shape[-2] - (y_overlap[i] if i < len(rows) - 1 else 0)
             for i, row in enumerate(rows)
@@ -369,6 +383,26 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     def _run_tile_tasks(
         self, tiles, tile_indices, forward_fn, stack_tiling, cls_agg=None
     ):
+        from .batching import flat_decode_tiles, forward_many
+        from .optimizations import optimization_active
+
+        if tile_indices and optimization_active(self, tiles[tile_indices[0]]):
+            config = self._sgl_h3_vae_optimization.config
+            if forward_fn.__name__ == "decode" and not getattr(
+                self.decoder, "mask_enabled", False
+            ):
+                return flat_decode_tiles(
+                    tiles, tile_indices, forward_fn, config.decoder_tile_batch_size
+                )
+            if forward_fn.__name__ == "encode" and not getattr(
+                self.encoder, "mask_enabled", False
+            ):
+                return forward_many(
+                    [tiles[i] for i in tile_indices],
+                    forward_fn,
+                    config.encoder_tile_batch_size,
+                    cls_agg,
+                )
         if stack_tiling and tile_indices:
             sample_batch_size = tiles[0].shape[0]
             tile_batch = torch.cat([tiles[idx] for idx in tile_indices], dim=0)
@@ -661,6 +695,17 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         pad_frames = self._decode_temporal_pad_frames(z, pad_tokens)
         return int(total_frames), int(pad_frames), int(total_frames - pad_frames)
 
+    def _iter_decoded_windows(self, z, head, tail, count):
+        from .batching import decode_windows
+        from .optimizations import optimization_active
+
+        limit = (
+            self._sgl_h3_vae_optimization.config.decoder_window_batch_size
+            if optimization_active(self, z)
+            else 1
+        )
+        return decode_windows(self, z, head, tail, count, limit)
+
     def _decode_temporal_streaming(
         self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
     ):
@@ -684,7 +729,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         dropped_frames = 0
         decoded_count = 0
 
-        def write_part(part):
+        def write_part(part, overlap=None):
             nonlocal dec, write_pos, logical_frames, dropped_frames
             part_frames = int(part.shape[2])
             if part_frames <= 0:
@@ -698,24 +743,31 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             remaining = int(dec.shape[2]) - write_pos
             copy_frames = min(part_frames, max(0, remaining))
             if copy_frames > 0:
-                dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(
-                    part[:, :, :copy_frames, :, :]
+                from sglang.kernels.ops.diffusion import (
+                    can_use_minimax_h3_vae_temporal_write,
+                    minimax_h3_vae_temporal_write,
                 )
+
+                from .optimizations import optimization_active
+
+                if optimization_active(
+                    self, part
+                ) and can_use_minimax_h3_vae_temporal_write(
+                    part, overlap, self.frame_overlap, dec, write_pos, copy_frames
+                ):
+                    minimax_h3_vae_temporal_write(
+                        part, overlap, self.frame_overlap, dec, write_pos, copy_frames
+                    )
+                else:
+                    if overlap is not None:
+                        part = self.blend(overlap, part, self.frame_overlap, dim=-3)
+                    dec[:, :, write_pos : write_pos + copy_frames].copy_(
+                        part[:, :, :copy_frames]
+                    )
                 write_pos += copy_frames
             dropped_frames += part_frames - copy_frames
 
-        for i in range(num_chunks):
-            t_start_idx = i * self.tokens_chunk_size
-            t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
-            clip_z = z[:, :, t_start_idx:t_end_idx, :, :]
-
-            if i == 0 and z_head is not None:
-                clip_z = torch.cat([z_head, clip_z], dim=2)
-
-            if i == num_chunks - 1 and z_tail is not None:
-                clip_z = torch.cat([clip_z, z_tail], dim=2)
-
-            clip_dec = self._adaptive_decode(clip_z)
+        for i, clip_dec in self._iter_decoded_windows(z, z_head, z_tail, num_chunks):
             decoded_count += 1
             if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
                 clip_dec = clip_dec.to(temporal_cat_dtype)
@@ -740,12 +792,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 clip_dec_chunk = clip_dec_chunk[:, :, self.frame_pre_padding :, :, :]
 
                 if j == 0:
-                    if dec_overlap is not None:
-                        clip_dec_chunk = self.blend(
-                            dec_overlap, clip_dec_chunk, self.frame_overlap, dim=-3
-                        )
-                        dec_overlap = None
-                    write_part(clip_dec_chunk)
+                    write_part(clip_dec_chunk, dec_overlap)
+                    dec_overlap = None
                 else:
                     # Break the view's reference to the full decoded clip so earlier
                     # temporal chunks can be released before the final output exists.
@@ -758,7 +806,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 if dec_tail is not None:
                     write_part(dec_tail)
 
-            del clip_dec, clip_z
+            del clip_dec
 
         if dec is None:
             raise RuntimeError("decode_temporal streaming produced no output tensor")
@@ -820,18 +868,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             )
 
         decoded_tasks = []
-        for i in range(num_chunks):
-            t_start_idx = i * self.tokens_chunk_size
-            t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
-            clip_z = z[:, :, t_start_idx:t_end_idx, :, :]
-
-            if i == 0 and z_head is not None:
-                clip_z = torch.cat([z_head, clip_z], dim=2)
-
-            if i == num_chunks - 1 and z_tail is not None:
-                clip_z = torch.cat([clip_z, z_tail], dim=2)
-
-            clip_dec = self._adaptive_decode(clip_z)
+        for i, clip_dec in self._iter_decoded_windows(z, z_head, z_tail, num_chunks):
             if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
                 clip_dec = clip_dec.to(temporal_cat_dtype)
 

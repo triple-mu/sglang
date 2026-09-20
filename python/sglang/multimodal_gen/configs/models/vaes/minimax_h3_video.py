@@ -38,6 +38,31 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
     # recipe. Spatial-shard decode is rejected because validation found output
     # mismatches on H3.
     parallel_decode_mode: str = "tiled"
+    # Batch/fusion paths are additionally scoped by request quality. Online
+    # FP8 is an independent deployment choice for the decoder block linears.
+    enable_optimizations: bool = False
+    encoder_tile_batch_size: int = 8
+    decoder_tile_batch_size: int = 64
+    decoder_window_batch_size: int = 0
+    decoder_quantization: str | None = None
+    decoder_output_projection_precision: str = "fp32"
+
+    def validate_optimization_options(self) -> None:
+        if type(self.enable_optimizations) is not bool:
+            raise ValueError("enable_optimizations must be a boolean")
+        for name in ("encoder_tile_batch_size", "decoder_tile_batch_size"):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= 64:
+                raise ValueError(f"{name} must be an integer in [1, 64]")
+        value = self.decoder_window_batch_size
+        if type(value) is not int or not 0 <= value <= 64:
+            raise ValueError(
+                "decoder_window_batch_size must be in [0, 64]; 0 groups all equal-shaped windows"
+            )
+        if self.decoder_quantization not in (None, "fp8"):
+            raise ValueError("MiniMax-H3 decoder_quantization must be None or 'fp8'")
+        if self.decoder_output_projection_precision not in ("fp32", "fp16"):
+            raise ValueError("decoder_output_projection_precision must be fp32 or fp16")
 
     def resolved_parallel_decode_mode(self) -> str:
         if self.parallel_decode_mode == "auto":
@@ -68,6 +93,7 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
         super().update_model_arch(model_dict)
 
     def post_init(self) -> None:
+        self.validate_optimization_options()
         self.resolved_parallel_decode_mode()
         validate_minimax_h3_vae_latent_stats(
             self.arch_config,

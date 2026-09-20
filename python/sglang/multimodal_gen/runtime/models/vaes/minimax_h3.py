@@ -24,6 +24,7 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
     layer_names = ["decoder.transformer_blocks"]
 
     def __init__(self, config: MiniMaxH3VideoVAEConfig) -> None:
+        config.validate_optimization_options()
         arch = config.arch_config
         parallel_decode_mode = config.resolved_parallel_decode_mode()
         use_tiled_decode = config.use_tiling and parallel_decode_mode == "tiled"
@@ -82,6 +83,14 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         self.sglang_config = config
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = parallel_decode_mode
+        from .minimax_h3_video_vae.optimizations import install_optimization_state
+
+        if (
+            config.enable_optimizations
+            or config.decoder_quantization is not None
+            or config.decoder_output_projection_precision != "fp32"
+        ):
+            install_optimization_state(self, config)
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)

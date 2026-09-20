@@ -50,6 +50,55 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.minimax_h3_vae_qk_rope",
+        KernelBackend.JIT,
+        "rope.minimax_h3_vae_jit:minimax_h3_vae_qk_rope",
+        _CUDA_SM100_PLUS,
+        "Paired H3 VAE Q/K RMSNorm and RoPE; close, quality-gated.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_silu_quant",
+        KernelBackend.JIT,
+        "activation.minimax_h3_vae_jit:minimax_h3_vae_silu_quant",
+        _CUDA_SM100_PLUS,
+        "H3 VAE SiLU/multiply and FP8 producer; close, quality-gated.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_norm_quant",
+        KernelBackend.JIT,
+        "norm.minimax_h3_vae_jit:minimax_h3_vae_norm_quant",
+        _CUDA_SM100_PLUS,
+        "H3 VAE residual/norm and FP8 producer; close, quality-gated.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_group_norm_silu",
+        KernelBackend.JIT,
+        "norm.minimax_h3_vae_jit:minimax_h3_vae_group_norm_silu",
+        _CUDA_SM100_PLUS,
+        "FP32 H3 VAE GroupNorm/SiLU; close, quality-gated.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_assemble",
+        KernelBackend.JIT,
+        "layout.minimax_h3_vae_jit:minimax_h3_vae_assemble",
+        _CUDA_SM100_PLUS,
+        "H3 VAE spatial blend/crop/write; close, quality-gated.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_temporal_write",
+        KernelBackend.JIT,
+        "layout.minimax_h3_vae_jit:minimax_h3_vae_temporal_write",
+        _CUDA_SM100_PLUS,
+        "H3 VAE temporal blend/write; close, quality-gated.",
+    ),
+    (
+        "diffusion.minimax_h3_vae_denorm",
+        KernelBackend.JIT,
+        "layout.minimax_h3_vae_jit:minimax_h3_vae_denorm",
+        _CUDA_SM100_PLUS,
+        "H3 VAE inverse normalization and clamp; close, quality-gated.",
+    ),
+    (
         "diffusion.apply_group_norm_silu",
         KernelBackend.TRITON,
         "norm.group_norm_silu:apply_group_norm_silu",
@@ -520,6 +569,20 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "minimax_h3_vae_qk_rope": "rope.minimax_h3_vae_jit",
+    "can_use_minimax_h3_vae_qk_rope": "rope.minimax_h3_vae_jit",
+    "minimax_h3_vae_silu_quant": "activation.minimax_h3_vae_jit",
+    "can_use_minimax_h3_vae_silu_quant": "activation.minimax_h3_vae_jit",
+    "minimax_h3_vae_norm_quant": "norm.minimax_h3_vae_jit",
+    "can_use_minimax_h3_vae_norm_quant": "norm.minimax_h3_vae_jit",
+    "minimax_h3_vae_group_norm_silu": "norm.minimax_h3_vae_jit",
+    "can_use_minimax_h3_vae_group_norm_silu": "norm.minimax_h3_vae_jit",
+    "minimax_h3_vae_assemble": "layout.minimax_h3_vae_jit",
+    "can_use_minimax_h3_vae_assemble": "layout.minimax_h3_vae_jit",
+    "minimax_h3_vae_temporal_write": "layout.minimax_h3_vae_jit",
+    "can_use_minimax_h3_vae_temporal_write": "layout.minimax_h3_vae_jit",
+    "minimax_h3_vae_denorm": "layout.minimax_h3_vae_jit",
+    "can_use_minimax_h3_vae_denorm": "layout.minimax_h3_vae_jit",
     "load_extension_with_recovery": "ext.loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
