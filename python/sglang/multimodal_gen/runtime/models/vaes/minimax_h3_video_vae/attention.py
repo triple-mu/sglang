@@ -116,6 +116,7 @@ class Attention(nn.Module):
                 supported_attention_backends={
                     AttentionBackendEnum.FA,
                     AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.TORCH_CUDNN_SDPA,
                 },
                 default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
                 skip_sequence_parallel=True,
