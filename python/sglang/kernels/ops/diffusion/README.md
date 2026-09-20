@@ -186,6 +186,23 @@ Python int (reciprocal first), on the strided and the 128-bit path alike. The ra
 the common tiled-VAE pattern and the interface carries no H3 constants, but
 only the MiniMax-H3 VAE is wired to it today. SM100+.
 
+### MiniMax-H3 VAE (FP8 tier)
+
+Row producers for the online-FP8 ViT decoder: they feed `fp8_scaled_mm` and
+exist only when the MiniMax-H3 FP8 decoder option is selected (the request
+`quality` tier neither selects nor disables them). All four are close-contract
+and gated to SM100+. FP8 epilogues follow `per_token_quant_fp8` (scale = amax /
+448, clamp to +-448, an all-zero row gives scale 0); the fp32 reduction tree
+differs from eager, so the tests assert >= 99.9% identical E4M3 bins plus a
+half-ulp bound on the dequantized values rather than `torch.equal`.
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `minimax_h3_vae_rmsnorm_fp8` | JIT CUDA | `fp8(RMSNorm(x) * weight)`; fp32/fp16 rows, fp32 weight; width from `x.shape[-1]` (2048), contiguous and 16-byte aligned |
+| `minimax_h3_vae_residual_rmsnorm_fp8` | JIT CUDA | `residual = fma(projected, layer_scale, x)` kept in fp32 and returned, then the RMSNorm + FP8 epilogue above |
+| `minimax_h3_vae_residual_layernorm` | JIT CUDA | fp32 residual update + LayerNorm(gamma, beta), fp32 output; the decoder's final norm |
+| `silu_mul_quant_fp8` | JIT CUDA | `fp8(silu(gate) * up)` from a fp16/bf16 `[gate \| up]` row, product never rounded to 16 bits; output width `x.shape[-1] // 2` (8192) |
+
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
 | Entry point | Backend | Contract |
