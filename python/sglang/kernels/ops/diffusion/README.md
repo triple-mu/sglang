@@ -126,6 +126,7 @@ Several norms look interchangeable and are not. Start here.
 |---|---|---|---|
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
+| `group_norm_silu_ncthw` | JIT CUDA | close (exact two-pass fp32 moments, direct `((x - mean) * rstd) * gamma + beta` epilogue; a constant group is exactly `silu(beta)`) | fp32 NCTHW / NCHW, any strides; `time_isolated=True` takes statistics per frame, which is what a causal video encoder needs; always applies SiLU; SM100+ |
 | `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU |
 | `rmsnorm_scale` / `rmsnorm_tanh_residual` | Triton | bf16-native statistics | Z-Image (matches its own reference exactly), Ideogram 4 (gated) |
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
