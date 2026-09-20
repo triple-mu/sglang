@@ -1,28 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The configured x264 preset has to reach the encoder, not just the command.
+"""Check encoder settings and playable output using the real FFmpeg backend.
 
-libx264 records the options it resolved into the mp4 it writes, so a real encode
-can be checked against a reference encode made with the preset spelled out. That
-catches the failure this guards against -- the preset never being passed, and
-ffmpeg silently applying its own default.
+libx264 records resolved options inside the MP4, so these tests detect options
+that are accepted by a wrapper but never reach the encoder.
 """
 
-import shutil
 import subprocess
 
+import imageio_ffmpeg
 import numpy as np
 import pytest
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.runtime.entrypoints.utils import X264_PRESET, save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    X264_PRESET,
+    _resolve_ffmpeg_exe,
+    save_outputs,
+)
 
 FPS = 8
 FRAMES = 8
 SIZE = 64
-# Options libx264 derives from the preset alone, so a reference encode pins them
-# without hard-coding values that move with the x264 build.
+PREFIX = "SGLANG_DIFFUSION_VIDEO_ENCODING_"
+# Derive expectations from the same FFmpeg build instead of hard-coding the
+# individual x264 options associated with each preset.
 PRESET_DERIVED_KEYS = ("subme", "ref", "rc_lookahead", "me", "trellis")
+
+
+@pytest.fixture(autouse=True)
+def encoding_environment(monkeypatch):
+    for suffix in ("PRESET", "CRF", "THREADS"):
+        monkeypatch.delenv(PREFIX + suffix, raising=False)
+    try:
+        executable = _resolve_ffmpeg_exe()
+    except RuntimeError:
+        pytest.skip("needs FFmpeg with libx264")
+    monkeypatch.setenv("IMAGEIO_FFMPEG_EXE", executable)
+    return executable
 
 
 def _x264_options(path) -> dict[str, str]:
@@ -35,88 +50,123 @@ def _x264_options(path) -> dict[str, str]:
     return dict(kv.split("=", 1) for kv in options.split() if "=" in kv)
 
 
-def _reference_encode(tmp_path, frames, preset):
+def _reference_encode(tmp_path, frames, preset, executable, *, crf=25, threads=None):
     out = tmp_path / f"ref_{preset}.mp4"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{SIZE}x{SIZE}",
-            "-r",
-            str(FPS),
-            "-i",
-            "pipe:0",
-            "-vcodec",
-            "libx264",
-            "-preset",
-            preset,
-            "-pix_fmt",
-            "yuv420p",
-            str(out),
-        ],
-        input=frames.tobytes(),
-        check=True,
-    )
+    command = [
+        executable,
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{SIZE}x{SIZE}",
+        "-r",
+        str(FPS),
+        "-i",
+        "pipe:0",
+        "-vcodec",
+        "libx264",
+        "-preset",
+        preset,
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        str(crf),
+    ]
+    if threads is not None:
+        command += ["-threads", str(threads)]
+    command.append(str(out))
+    subprocess.run(command, input=frames.tobytes(), check=True)
     return out
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
-def test_saved_video_carries_the_configured_preset(tmp_path):
+def _decode_frames(path):
+    reader = imageio_ffmpeg.read_frames(str(path))
+    try:
+        metadata = next(reader)
+        frames = list(reader)
+    finally:
+        reader.close()
+    assert metadata["codec"] == "h264"
+    assert metadata["size"] == (SIZE, SIZE)
+    assert metadata["fps"] == FPS
+    assert len(frames) == FRAMES
+    assert all(len(frame) == SIZE * SIZE * 3 for frame in frames)
+    return frames
+
+
+@pytest.mark.parametrize("with_audio", [False, True])
+@pytest.mark.parametrize(
+    ("preset", "crf", "threads"),
+    [(None, None, None), ("medium", 19, 2), ("ultrafast", 0, 1), ("fast", 51, 1)],
+)
+def test_saved_video_carries_configured_options_and_decodes(
+    tmp_path, monkeypatch, encoding_environment, with_audio, preset, crf, threads
+):
+    for suffix, value in (("PRESET", preset), ("CRF", crf), ("THREADS", threads)):
+        if value is not None:
+            monkeypatch.setenv(PREFIX + suffix, str(value))
     rng = np.random.default_rng(0)
     frames = rng.integers(0, 256, (FRAMES, SIZE, SIZE, 3), dtype=np.uint8)
-    sample = torch.from_numpy(frames).permute(3, 0, 1, 2).float() / 255.0
-
+    video = torch.from_numpy(frames).permute(3, 0, 1, 2).float() / 255.0
+    # One second of non-silent audio verifies that the single-pass AAC stream
+    # remains usable when deployment encoder overrides are active.
+    audio = (0.1 * np.sin(2 * np.pi * 440 * np.arange(24000) / 24000)).astype(
+        np.float32
+    )
+    sample = (video, audio) if with_audio else video
     saved = tmp_path / "clip.mp4"
-    paths = save_outputs([sample], DataType.VIDEO, FPS, True, lambda _idx: str(saved))
-
+    paths = save_outputs(
+        [sample],
+        DataType.VIDEO,
+        FPS,
+        True,
+        lambda _idx: str(saved),
+        audio_sample_rate=24000,
+    )
     assert paths == [str(saved)] and saved.exists()
+    selected_preset = preset or X264_PRESET
+    reference = _reference_encode(
+        tmp_path,
+        frames,
+        selected_preset,
+        encoding_environment,
+        crf=25 if crf is None else crf,
+        threads=threads,
+    )
     got = _x264_options(saved)
-    expected = _x264_options(_reference_encode(tmp_path, frames, X264_PRESET))
-    for key in PRESET_DERIVED_KEYS:
-        assert got.get(key) == expected.get(key), f"{key} does not match {X264_PRESET}"
-
-    if X264_PRESET != "medium":
-        # ffmpeg's implicit default, i.e. what a dropped -preset would give.
-        default = _x264_options(_reference_encode(tmp_path, frames, "medium"))
-        assert any(got.get(k) != default.get(k) for k in PRESET_DERIVED_KEYS), (
-            "encode is indistinguishable from ffmpeg's default preset"
+    expected = _x264_options(reference)
+    for key in (*PRESET_DERIVED_KEYS, "crf", "qp", "threads"):
+        assert got.get(key) == expected.get(key), f"{key} differs from the reference"
+    assert _decode_frames(saved) == _decode_frames(reference)
+    if preset is None:
+        default = _x264_options(
+            _reference_encode(tmp_path, frames, "medium", encoding_environment)
         )
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
-def test_saved_video_decodes_to_every_frame(tmp_path):
-    rng = np.random.default_rng(1)
-    frames = rng.integers(0, 256, (FRAMES, SIZE, SIZE, 3), dtype=np.uint8)
-    sample = torch.from_numpy(frames).permute(3, 0, 1, 2).float() / 255.0
-
-    saved = tmp_path / "clip.mp4"
-    save_outputs([sample], DataType.VIDEO, FPS, True, lambda _idx: str(saved))
-
-    probe = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-count_frames",
-            "-show_entries",
-            "stream=nb_read_frames,codec_name",
-            "-of",
-            "csv=p=0",
-            str(saved),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    codec, count = probe.split(",")
-    assert codec == "h264"
-    assert int(count) == FRAMES
+        assert any(got.get(key) != default.get(key) for key in PRESET_DERIVED_KEYS)
+    if with_audio:
+        decoded_audio = subprocess.run(
+            [
+                encoding_environment,
+                "-v",
+                "error",
+                "-i",
+                str(saved),
+                "-map",
+                "0:a:0",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "pipe:1",
+            ],
+            capture_output=True,
+            check=True,
+        ).stdout
+        samples = np.frombuffer(decoded_audio, dtype=np.float32)
+        assert samples.size >= audio.size
+        assert np.isfinite(samples).all()
+        assert np.sqrt(np.mean(samples * samples)) > 0.01

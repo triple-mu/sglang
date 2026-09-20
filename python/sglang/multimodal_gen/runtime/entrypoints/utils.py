@@ -50,6 +50,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.multimodal_gen.runtime.utils.video_encoding import (
+    DEFAULT_X264_PRESET,
+    get_x264_encoding_options,
+)
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -322,7 +326,7 @@ def _resolve_ffmpeg_exe() -> str:
 
 # ffmpeg's implicit libx264 default is `medium`. On diffusion output `fast` is
 # both quicker and measurably closer to the frames the model produced.
-X264_PRESET = "fast"
+X264_PRESET = DEFAULT_X264_PRESET
 
 
 def _x264_auto_thread_count(height: int) -> int:
@@ -387,10 +391,11 @@ def _try_save_cuda_video_direct(
     _, num_frames, height, width = video.shape
     chunk_frames = _cuda_video_conversion_chunk_frames(video)
 
+    encoding = get_x264_encoding_options()
     quality = output_compression / 10 if output_compression is not None else 5
-    if not 1 <= quality <= 10:
+    if encoding.crf is None and not 1 <= quality <= 10:
         return False
-    crf = int((1 - quality / 10.0) * 51)
+    crf = encoding.crf if encoding.crf is not None else int((1 - quality / 10.0) * 51)
 
     audio_np = _normalize_audio_to_numpy(audio)
     tmp_wav_path = None
@@ -433,7 +438,7 @@ def _try_save_cuda_video_direct(
             "-vcodec",
             "libx264",
             "-preset",
-            X264_PRESET,
+            encoding.preset,
             "-pix_fmt",
             "yuv420p",
             "-crf",
@@ -454,7 +459,10 @@ def _try_save_cuda_video_direct(
             )
             command += ["-vf", f"scale={output_width}:{output_height}"]
 
-        command += ["-threads", str(_x264_auto_thread_count(height))]
+        command += [
+            "-threads",
+            str(encoding.threads or _x264_auto_thread_count(height)),
+        ]
         if tmp_wav_path is not None:
             command += [
                 "-acodec",
@@ -587,8 +595,12 @@ def _try_save_cuda_videos_direct(
         available_cpus = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
         available_cpus = os.cpu_count() or 1
+    encoding = get_x264_encoding_options()
     encoder_threads = sorted(
-        (_x264_auto_thread_count(int(video.shape[-2])) for video in videos),
+        (
+            encoding.threads or _x264_auto_thread_count(int(video.shape[-2]))
+            for video in videos
+        ),
         reverse=True,
     )[:_MAX_PARALLEL_CUDA_VIDEO_SAVES]
     if sum(encoder_threads) > available_cpus:
@@ -714,6 +726,7 @@ def _try_save_video_with_audio(
     quality: float,
 ) -> bool:
     """Encode video and audio in one ffmpeg pass when audio is available."""
+    encoding = get_x264_encoding_options()
     audio_np = _normalize_audio_to_numpy(audio)
     if audio_np is None:
         return False
@@ -739,10 +752,10 @@ def _try_save_video_with_audio(
             fps=fps,
             format=output_format,
             codec="libx264",
-            quality=quality,
+            quality=encoding.imageio_quality(quality),
             audio_path=tmp_wav_path,
             audio_codec="aac",
-            output_params=["-preset", X264_PRESET],
+            output_params=encoding.output_params(),
         )
         return True
     except Exception as e:
@@ -957,6 +970,7 @@ def save_materialized_output(
 
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
     if data_type == DataType.VIDEO:
+        encoding = get_x264_encoding_options()
         quality = output_compression / 10 if output_compression is not None else 5
         output_format = data_type.get_default_extension()
         saved_with_audio = _try_save_video_with_audio(
@@ -975,8 +989,8 @@ def save_materialized_output(
                 fps=materialized.fps,
                 format=output_format,
                 codec="libx264",
-                quality=quality,
-                output_params=["-preset", X264_PRESET],
+                quality=encoding.imageio_quality(quality),
+                output_params=encoding.output_params(),
             )
 
             _maybe_mux_audio_into_mp4(

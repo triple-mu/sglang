@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_VIDEO_ENCODING_PRESET: str = "fast"
+    SGLANG_DIFFUSION_VIDEO_ENCODING_CRF: int | None = None
+    SGLANG_DIFFUSION_VIDEO_ENCODING_THREADS: int | None = None
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
@@ -303,6 +306,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    "SGLANG_DIFFUSION_VIDEO_ENCODING_PRESET": _lazy_str(
+        "SGLANG_DIFFUSION_VIDEO_ENCODING_PRESET", "fast"
+    ),
+    "SGLANG_DIFFUSION_VIDEO_ENCODING_CRF": _lazy_int(
+        "SGLANG_DIFFUSION_VIDEO_ENCODING_CRF"
+    ),
+    "SGLANG_DIFFUSION_VIDEO_ENCODING_THREADS": _lazy_int(
+        "SGLANG_DIFFUSION_VIDEO_ENCODING_THREADS"
+    ),
     # Kill-switch for the warmup-calibrated auto residency promotion that runs
     # under `--performance-mode auto` with server warmup. Set to disable the
     # promotion without giving up the rest of the auto performance policy.

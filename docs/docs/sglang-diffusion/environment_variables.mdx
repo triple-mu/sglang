@@ -111,6 +111,32 @@ description: "Configure SGLang diffusion behavior with environment variables."
   </tbody>
 </table>
 
+## MP4 encoding
+
+You can tune the CPU `libx264` encoder independently of model quality and inference
+parallelism. These settings apply to direct CUDA saves, imageio saves, and saves
+with audio. Your FFmpeg build must include `libx264`.
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `SGLANG_DIFFUSION_VIDEO_ENCODING_PRESET` | `fast` | Speed/compression tradeoff. Accepts `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. |
+| `SGLANG_DIFFUSION_VIDEO_ENCODING_CRF` | Unset | Integer `0`–`51`; lower values favor quality and larger files. Overrides request `output_compression` / `output_quality` for video. Unset keeps the existing request-to-CRF conversion. |
+| `SGLANG_DIFFUSION_VIDEO_ENCODING_THREADS` | Unset | Integer `1`–`128` per encoder. Unset keeps the existing thread policy. Explicit values also enter the CPU budget check for concurrent direct CUDA saves. |
+
+For example, set these before starting your existing server or generation command:
+
+```bash
+export SGLANG_DIFFUSION_VIDEO_ENCODING_PRESET=veryfast
+export SGLANG_DIFFUSION_VIDEO_ENCODING_CRF=23
+export SGLANG_DIFFUSION_VIDEO_ENCODING_THREADS=8
+```
+
+The direct CUDA path derives its default thread count from CPU affinity and frame
+height; imageio lets FFmpeg choose. A preset can change the decoded pixels and file
+size even at the same CRF, so compare your clips before changing the deployment
+default. Image output and inference `quality` tiers are unaffected. Remove the
+variables to restore the defaults.
+
 ## Platform-Specific
 
 ### Apple MPS
