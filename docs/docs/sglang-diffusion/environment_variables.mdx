@@ -128,6 +128,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>1</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: adjacent equal-shaped decode windows per forward, <code>0</code>-<code>64</code>; <code>1</code> decodes one window at a time, <code>0</code> groups all of them (opt-in; helps on NVLink hosts, costs time and memory on PCIe hosts).</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: round the decoder output-projection input to fp16 (fp32 accumulation). Read once at load; a lossy deployment-level change outside the quality tiers, independent of <code>--component-quantizations.video_vae fp8</code>.</td>
+    </tr>
   </tbody>
 </table>
 

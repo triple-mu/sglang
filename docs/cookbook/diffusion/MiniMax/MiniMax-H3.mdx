@@ -414,11 +414,12 @@ near 50 dB, so the encoder side follows the approximate tier.
 Nothing is required on the command line beyond a resident SM100+ deployment;
 send `"quality": "extra-high"` in the request (or `--quality extra-high` with
 `sglang generate`). The server logs
-`[H3 VAE] decode fast path mounted: quality=extra-high caps=enc8/dec64/win1`
-when a request mounts the path and `[H3 VAE] decode fast path: used=<n>
-fallback=<m>` when it leaves the scope; a non-zero `fallback` means a kernel
-predicate refused a layout and the reference operator ran instead. A `high`
-request logs the same two lines with `encode` for the visual encoding stage.
+`[H3 VAE] decode fast path mounted: quality=extra-high caps=enc8/dec64/win1 fp8=False`
+when a request mounts the path (`fp8=True` once the FP8 decoder below is
+installed) and `[H3 VAE] decode fast path: used=<n> fallback=<m>` when it
+leaves the scope; a non-zero `fallback` means a kernel predicate refused a
+layout and the reference operator ran instead. A `high` request logs the same
+two lines with `encode` for the visual encoding stage.
 
 The batch caps and a kill switch are environment variables:
 
@@ -441,6 +442,31 @@ change the rounding order, so `extra-high` output is not bit-identical to
 unchanged on 8x SM120, 4 steps); the fast path is never mounted for a
 `lossless` request.
 Benchmarks follow in a later revision.
+
+#### Online FP8 decoder (deployment-level, lossy)
+
+`--component-quantizations.video_vae fp8` converts the 144 linears of the 36
+ViT decoder blocks to FP8 once at load: per-output-channel weight scales,
+per-token activation scales and fp16 outputs through the `sgl_kernel` scaled
+GEMM. The encoder, embedding, norms, attention and output projection keep
+their precision. Startup rejects the flag unless the deployment runs on CUDA
+SM100 or newer, keeps the default fp16 decode autocast (no
+`--component-precisions.video_vae`, no `--disable-autocast`) and holds the
+video VAE resident; pass `--component-residency video_vae=resident` when a
+performance mode would offload it. A conversion failure aborts the load. The
+FP8 GEMMs run at every quality level; `"extra-high"` and `"high"` requests
+additionally run the decoder blocks on fused producers (residual add +
+RMSNorm + FP8 quantization, SiLU-gated activation + FP8 quantization,
+residual add + output LayerNorm) and the mount line reports `fp8=True`.
+
+`SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16=1` rounds the input
+of the decoder output projection to fp16 (fp32 accumulation). It is read once
+at load and works with or without the FP8 decoder.
+
+Both are deployment-level precision changes outside the quality contract:
+`"lossless"` no longer reproduces the reference decoder bit-for-bit, and the
+strict 4xH200 fingerprint behind `"quality": "high"` requires both to be off.
+Measure against a `lossless` server on the target GPU before serving them.
 
 ### Serve MiniMax-H3 on Ascend NPUs
 
@@ -1401,6 +1427,7 @@ fold decision is not node-boundary aware:
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
 - On SM100+ GPUs, `quality: "extra-high"` mounts the quality-gated video VAE decode fast path (decoder tile and window batching, fused Q/K norm+RoPE and output kernels) and `"high"` adds the encoder side (encoder tile batching, fused GroupNorm+SiLU); `lossless` never mounts either. `SGLANG_DIFFUSION_DISABLE_MINIMAX_H3_VAE_FAST_PATH=1` skips the install, and the `SGLANG_DIFFUSION_MINIMAX_H3_VAE_*_BATCH` variables bound the batched work per call.
+- `--component-quantizations.video_vae fp8` (online FP8 decoder, SM100+, resident fp16-autocast video VAE only) and `SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16=1` are deployment-level precision changes applied at load and outside the quality contract: they change the output at every quality level, including `lossless`, and the `quality: "high"` fingerprint requires both to be off. See "Advanced: quality-gated video VAE fast path on Blackwell".
 - Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
 - For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1. Encoder DP stays inside each DiT replica and composes with encoder TP: the H100 TP2 + Ulysses2 recipe has two TP-sharded encoder copies that can split a batch, while the RTX 5090 pure-TP2 recipe has one encoder copy and therefore no additional batch-DP degree. It provides no benefit for a batch of one and is not bitwise-identical to the unsplit deployment.
 - Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
