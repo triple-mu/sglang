@@ -71,6 +71,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Channels-last two-pass GroupNorm(+SiLU) over (N, L, C) rows.",
     ),
     (
+        "diffusion.group_norm_silu_ncthw",
+        KernelBackend.JIT,
+        "norm.group_norm_silu_ncthw_jit:group_norm_silu_ncthw",
+        _CUDA_SM100_PLUS,
+        "Fused fp32 GroupNorm + SiLU over NCTHW, optional per-frame statistics.",
+    ),
+    (
         "diffusion.wan_rmsnorm_silu",
         KernelBackend.TRITON,
         "norm.wan_rmsnorm_silu_triton:wan_rmsnorm_silu",
@@ -536,6 +543,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_group_norm_silu_rows": "norm.group_norm_silu_twopass_triton",
     "group_norm_silu_4d": "norm.group_norm_silu_twopass_triton",
     "group_norm_silu_rows": "norm.group_norm_silu_twopass_triton",
+    "can_use_group_norm_silu_ncthw": "norm.group_norm_silu_ncthw_jit",
+    "group_norm_silu_ncthw": "norm.group_norm_silu_ncthw_jit",
     "can_use_fused_layernorm_modulate": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "can_use_fused_qk_head_layernorm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_layernorm_modulate": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
