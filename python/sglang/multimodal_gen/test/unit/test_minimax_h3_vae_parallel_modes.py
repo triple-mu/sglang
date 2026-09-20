@@ -52,8 +52,12 @@ requires_cuda = pytest.mark.skipif(
 
 
 def _init_kwargs(config: MiniMaxH3VideoVAEConfig):
+    def stub_init(self, **_kwargs):
+        # The real constructor builds the ViT decoder the subclass configures.
+        self.decoder = SimpleNamespace(output_projection_input_dtype=None)
+
     with mock.patch.object(
-        AutoencoderKLLegacy, "__init__", autospec=True, return_value=None
+        AutoencoderKLLegacy, "__init__", autospec=True, side_effect=stub_init
     ) as init:
         model = MiniMaxH3VideoVAE(config)
     return model, init.call_args.kwargs
@@ -102,6 +106,7 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
     assert kwargs["supported_attention_backends"] == {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.TORCH_CUDNN_SDPA,
     }
 
 
