@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # ViT3D decoder for the MiniMax H3 visual VAE (inference-only bundle).
+from __future__ import annotations
+
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -11,6 +14,9 @@ from diffusers.utils import logging
 
 from .base_module import RotaryEmbeddingND, TransformerBlock
 from .vit_utils import create_token_ids, prepare_rotary_pos_emb
+
+if TYPE_CHECKING:
+    from .fast_path import MiniMaxH3VaeFastPath
 
 logger = logging.get_logger(__name__)
 
@@ -218,6 +224,8 @@ class ViT3DDecoder(ViTBase):
 
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        # Filled by minimax_h3_vae_cuda_opt at load; None keeps the eager decoder.
+        self.fast_path: MiniMaxH3VaeFastPath | None = None
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
@@ -261,6 +269,7 @@ class ViT3DDecoder(ViTBase):
         return converted
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fast_path = self.fast_path is not None and self.fast_path.active(x)
         B, C, latent_T, latent_H, latent_W = x.shape
         patch_size = self.config.patch_size
         patch_size_t = self.config.patch_size_t
@@ -306,6 +315,7 @@ class ViT3DDecoder(ViTBase):
             x.device,
             x.dtype,
             rotary_dtype,
+            fast_path,
         )
         cache_record = self._rotary_pos_emb_cache if cache_enabled else None
         cache_hit = cache_record is not None and cache_record[0] == cache_key
@@ -329,6 +339,7 @@ class ViT3DDecoder(ViTBase):
             rotary_pos_emb = prepare_rotary_pos_emb(
                 self.pos_embed(img_ids),
                 dtype=rotary_dtype,
+                allow_batched_native=fast_path,
             )
             if cache_enabled:
                 self._rotary_pos_emb_cache = (
