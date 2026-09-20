@@ -221,8 +221,15 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
 
     def validate_server_args(self, server_args) -> None:
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_path import (
+            resolve_minimax_h3_vae_batch_caps,
+        )
+
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        # Out-of-range SGLANG_DIFFUSION_MINIMAX_H3_VAE_*_BATCH values fail here;
+        # optimize_vae would otherwise swallow them as a load-time warning.
+        resolve_minimax_h3_vae_batch_caps()
         if current_platform.is_mps():
             required_components = (
                 "transformer",
