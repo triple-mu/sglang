@@ -172,6 +172,20 @@ tensor copy per residual site.
 | `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
 | `vdn_delta_factors` | JIT CUDA | `(alpha * inv(I + A), B @ inv(I + A))` in one launch; same fp32 accuracy class as the cholesky + solve_triangular chain (cond-dominated); head_dim 128 |
 
+### MiniMax-H3 VAE output
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `minimax_h3_vae_assemble_tiles` | JIT CUDA | bit-exact vs `AutoencoderKL._assemble_tiles`: ramp blend with the raw tile above, then with the raw tile to the left (the corner reads the un-blended left tile), crop, place; an `[N, B, C, T, H, W]` tile stack in, one contiguous frame out |
+| `minimax_h3_vae_temporal_blend_write` | JIT CUDA | bit-exact vs `blend(overlap, part, frame_overlap, dim=-3)` followed by the slice copy, written straight into the destination frames |
+| `minimax_h3_vae_denorm_clamp` | JIT CUDA | bit-exact vs torchvision `Normalize` + `clamp_(0, 1)`, NaN preserved |
+
+All three spell klvae's `a * (1 - w) + b * w` with one fp32 rounding per op
+and `w = k * (1 / n)` rounded the way aten evaluates a tensor divided by a
+Python int (reciprocal first), on the strided and the 128-bit path alike. The ramp blend is
+the common tiled-VAE pattern and the interface carries no H3 constants, but
+only the MiniMax-H3 VAE is wired to it today. SM100+.
+
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
 | Entry point | Backend | Contract |
