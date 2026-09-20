@@ -239,7 +239,8 @@ def test_scope_mounts_by_quality_and_logs_counters(caplog):
         if "H3 VAE" in record.getMessage()
     ]
     assert messages == [
-        "[H3 VAE] decode fast path mounted: quality=extra-high caps=enc8/dec64/win0",
+        "[H3 VAE] decode fast path mounted: quality=extra-high caps=enc8/dec64/win0 "
+        "fp8=False",
         "[H3 VAE] decode fast path: used=1 fallback=1",
     ]
 
@@ -259,7 +260,8 @@ def test_scope_encode_mounts_only_at_high(caplog):
         if "H3 VAE" in record.getMessage()
     ]
     assert messages == [
-        "[H3 VAE] encode fast path mounted: quality=high caps=enc8/dec64/win0",
+        "[H3 VAE] encode fast path mounted: quality=high caps=enc8/dec64/win0 "
+        "fp8=False",
         "[H3 VAE] encode fast path: used=0 fallback=0",
     ]
 
