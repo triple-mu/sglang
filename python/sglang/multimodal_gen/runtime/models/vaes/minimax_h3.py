@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
     install_fp8_block_linears,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.nvfp4 import (
+    install_mixed_block_linears,
+)
 
 
 class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
@@ -100,6 +103,12 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
     def quantize_decoder_fp8(self) -> int:
         """Replace the 144 decoder block linears with online FP8 modules."""
         return install_fp8_block_linears(self.decoder)
+
+    def quantize_decoder_nvfp4(self) -> int:
+        """FFN linears in online NVFP4, attention linears in online FP8."""
+        return install_mixed_block_linears(
+            self.decoder, backend=envs.SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND
+        )
 
 
 class MiniMaxH3AudioVAE(DacAudioVAE, LayerwiseOffloadableModuleMixin):

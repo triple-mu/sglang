@@ -434,14 +434,14 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         quantization = server_args.component_quantizations.get("video_vae")
         if quantization is None:
             return
-        if quantization != "fp8":
+        if quantization not in ("fp8", "nvfp4"):
             raise ValueError(
                 "MiniMax-H3 video_vae supports only "
-                f"--component-quantizations.video_vae fp8, got {quantization!r}"
+                f"--component-quantizations.video_vae fp8 or nvfp4, got {quantization!r}"
             )
         if not (current_platform.is_cuda() and is_cuda_sm_at_least((10, 0))):
             raise ValueError(
-                "The MiniMax-H3 online FP8 video VAE decoder requires CUDA "
+                "The MiniMax-H3 online FP8/NVFP4 video VAE decoder requires CUDA "
                 "compute capability 10.0 or newer"
             )
         if (

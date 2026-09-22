@@ -421,6 +421,12 @@ class TestVAELoader(unittest.TestCase):
             "fp8",
         )
 
+        h3_args.component_quantizations = {"video_vae": "nvfp4"}
+        self.assertEqual(
+            loader.resolve_component_quantization_override(h3_args, "video_vae"),
+            "nvfp4",
+        )
+
         h3_args.component_quantizations = {"video_vae": "int8"}
         with self.assertRaisesRegex(
             ComponentCheckpointUnsupportedError, "quantization override"
@@ -434,7 +440,12 @@ class TestVAELoader(unittest.TestCase):
         ):
             loader.resolve_component_quantization_override(qwen_args, "vae")
 
-    def test_fp8_override_quantizes_the_h3_decoder_before_optimize_vae(self):
+    def test_quantization_override_quantizes_the_h3_decoder_before_optimize_vae(self):
+        for method in ("fp8", "nvfp4"):
+            with self.subTest(method=method):
+                self._check_h3_decoder_quantization_dispatch(method)
+
+    def _check_h3_decoder_quantization_dispatch(self, method):
         class _H3LikeVAE(nn.Module):
             def __init__(self, *_args, **_kwargs):
                 super().__init__()
@@ -445,13 +456,17 @@ class TestVAELoader(unittest.TestCase):
                 self.calls.append("fp8")
                 return 144
 
+            def quantize_decoder_nvfp4(self):
+                self.calls.append("nvfp4")
+                return 144
+
         def optimize(vae):
             vae.calls.append("optimize")
             return vae
 
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(MiniMaxH3PipelineConfig())
-        server_args.component_quantizations = {"video_vae": "fp8"}
+        server_args.component_quantizations = {"video_vae": method}
         latent_stats = {
             "latents_mean": [0.0] * 24,
             "latents_std": [1.0] * 24,
@@ -480,7 +495,7 @@ class TestVAELoader(unittest.TestCase):
             )
             loaded = loader.load_customized(root, server_args, "video_vae")
 
-        self.assertEqual(loaded.calls, ["fp8", "optimize"])
+        self.assertEqual(loaded.calls, [method, "optimize"])
 
     def test_exact_precision_is_admitted_for_every_vae_component(self):
         loader = vae_loader.VAELoader()

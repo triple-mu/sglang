@@ -527,7 +527,7 @@ class VAELoader(WeightOverrideComponentLoader):
         # other VAE keeps the fail-closed base behavior.
         quantization = server_args.component_quantizations.get(component_name)
         if (
-            quantization == "fp8"
+            quantization in ("fp8", "nvfp4")
             and self.structural_component_type(component_name) in ("vae", "video_vae")
             and isinstance(
                 server_args.pipeline_config.vae_config, MiniMaxH3VideoVAEConfig
@@ -541,10 +541,18 @@ class VAELoader(WeightOverrideComponentLoader):
     def _quantize_decoder_if_requested(
         self, vae, server_args: ServerArgs, component_name: str
     ) -> None:
-        if (
-            self.resolve_component_quantization_override(server_args, component_name)
-            is None
-        ):
+        quantization = self.resolve_component_quantization_override(
+            server_args, component_name
+        )
+        if quantization is None:
+            return
+        if quantization == "nvfp4":
+            swapped = vae.quantize_decoder_nvfp4()
+            logger.info(
+                "VAE: %s holds %d decoder linears in online FP8 with the FFN in NVFP4",
+                component_name,
+                swapped,
+            )
             return
         swapped = vae.quantize_decoder_fp8()
         logger.info(

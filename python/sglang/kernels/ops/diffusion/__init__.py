@@ -229,6 +229,14 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "deployment-gated by the MiniMax-H3 FP8 decoder option.",
     ),
     (
+        "diffusion.minimax_h3_vae_residual_rmsnorm_fp4",
+        KernelBackend.JIT,
+        "norm.minimax_h3_vae_residual_norm_jit:minimax_h3_vae_residual_rmsnorm_fp4",
+        _CUDA_SM100_PLUS,
+        "MiniMax-H3 VAE fp32 residual update + RMSNorm + NVFP4 (E2M1 codes, swizzled "
+        "E4M3 block scales); close; deployment-gated by the MiniMax-H3 NVFP4 decoder option.",
+    ),
+    (
         "diffusion.modulate_scale_shift",
         KernelBackend.JIT,
         "modulate.modulate_scale_shift_jit:modulate_scale_shift",
@@ -417,6 +425,14 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         _CUDA_SM100_PLUS,
         "fp32 silu(gate) * up + dynamic per-token FP8; close; "
         "deployment-gated by the MiniMax-H3 FP8 decoder option.",
+    ),
+    (
+        "diffusion.silu_mul_quant_fp4",
+        KernelBackend.JIT,
+        "activation.silu_mul_quant_fp8_jit:silu_mul_quant_fp4",
+        _CUDA_SM100_PLUS,
+        "fp32 silu(gate + b) * (up + b) + NVFP4 (E2M1 codes, swizzled E4M3 block scales); "
+        "close; deployment-gated by the MiniMax-H3 NVFP4 decoder option.",
     ),
     (
         "diffusion.sparse_linear_attn_fwd",
@@ -742,6 +758,10 @@ _EXPORTS: dict[str, str] = {
     "fused_layernorm_modulate_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_qk_head_layernorm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "is_plain_layer_norm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+    "NVFP4_BLOCK": "norm.minimax_h3_vae_residual_norm_jit",
+    "nvfp4_scale_rows": "norm.minimax_h3_vae_residual_norm_jit",
+    "can_use_minimax_h3_vae_residual_rmsnorm_fp4": "norm.minimax_h3_vae_residual_norm_jit",
+    "minimax_h3_vae_residual_rmsnorm_fp4": "norm.minimax_h3_vae_residual_norm_jit",
     "can_use_minimax_h3_vae_residual_layernorm": "norm.minimax_h3_vae_residual_norm_jit",
     "can_use_minimax_h3_vae_residual_rmsnorm_fp8": "norm.minimax_h3_vae_residual_norm_jit",
     "can_use_minimax_h3_vae_rmsnorm_fp8": "norm.minimax_h3_vae_residual_norm_jit",
@@ -821,6 +841,8 @@ _EXPORTS: dict[str, str] = {
     "fused_bias_silu": "activation.sana_conv_post_triton",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
+    "can_use_silu_mul_quant_fp4": "activation.silu_mul_quant_fp8_jit",
+    "silu_mul_quant_fp4": "activation.silu_mul_quant_fp8_jit",
     "can_use_silu_mul_quant_fp8": "activation.silu_mul_quant_fp8_jit",
     "silu_mul_quant_fp8": "activation.silu_mul_quant_fp8_jit",
     # Diffusion attention kernels
