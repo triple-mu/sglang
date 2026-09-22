@@ -25,6 +25,8 @@ from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+from .nvfp4 import freeze_nvfp4_calibration
+
 logger = init_logger(__name__)
 
 # Blackwell floor of the JIT kernels; the sglang.kernels predicates re-check it.
@@ -122,27 +124,33 @@ def minimax_h3_vae_fast_path_scope(vae, *, quality: str, stage: str):
     else:
         enabled = quality_allows(quality, "lossless")
     state = vae.fast_path
-    with use_vae_fast_path(vae, enabled):
-        if state is None or not enabled:
-            yield
-            return
-        state.used = 0
-        state.fallback = 0
-        logger.info(
-            "[H3 VAE] %s fast path mounted: quality=%s caps=enc%d/dec%d/win%d fp8=%s",
-            stage,
-            quality,
-            state.encoder_tile_batch,
-            state.decoder_tile_batch,
-            state.window_batch,
-            vae.decoder.fp8_installed,
-        )
-        try:
-            yield
-        finally:
+    try:
+        with use_vae_fast_path(vae, enabled):
+            if state is None or not enabled:
+                yield
+                return
+            state.used = 0
+            state.fallback = 0
             logger.info(
-                "[H3 VAE] %s fast path: used=%d fallback=%d",
+                "[H3 VAE] %s fast path mounted: quality=%s caps=enc%d/dec%d/win%d fp8=%s nvfp4=%s",
                 stage,
-                state.used,
-                state.fallback,
+                quality,
+                state.encoder_tile_batch,
+                state.decoder_tile_batch,
+                state.window_batch,
+                vae.decoder.fp8_installed,
+                vae.decoder.nvfp4_installed,
             )
+            try:
+                yield
+            finally:
+                logger.info(
+                    "[H3 VAE] %s fast path: used=%d fallback=%d",
+                    stage,
+                    state.used,
+                    state.fallback,
+                )
+    finally:
+        # The first decode after install ran the eager NVFP4 path; fix its scales.
+        if stage == "decode" and vae.decoder.nvfp4_installed:
+            freeze_nvfp4_calibration(vae.decoder)

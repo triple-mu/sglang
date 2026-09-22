@@ -501,13 +501,29 @@ additionally run the decoder blocks on fused producers (residual add +
 RMSNorm + FP8 quantization, SiLU-gated activation + FP8 quantization,
 residual add + output LayerNorm) and the mount line reports `fp8=True`.
 
+#### Online NVFP4 FFN (deployment-level, lossy)
+
+`--component-quantizations.video_vae nvfp4` keeps the two attention linears of
+each decoder block in the online FP8 above and puts the two FFN linears
+(`ff.w1`, `ff.w2`; 72 of the 144) in NVFP4: E2M1 weights with E4M3 block-16
+scales quantized once at load, E2M1 activations under a per-linear tensor
+scale, fp16 outputs through `flashinfer.mm_fp4`
+(`SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND`, `cudnn` or `cutlass`). The
+activation scales are calibrated on the first decode after load, which runs
+the eager decoder blocks and is slower than the following decodes;
+`"extra-high"` and `"high"` requests after that run fused producers that
+quantize the residual RMSNorm and the SiLU-gated activation straight to NVFP4
+and fold the FFN biases in (the FP4 GEMM has no bias epilogue). The
+deployment gates are those of the FP8 decoder. NVFP4 is coarser than FP8;
+measure the output against a `lossless` server before serving it.
+
 `SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16=1` rounds the input
 of the decoder output projection to fp16 (fp32 accumulation). It is read once
-at load and works with or without the FP8 decoder.
+at load and works with or without the FP8 or NVFP4 decoder.
 
-Both are deployment-level precision changes outside the quality contract:
+All three are deployment-level precision changes outside the quality contract:
 `"exact"` no longer reproduces the reference decoder bit-for-bit, and the
-strict 4xH200 fingerprint behind `"quality": "high"` requires both to be off.
+strict 4xH200 fingerprint behind `"quality": "high"` requires them to be off.
 Measure against an `exact` server on the target GPU before serving them.
 
 ### 8x RTX PRO 5000 (SM120) without NVLink
@@ -581,6 +597,11 @@ sglang serve \
 ```
 
 Requests then add `"quality": "extra-high"` for the FP8 video VAE fast path.
+Swapping `--component-quantizations.video_vae fp8` for `nvfp4` keeps the same
+deployment gates and takes the decode from 1.16 s to 0.97 s on this host (last
+table row below); it adds one more lossy step in the VAE only, 40.3 dB (worst
+frame 39.5 dB) against the FP8 decoder's output, and the FP8 row's byte-exact
+reproduction after the rebase onto `main` shows the DiT stack is unchanged.
 `--warmup-steps` equal to the serving step count lets the online AdaLN rebuild
 prepare the serving plans during warmup; a shorter warmup pushes a 4 s rebuild
 into the first request. Transport overrides: `SGLANG_DIFFUSION_RDMA_ULYSSES_NICS`
@@ -619,6 +640,7 @@ attention for the first ten steps and route with sparsity 0.75 afterwards:
 | PDD 8-step, sparse Sage + RDMA + fusions, Cache-DiT caching steps 4 and 6 (default dynamic settings or the static mask below), lossless VAE | 9 | 8.10 | 841 | 2.25x over the anchor | 20.2 / 18.6 against the PDD anchor, 32.0 / 29.8 against the uncached row |
 | same with Cache-DiT and the FP8 video VAE in one request (`extra-high` plus `enable_cache_dit: true`) | 9 | 7.22 | 812 | 2.53x over the anchor | denoise 5.96 s, decode 1.16 s |
 | same plus fp8 rows out of the fused norms and an fp8 attention-output gather (default) | 9 | 6.98 | 772 | 2.61x over the anchor | 21.1 / 19.8 against the PDD anchor |
+| same with the video VAE decoder's FFN in NVFP4 (`--component-quantizations.video_vae nvfp4`); anchor and this row re-measured on the branch rebased onto main `57826a62ea`, medians of three interleaved runs | 9 | 6.79 | 773 | 2.67x over the same-day anchor (18.11 s) | 21.0 / 19.7 against the PDD anchor, 40.3 / 39.5 against the FP8-VAE row; decode 1.16 s to 0.97 s |
 
 The fl2va task moves the same way: 126.6 s to 61.0 s end to end (2434 to
 1017 ms per step) at 25.6 dB (worst frame 22.6 dB) against the dense run.
@@ -658,8 +680,9 @@ SGLANG_CACHE_DIT_WARMUP=0 SGLANG_CACHE_DIT_FN=1 SGLANG_CACHE_DIT_BN=0
 ```
 
 Runs and logs behind these numbers live under
-`h3-experiments/minimax-h3-sm120-all/2026-09-26/` in the maintainer's
-experiment tree.
+`h3-experiments/minimax-h3-sm120-all/2026-09-26/` and, for the rebased
+anchor and NVFP4 rows, `exps/model/2026-10-05-minimax-h3-all-opt-sm120/` in
+the maintainer's experiment tree.
 
 ### Serve MiniMax-H3 on Ascend NPUs
 
@@ -1702,7 +1725,7 @@ fold decision is not node-boundary aware:
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
 - On SM100+ GPUs, `quality: "lossless"` (the default) mounts the quality-gated video VAE decode fast path (decoder tile and window batching, fused Q/K norm+RoPE and output kernels) and `"high"` adds the encoder side (encoder tile batching, fused GroupNorm+SiLU); `lossless` never mounts either. `SGLANG_DIFFUSION_DISABLE_MINIMAX_H3_VAE_FAST_PATH=1` skips the install, and the `SGLANG_DIFFUSION_MINIMAX_H3_VAE_*_BATCH` variables bound the batched work per call.
-- `--component-quantizations.video_vae fp8` (online FP8 decoder, SM100+, resident fp16-autocast video VAE only) and `SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16=1` are deployment-level precision changes applied at load and outside the quality contract: they change the output at every quality level, including `lossless`, and the `quality: "high"` fingerprint requires both to be off. See "Advanced: quality-gated video VAE fast path on Blackwell".
+- `--component-quantizations.video_vae fp8` (online FP8 decoder, SM100+, resident fp16-autocast video VAE only), `--component-quantizations.video_vae nvfp4` (FP8 decoder with the FFN linears in NVFP4, same gates) and `SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16=1` are deployment-level precision changes applied at load and outside the quality contract: they change the output at every quality level, including `lossless`, and the `quality: "high"` fingerprint requires both to be off. See "Advanced: quality-gated video VAE fast path on Blackwell".
 - Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
 - For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1. Encoder DP stays inside each DiT replica and composes with encoder TP: the H100 TP2 + Ulysses2 recipe has two TP-sharded encoder copies that can split a batch, while the RTX 5090 pure-TP2 recipe has one encoder copy and therefore no additional batch-DP degree. It provides no benefit for a batch of one and is not bitwise-identical to the unsplit deployment.
 - Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.

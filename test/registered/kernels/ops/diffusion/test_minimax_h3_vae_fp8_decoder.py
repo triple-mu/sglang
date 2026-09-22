@@ -7,6 +7,7 @@ half-input fp32-output projection GEMM and the load-time installer on the
 released 36-block topology are checked on their own.
 """
 
+import copy
 import sys
 
 import pytest
@@ -35,6 +36,11 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_path im
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
     MiniMaxH3FP8Linear,
     install_fp8_block_linears,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.nvfp4 import (
+    MiniMaxH3NVFP4Linear,
+    freeze_nvfp4_calibration,
+    install_mixed_block_linears,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_vit import (
     ViT3DDecoder,
@@ -174,6 +180,114 @@ def test_two_real_decoder_blocks(backend, stub_server_args, record_property):
     assert relative_rms < 0.01
     assert cosine > 0.99995
     torch.testing.assert_close(actual, reference, atol=0.075, rtol=0.02)
+
+
+def _quality(record_property, actual, reference, prefix):
+    relative_rms = (
+        ((actual - reference).square().mean() / reference.square().mean()).sqrt().item()
+    )
+    cosine = F.cosine_similarity(actual.flatten(), reference.flatten(), dim=0).item()
+    record_property(f"{prefix}_relative_rms", relative_rms)
+    record_property(f"{prefix}_cosine", cosine)
+    return relative_rms, cosine
+
+
+def test_two_real_decoder_blocks_nvfp4_ffn(stub_server_args, record_property):
+    """NVFP4 FFN linears: the uncalibrated blocks stay eager and record their
+    activation scales; once frozen, the fused NVFP4 producers (w1 bias folded
+    into the activation kernel, w2 bias pending into the next norm) track the
+    calibrated eager path."""
+    with global_force_attn_backend_context_manager(AttentionBackendEnum.TORCH_CUDNN_SDPA):
+        decoder = _released_decoder(num_layers=2).cuda().eval()
+    decoder.prepare_autocast_linear_weights(torch.float16)
+    for block in decoder.transformer_blocks:
+        block.scale1.uniform_(0.2, 0.8)
+        block.scale2.uniform_(0.2, 0.8)
+        block.norm1.weight.uniform_(0.8, 1.2)
+        block.norm2.weight.uniform_(0.8, 1.2)
+    half_precision = copy.deepcopy(decoder)
+    for block in decoder.transformer_blocks:
+        block.attn.to_qkv = MiniMaxH3FP8Linear(block.attn.to_qkv)
+        block.attn.to_out = MiniMaxH3FP8Linear(block.attn.to_out)
+        block.ff.w1 = MiniMaxH3NVFP4Linear(block.ff.w1, backend="cudnn")
+        block.ff.w2 = MiniMaxH3NVFP4Linear(block.ff.w2, backend="cudnn")
+    decoder.fp8_installed = True
+    decoder.nvfp4_installed = True
+    state = _mount_fast_path(decoder)
+    value = torch.randn(2, 65, 2048, device="cuda")
+    token_ids = torch.randn(2, 65, 3, device="cuda")
+    rope = prepare_rotary_pos_emb(
+        decoder.pos_embed(token_ids), dtype=torch.float16, allow_batched_native=True
+    )
+
+    def eager(model):
+        out = value
+        for block in model.transformer_blocks:
+            out = block(out, rope)
+        return model.norm_out(out)
+
+    with set_forward_context(0, None), torch.autocast("cuda", dtype=torch.float16):
+        with use_vae_fast_path(decoder, False):
+            half_reference = eager(half_precision)
+            assert not fused_decoder.can_use_fused_decoder(decoder, value, rope)
+            calibration = eager(decoder)
+            assert freeze_nvfp4_calibration(decoder) == 4
+            assert freeze_nvfp4_calibration(decoder) == 0
+            reference = eager(decoder)
+        with use_vae_fast_path(decoder, True):
+            assert fused_decoder.can_use_fused_decoder(decoder, value, rope)
+            pending = value
+            for block in decoder.transformer_blocks:
+                pending = fused_decoder.block_forward(block, pending, rope)
+                assert isinstance(pending, fused_decoder.ResidualPending)
+                assert pending.bias is block.ff.w2.bias_fp32
+            actual = fused_decoder.finish(pending, decoder.norm_out)
+    assert (state.used, state.fallback) == (3, 0)
+    assert actual.dtype == torch.float32 and actual.shape == reference.shape
+    record_error(record_property, actual, reference)
+    # Same NVFP4 weights and input scales; the fused path quantizes the fp32
+    # producer values instead of fp16-rounded ones, so a few blocks land in
+    # neighbouring E2M1 / E4M3 bins.
+    relative_rms, cosine = _quality(record_property, actual, reference, "fused_vs_eager")
+    assert relative_rms < 0.02
+    assert cosine > 0.9998
+    # Both NVFP4 paths against the unquantized fp16 decoder, for the record.
+    _quality(record_property, reference, half_reference, "eager_vs_fp16")
+    _quality(record_property, actual, half_reference, "fused_vs_fp16")
+    _quality(record_property, calibration, half_reference, "calibration_vs_fp16")
+
+
+def test_install_mixed_block_linears_puts_the_ffn_in_nvfp4(stub_server_args):
+    """The installer converts the 36 x 2 FFN linears to NVFP4 and the 36 x 2
+    attention linears to FP8, once, with storage that survives dtype scopes."""
+    with torch.device("cuda"):
+        decoder = _released_decoder(num_layers=36).eval()
+    assert install_mixed_block_linears(decoder, backend="cudnn") == 144
+    assert decoder.fp8_installed and decoder.nvfp4_installed
+    nvfp4 = [m for m in decoder.modules() if isinstance(m, MiniMaxH3NVFP4Linear)]
+    fp8 = [m for m in decoder.modules() if isinstance(m, MiniMaxH3FP8Linear)]
+    assert len(nvfp4) == 72 and len(fp8) == 72
+    assert {(m.out_features, m.in_features) for m in nvfp4} == {(16384, 2048), (2048, 8192)}
+    assert all(
+        m.weight.dtype == torch.uint8
+        and m.weight.shape == (m.out_features, m.in_features // 2)
+        and m.weight_scale.dtype == torch.uint8
+        and m.weight_scale.shape == (m.out_features, m.in_features // 16)
+        and m.bias.dtype == torch.float16
+        and m.bias_fp32.dtype == torch.float32
+        and not m.calibrated
+        for m in nvfp4
+    )
+    assert freeze_nvfp4_calibration(decoder) == 0
+    assert install_mixed_block_linears(decoder, backend="cudnn") == 0
+    assert install_fp8_block_linears(decoder) == 0
+    assert decoder.prepare_autocast_linear_weights(torch.float16) == 0
+    decoder.half()
+    assert all(m.weight.dtype == torch.uint8 and m.weight_scale.dtype == torch.uint8 for m in nvfp4)
+    with pytest.raises(ValueError, match="backend"):
+        MiniMaxH3NVFP4Linear(
+            torch.nn.Linear(2048, 2048, device="cuda", dtype=torch.float16), backend="trtllm"
+        )
 
 
 def test_install_fp8_block_linears_swaps_the_released_144_linears(stub_server_args):

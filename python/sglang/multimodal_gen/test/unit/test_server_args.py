@@ -2915,7 +2915,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
 
     def test_video_vae_rejects_non_fp8_quantization(self):
         with self.assertRaisesRegex(
-            ValueError, r"--component-quantizations\.video_vae fp8, got 'int8'"
+            ValueError, r"--component-quantizations\.video_vae fp8 or nvfp4, got 'int8'"
         ):
             self._from_dict_with_pipeline_config(
                 MiniMaxH3PipelineConfig(),
@@ -2925,6 +2925,36 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                     "component_quantizations": {"video_vae": "int8"},
                 },
             )
+
+    def test_video_vae_nvfp4_override_shares_the_fp8_gates(self):
+        sm_gate = (
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "is_cuda_sm_at_least"
+        )
+        base = {
+            "model_path": "MiniMaxAI/MiniMax-H3",
+            "num_gpus": 4,
+            "ulysses_degree": 4,
+            "component_quantizations": {"video_vae": "nvfp4"},
+        }
+        with patch(sm_gate, return_value=False):
+            with self.assertRaisesRegex(ValueError, "compute capability 10.0"):
+                self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(), kwargs=base
+                )
+        with patch(sm_gate, return_value=True):
+            with self.assertRaisesRegex(
+                ValueError, "--component-residency video_vae=resident"
+            ):
+                self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(),
+                    kwargs={**base, "performance_mode": "memory"},
+                )
+            args = self._from_dict_with_pipeline_config(
+                MiniMaxH3PipelineConfig(),
+                kwargs={**base, "performance_mode": "speed"},
+            )
+        self.assertEqual(args.component_quantizations, {"video_vae": "nvfp4"})
 
     def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(

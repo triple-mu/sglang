@@ -20,21 +20,28 @@ from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     can_use_minimax_h3_vae_rmsnorm_fp8,
     minimax_h3_vae_residual_layernorm,
+    minimax_h3_vae_residual_rmsnorm_fp4,
     minimax_h3_vae_residual_rmsnorm_fp8,
     minimax_h3_vae_rmsnorm_fp8,
+    silu_mul_quant_fp4,
     silu_mul_quant_fp8,
 )
 
 from .attention import _weightless_rmsnorm
 from .fp8 import MiniMaxH3FP8Linear
+from .nvfp4 import MiniMaxH3NVFP4Linear
 
 
 class ResidualPending(NamedTuple):
-    """``residual + projected * scale`` left for the next norm kernel to apply."""
+    """``residual + (projected + bias) * scale`` left for the next norm kernel to apply.
+
+    ``bias`` is the down-projection bias an NVFP4 GEMM could not add; None for FP8.
+    """
 
     residual: torch.Tensor
     projected: torch.Tensor
     scale: torch.Tensor
+    bias: torch.Tensor | None = None
 
 
 def _vector(value, size, device) -> bool:
@@ -89,10 +96,13 @@ def _block_ok(block, *, fast_path, width, dim_head, device) -> bool:
         return False
     if not (block.ff.use_gated and isinstance(block.ff.act_fn, nn.SiLU)):
         return False
-    return all(
-        isinstance(module, MiniMaxH3FP8Linear)
-        for module in (attn.to_qkv, attn.to_out, block.ff.w1, block.ff.w2)
-    )
+    if not all(isinstance(module, MiniMaxH3FP8Linear) for module in (attn.to_qkv, attn.to_out)):
+        return False
+    ffn = (block.ff.w1, block.ff.w2)
+    if all(isinstance(module, MiniMaxH3NVFP4Linear) for module in ffn):
+        # Uncalibrated NVFP4 runs the eager blocks once to record its activation scales.
+        return all(module.calibrated for module in ffn)
+    return all(isinstance(module, MiniMaxH3FP8Linear) for module in ffn)
 
 
 def can_use_fused_decoder(decoder, value, rope) -> bool:
@@ -143,7 +153,12 @@ def _quantized_input(value, norm):
     """fp32 residual plus the FP8 rows of ``RMSNorm(residual) * weight``."""
     if isinstance(value, ResidualPending):
         return minimax_h3_vae_residual_rmsnorm_fp8(
-            value.residual, value.projected, value.scale, norm.weight, eps=norm.eps
+            value.residual,
+            value.projected,
+            value.scale,
+            norm.weight,
+            eps=norm.eps,
+            projected_bias=value.bias,
         )
     q, scales = minimax_h3_vae_rmsnorm_fp8(value, norm.weight, eps=norm.eps)
     return value, q, scales
@@ -168,6 +183,8 @@ def block_forward(module, value, rope):
     residual, q, scales = _quantized_input(value, module.norm1)
     shape = tuple(residual.shape)
     projected = _attention(module.attn, q, scales, shape, rope)
+    if isinstance(module.ff.w1, MiniMaxH3NVFP4Linear):
+        return _ffn_nvfp4(module, residual, projected, shape)
     residual, q, scales = minimax_h3_vae_residual_rmsnorm_fp8(
         residual, projected, module.scale1, module.norm2.weight, eps=module.norm2.eps
     )
@@ -181,6 +198,29 @@ def block_forward(module, value, rope):
     return ResidualPending(residual, projected, module.scale2)
 
 
+def _ffn_nvfp4(module, residual, projected, shape):
+    """FFN on NVFP4 producers; the w1 bias enters the activation kernel, the w2 bias stays pending."""
+    w1, w2 = module.ff.w1, module.ff.w2
+    residual, codes, scales = minimax_h3_vae_residual_rmsnorm_fp4(
+        residual,
+        projected,
+        module.scale1,
+        module.norm2.weight,
+        eps=module.norm2.eps,
+        global_scale=w1.input_global_scale_value,
+    )
+    expanded = w1.forward_quantized(codes, scales, shape)
+    half = expanded.shape[-1] // 2
+    codes, scales = silu_mul_quant_fp4(
+        expanded,
+        global_scale=w2.input_global_scale_value,
+        gate_bias=w1.bias_fp32[:half],
+        up_bias=w1.bias_fp32[half:],
+    )
+    projected = w2.forward_quantized(codes, scales, (*shape[:-1], half))
+    return ResidualPending(residual, projected, module.scale2, w2.bias_fp32)
+
+
 def finish(value, norm):
     return minimax_h3_vae_residual_layernorm(
         value.residual,
@@ -189,6 +229,7 @@ def finish(value, norm):
         norm.weight,
         norm.bias,
         eps=norm.eps,
+        projected_bias=value.bias,
     )
 
 

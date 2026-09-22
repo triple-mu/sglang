@@ -328,6 +328,8 @@ class ViT3DDecoder(ViTBase):
         self.fast_path: MiniMaxH3VaeFastPath | None = None
         # True once fp8.install_fp8_block_linears has swapped the block linears.
         self.fp8_installed = False
+        # True once nvfp4.install_mixed_block_linears put the FFN linears in NVFP4.
+        self.nvfp4_installed = False
         # torch.float16 rounds the proj_out input to half with fp32 accumulation
         # (SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16); None keeps fp32.
         self.output_projection_input_dtype: torch.dtype | None = None
