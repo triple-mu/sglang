@@ -271,7 +271,7 @@ def test_scope_mounts_by_quality_and_logs_counters(caplog):
     ]
     assert messages == [
         "[H3 VAE] decode fast path mounted: quality=extra-high caps=enc8/dec64/win0 "
-        "fp8=False",
+        "fp8=False nvfp4=False",
         "[H3 VAE] decode fast path: used=1 fallback=1",
     ]
 
@@ -292,7 +292,7 @@ def test_scope_encode_mounts_only_at_high(caplog):
     ]
     assert messages == [
         "[H3 VAE] encode fast path mounted: quality=high caps=enc8/dec64/win0 "
-        "fp8=False",
+        "fp8=False nvfp4=False",
         "[H3 VAE] encode fast path: used=0 fallback=0",
     ]
 

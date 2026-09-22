@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_DECODER_TILE_BATCH: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_WINDOW_BATCH: int = 1
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND: str = "cudnn"
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -347,6 +348,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp16 input for the decoder output projection (lossy, deployment-level).
     "SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16"
+    ),
+    # flashinfer.mm_fp4 backend of the online NVFP4 FFN linears: cudnn | cutlass.
+    "SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND", "cudnn"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

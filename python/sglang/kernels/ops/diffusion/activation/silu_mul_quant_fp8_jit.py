@@ -59,6 +59,78 @@ def _jit_silu_mul_quant_fp8_module(dtype: torch.dtype, width: int) -> Module:
     )
 
 
+@cache_once
+def _jit_silu_mul_quant_fp4_module(dtype: torch.dtype, width: int) -> Module:
+    if dtype not in _DTYPES:
+        raise RuntimeError(f"Unsupported dtype {dtype}; expected float16 or bfloat16")
+    if width <= 0 or width % _WIDTH_MULTIPLE != 0 or width > _MAX_WIDTH:
+        raise RuntimeError(
+            f"Unsupported output width {width}; expected a multiple of "
+            f"{_WIDTH_MULTIPLE} up to {_MAX_WIDTH}"
+        )
+    args = make_cpp_args(dtype, width)
+    return load_jit(
+        "diffusion_silu_mul_quant_fp4",
+        *args,
+        cuda_files=["diffusion/silu_mul_quant_fp8.cuh"],
+        cuda_wrappers=[
+            (
+                "silu_mul_quant_fp4",
+                f"silu_mul_quant_fp8::SiluMulQuantFp4Kernel<{args}>::run",
+            )
+        ],
+    )
+
+
+@register_custom_op(mutates_args=["out_q4", "out_sf"])
+def silu_mul_quant_fp4_raw(
+    x: torch.Tensor,
+    gate_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+    out_q4: torch.Tensor,
+    out_sf: torch.Tensor,
+    global_scale: float,
+) -> None:
+    """``out_q4, out_sf = nvfp4(silu(gate + gate_bias) * (up + up_bias))`` on ``[gate | up]`` rows."""
+    module = _jit_silu_mul_quant_fp4_module(x.dtype, out_q4.shape[-1] * 2)
+    module.silu_mul_quant_fp4(x, gate_bias, up_bias, out_q4, out_sf, global_scale)
+
+
+def silu_mul_quant_fp4(
+    x: torch.Tensor,
+    *,
+    global_scale: float,
+    gate_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(q4, sf)``: packed E2M1 codes ``[M, width / 2]`` (uint8) and
+    128x4-swizzled E4M3 block scales ``[ceil(M / 128) * 128, width / 16]`` (uint8)
+    for ``flashinfer.mm_fp4``; the up-projection biases are folded in."""
+    width = x.shape[-1] // 2
+    rows = x.view(-1, 2 * width)
+    out_q4 = torch.empty((rows.shape[0], width // 2), dtype=torch.uint8, device=x.device)
+    scale_rows = (rows.shape[0] + 127) // 128 * 128
+    out_sf = torch.empty((scale_rows, width // 16), dtype=torch.uint8, device=x.device)
+    silu_mul_quant_fp4_raw(rows, gate_bias, up_bias, out_q4, out_sf, float(global_scale))
+    return out_q4, out_sf
+
+
+def can_use_silu_mul_quant_fp4(
+    x: torch.Tensor, gate_bias: torch.Tensor, up_bias: torch.Tensor, *, global_scale: float
+) -> bool:
+    width = x.shape[-1] // 2 if x.dim() >= 2 else 0
+    return (
+        can_use_silu_mul_quant_fp8(x)
+        and width % 64 == 0
+        and global_scale > 0
+        and all(
+            b.shape == (width,) and b.dtype == torch.float32 and b.device == x.device
+            and b.is_contiguous() and b.data_ptr() % _ALIGNMENT == 0
+            for b in (gate_bias, up_bias)
+        )
+    )
+
+
 @register_custom_op(mutates_args=["out_q", "out_s"])
 def silu_mul_quant_fp8_raw(
     x: torch.Tensor, out_q: torch.Tensor, out_s: torch.Tensor
@@ -96,7 +168,10 @@ def can_use_silu_mul_quant_fp8(x: torch.Tensor) -> bool:
 
 
 __all__ = [
+    "can_use_silu_mul_quant_fp4",
     "can_use_silu_mul_quant_fp8",
+    "silu_mul_quant_fp4",
+    "silu_mul_quant_fp4_raw",
     "silu_mul_quant_fp8",
     "silu_mul_quant_fp8_raw",
 ]

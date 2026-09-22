@@ -11,6 +11,8 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
+#include "minimax_h3_vae_nvfp4.cuh"
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -25,6 +27,7 @@ enum class NormMode : int32_t {
   kRmsNormFp8 = 0,          ///< q, s = fp8(RMSNorm(x) * weight)
   kResidualRmsNormFp8 = 1,  ///< r = fma(projected, layer_scale, x); q, s = fp8(RMSNorm(r) * weight)
   kResidualLayerNorm = 2,   ///< out = LayerNorm(fma(projected, layer_scale, x)) * weight + bias
+  kResidualRmsNormFp4 = 3,  ///< r = fma(projected, layer_scale, x); q4, sf = nvfp4(RMSNorm(r) * weight)
 };
 
 /// One CTA per row; the fp32 row stays in registers between the two passes.
@@ -41,6 +44,7 @@ template <typename T, typename U>
 struct Params {
   const T* __restrict__ x;                ///< [rows, kWidth]
   const U* __restrict__ projected;        ///< [rows, kWidth]; residual modes only
+  const float* __restrict__ projected_bias;  ///< [kWidth] added to `projected` first, or nullptr; residual modes
   const float* __restrict__ layer_scale;  ///< [kWidth]; residual modes only
   const float* __restrict__ weight;       ///< [kWidth]
   const float* __restrict__ bias;         ///< [kWidth]; kResidualLayerNorm only
@@ -48,6 +52,9 @@ struct Params {
   fp8_e4m3_t* __restrict__ out_q;         ///< [rows, kWidth]; FP8 modes only
   float* __restrict__ out_s;              ///< [rows]; FP8 modes only
   float* __restrict__ out;                ///< [rows, kWidth]; kResidualLayerNorm only
+  uint8_t* __restrict__ out_q4;           ///< [rows, kWidth / 2] packed E2M1; kResidualRmsNormFp4 only
+  uint8_t* __restrict__ out_sf;           ///< [rows_pad, kWidth / 16] swizzled E4M3; kResidualRmsNormFp4 only
+  float global_scale;                     ///< NVFP4 tensor scale of the produced activation
   float eps;
 };
 
@@ -73,6 +80,9 @@ __global__ void __launch_bounds__(kBlockSize) residual_norm_kernel(const Params<
   constexpr uint32_t kPerThread = kSteps * kVecSize;
   constexpr bool kResidual = kMode != NormMode::kRmsNormFp8;
   constexpr bool kLayerNorm = kMode == NormMode::kResidualLayerNorm;
+  constexpr bool kFp4 = kMode == NormMode::kResidualRmsNormFp4;
+  constexpr bool kResidualOut = kMode == NormMode::kResidualRmsNormFp8 || kFp4;
+  static_assert(!kFp4 || kVecSize == 4, "the NVFP4 epilogue groups four lanes into one 16-element block");
   using XVec = AlignedVector<T, kVecSize>;
   using PVec = AlignedVector<U, kVecSize>;
   using FVec = AlignedVector<float, kVecSize>;
@@ -95,25 +105,36 @@ __global__ void __launch_bounds__(kBlockSize) residual_norm_kernel(const Params<
     x_vec.load(params.x + row_offset, chunk);
     [[maybe_unused]] PVec projected_vec;
     [[maybe_unused]] FVec layer_scale_vec;
+    [[maybe_unused]] FVec projected_bias_vec;
+    [[maybe_unused]] bool has_bias = false;
     if constexpr (kResidual) {
       projected_vec.load(params.projected + row_offset, chunk);
       layer_scale_vec.load(params.layer_scale, chunk);
+      // A GEMM whose epilogue cannot add the bias (NVFP4) leaves it to the consumer.
+      has_bias = params.projected_bias != nullptr;
+      if (has_bias) {
+        projected_bias_vec.load(params.projected_bias, chunk);
+      }
     }
     [[maybe_unused]] FVec residual_vec;
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize; ++i) {
       float value = cast<fp32_t>(x_vec[i]);
       if constexpr (kResidual) {
-        value = fmaf(cast<fp32_t>(projected_vec[i]), layer_scale_vec[i], value);
+        float projected = cast<fp32_t>(projected_vec[i]);
+        if (has_bias) {
+          projected += projected_bias_vec[i];
+        }
+        value = fmaf(projected, layer_scale_vec[i], value);
       }
       values[step * kVecSize + i] = value;
       sum += value;
       sum_sq = fmaf(value, value, sum_sq);
-      if constexpr (kMode == NormMode::kResidualRmsNormFp8) {
+      if constexpr (kResidualOut) {
         residual_vec[i] = value;
       }
     }
-    if constexpr (kMode == NormMode::kResidualRmsNormFp8) {
+    if constexpr (kResidualOut) {
       residual_vec.store(params.residual_out + row_offset, chunk);
     }
   }
@@ -161,7 +182,34 @@ __global__ void __launch_bounds__(kBlockSize) residual_norm_kernel(const Params<
     }
   }
 
-  if constexpr (!kLayerNorm) {
+  if constexpr (kFp4) {
+    // Four consecutive lanes of one step hold the 16 elements of one scale block.
+    namespace nvfp4 = minimax_h3_vae_nvfp4;
+    constexpr uint32_t kNumBlocks = kWidth / nvfp4::kBlock;
+    uint8_t* q_row = params.out_q4 + static_cast<int64_t>(blockIdx.x) * (kWidth / 2);
+#pragma unroll
+    for (uint32_t step = 0; step < kSteps; ++step) {
+      const uint32_t chunk = step * kBlockSize + threadIdx.x;
+      float block_amax = 0.0f;
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize; ++i) {
+        block_amax = math::max(block_amax, math::abs(values[step * kVecSize + i]));
+      }
+      block_amax = math::max(block_amax, __shfl_xor_sync(0xffffffffu, block_amax, 1));
+      block_amax = math::max(block_amax, __shfl_xor_sync(0xffffffffu, block_amax, 2));
+      const fp8_e4m3_t sf = nvfp4::block_scale(block_amax, params.global_scale);
+      const float multiplier = nvfp4::quant_multiplier(sf, params.global_scale);
+      if ((threadIdx.x & 3u) == 0u) {
+        params.out_sf[nvfp4::sf_offset_128x4(blockIdx.x, chunk >> 2, kNumBlocks)] =
+            *reinterpret_cast<const uint8_t*>(&sf);
+      }
+      const uint16_t packed =
+          static_cast<uint16_t>(nvfp4::pack2(values[step * kVecSize], values[step * kVecSize + 1], multiplier)) |
+          (static_cast<uint16_t>(nvfp4::pack2(values[step * kVecSize + 2], values[step * kVecSize + 3], multiplier))
+           << 8);
+      reinterpret_cast<uint16_t*>(q_row)[chunk] = packed;
+    }
+  } else if constexpr (!kLayerNorm) {
     cta::reduce_max(amax, smem_amax);
     __syncthreads();
     const float scale = smem_amax[0] / math::FP8_E4M3_MAX;
@@ -196,6 +244,19 @@ void verify_vector(tvm::ffi::TensorView view, host::SymbolicDevice& device) {
 
 inline void verify_scales(tvm::ffi::TensorView view, host::SymbolicSize& rows, host::SymbolicDevice& device) {
   host::TensorMatcher({rows, 1}).with_dtype<fp32_t>().with_device(device).verify(view);
+}
+
+template <uint32_t kWidth>
+void verify_nvfp4_outputs(
+    tvm::ffi::TensorView out_q4, tvm::ffi::TensorView out_sf, host::SymbolicSize& rows, host::SymbolicDevice& device) {
+  namespace nvfp4 = minimax_h3_vae_nvfp4;
+  static_assert(kWidth % (nvfp4::kBlock * 4) == 0, "NVFP4 rows need a multiple of four scale blocks");
+  host::TensorMatcher({rows, kWidth / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(kAlignment).verify(out_q4);
+  auto sf_rows = host::SymbolicSize{"sf_rows"};
+  host::TensorMatcher({sf_rows, kWidth / nvfp4::kBlock}).with_dtype<uint8_t>().with_device(device).verify(out_sf);
+  const int64_t needed = (rows.unwrap() + nvfp4::kScaleRowTile - 1) / nvfp4::kScaleRowTile * nvfp4::kScaleRowTile;
+  CHECK_HOST(sf_rows.unwrap() >= needed)
+      << "minimax_h3_vae_residual_norm: NVFP4 scale tensor needs " << needed << " rows, got " << sf_rows.unwrap();
 }
 
 template <typename T, typename U, uint32_t kWidth, NormMode kMode>
@@ -242,6 +303,7 @@ struct RmsNormFp8Kernel {
     const Params<T, T> params{
         .x = static_cast<const T*>(x.data_ptr()),
         .projected = nullptr,
+        .projected_bias = nullptr,
         .layer_scale = nullptr,
         .weight = static_cast<const float*>(weight.data_ptr()),
         .bias = nullptr,
@@ -249,6 +311,9 @@ struct RmsNormFp8Kernel {
         .out_q = static_cast<fp8_e4m3_t*>(out_q.data_ptr()),
         .out_s = static_cast<float*>(out_s.data_ptr()),
         .out = nullptr,
+        .out_q4 = nullptr,
+        .out_sf = nullptr,
+        .global_scale = 0.0f,
         .eps = static_cast<float>(eps),
     };
     details::launch<T, T, kWidth, NormMode::kRmsNormFp8>(params, rows, device);
@@ -283,6 +348,45 @@ struct ResidualRmsNormFp8Kernel {
       tvm::ffi::TensorView out_q,
       tvm::ffi::TensorView out_s,
       double eps) {
+    run_impl(x, projected, nullptr, layer_scale, weight, residual_out, out_q, out_s, eps);
+  }
+
+  /// `projected` gets `projected_bias` ([kWidth] fp32) added before the LayerScale fma.
+  static void run_bias(
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView projected,
+      tvm::ffi::TensorView projected_bias,
+      tvm::ffi::TensorView layer_scale,
+      tvm::ffi::TensorView weight,
+      tvm::ffi::TensorView residual_out,
+      tvm::ffi::TensorView out_q,
+      tvm::ffi::TensorView out_s,
+      double eps) {
+    auto device = host::SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    details::verify_vector<kWidth>(projected_bias, device);
+    run_impl(
+        x,
+        projected,
+        static_cast<const float*>(projected_bias.data_ptr()),
+        layer_scale,
+        weight,
+        residual_out,
+        out_q,
+        out_s,
+        eps);
+  }
+
+  static void run_impl(
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView projected,
+      const float* projected_bias,
+      tvm::ffi::TensorView layer_scale,
+      tvm::ffi::TensorView weight,
+      tvm::ffi::TensorView residual_out,
+      tvm::ffi::TensorView out_q,
+      tvm::ffi::TensorView out_s,
+      double eps) {
     using namespace host;
     auto rows = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
@@ -298,6 +402,7 @@ struct ResidualRmsNormFp8Kernel {
     const Params<T, U> params{
         .x = static_cast<const T*>(x.data_ptr()),
         .projected = static_cast<const U*>(projected.data_ptr()),
+        .projected_bias = projected_bias,
         .layer_scale = static_cast<const float*>(layer_scale.data_ptr()),
         .weight = static_cast<const float*>(weight.data_ptr()),
         .bias = nullptr,
@@ -305,6 +410,9 @@ struct ResidualRmsNormFp8Kernel {
         .out_q = static_cast<fp8_e4m3_t*>(out_q.data_ptr()),
         .out_s = static_cast<float*>(out_s.data_ptr()),
         .out = nullptr,
+        .out_q4 = nullptr,
+        .out_sf = nullptr,
+        .global_scale = 0.0f,
         .eps = static_cast<float>(eps),
     };
     details::launch<T, U, kWidth, NormMode::kResidualRmsNormFp8>(params, rows, device);
@@ -337,6 +445,34 @@ struct ResidualLayerNormKernel {
       tvm::ffi::TensorView bias,
       tvm::ffi::TensorView out,
       double eps) {
+    run_impl(x, projected, nullptr, layer_scale, weight, bias, out, eps);
+  }
+
+  /// `projected` gets `projected_bias` ([kWidth] fp32) added before the LayerScale fma.
+  static void run_bias(
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView projected,
+      tvm::ffi::TensorView projected_bias,
+      tvm::ffi::TensorView layer_scale,
+      tvm::ffi::TensorView weight,
+      tvm::ffi::TensorView bias,
+      tvm::ffi::TensorView out,
+      double eps) {
+    auto device = host::SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    details::verify_vector<kWidth>(projected_bias, device);
+    run_impl(x, projected, static_cast<const float*>(projected_bias.data_ptr()), layer_scale, weight, bias, out, eps);
+  }
+
+  static void run_impl(
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView projected,
+      const float* projected_bias,
+      tvm::ffi::TensorView layer_scale,
+      tvm::ffi::TensorView weight,
+      tvm::ffi::TensorView bias,
+      tvm::ffi::TensorView out,
+      double eps) {
     using namespace host;
     auto rows = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
@@ -351,6 +487,7 @@ struct ResidualLayerNormKernel {
     const Params<T, U> params{
         .x = static_cast<const T*>(x.data_ptr()),
         .projected = static_cast<const U*>(projected.data_ptr()),
+        .projected_bias = projected_bias,
         .layer_scale = static_cast<const float*>(layer_scale.data_ptr()),
         .weight = static_cast<const float*>(weight.data_ptr()),
         .bias = static_cast<const float*>(bias.data_ptr()),
@@ -358,9 +495,78 @@ struct ResidualLayerNormKernel {
         .out_q = nullptr,
         .out_s = nullptr,
         .out = static_cast<float*>(out.data_ptr()),
+        .out_q4 = nullptr,
+        .out_sf = nullptr,
+        .global_scale = 0.0f,
         .eps = static_cast<float>(eps),
     };
     details::launch<T, U, kWidth, NormMode::kResidualLayerNorm>(params, rows, device);
+  }
+};
+
+/**
+ * \brief `residual = fma(projected, layer_scale, x)` in fp32, then `q4, sf = nvfp4(RMSNorm(residual) * weight)`.
+ *
+ * The E2M1 codes and the 128x4-swizzled E4M3 block scales are laid out for
+ * `flashinfer.mm_fp4`; `global_scale` is the calibrated tensor scale of the
+ * consuming linear's input (`448 * 6 / amax`).
+ *
+ * \tparam T      Element type of `x`: fp32_t | fp16_t
+ * \tparam U      Element type of `projected`: fp32_t | fp16_t
+ * \tparam kWidth Row width; a multiple of kBlockSize * kVecSize and of 64
+ */
+template <typename T, typename U, uint32_t kWidth>
+struct ResidualRmsNormFp4Kernel {
+  /**
+   * \param x             [rows, kWidth] T, contiguous, 16-byte aligned
+   * \param projected     [rows, kWidth] U, contiguous, 16-byte aligned
+   * \param layer_scale   [kWidth] fp32
+   * \param weight        [kWidth] fp32
+   * \param residual_out  [rows, kWidth] fp32, written
+   * \param out_q4        [rows, kWidth / 2] uint8 packed E2M1, written
+   * \param out_sf        [>= ceil(rows / 128) * 128, kWidth / 16] uint8 E4M3, swizzled, written (valid rows only)
+   * \param global_scale  NVFP4 tensor scale of the produced activation
+   * \param eps           RMSNorm epsilon
+   */
+  static void
+  run(tvm::ffi::TensorView x,
+      tvm::ffi::TensorView projected,
+      tvm::ffi::TensorView layer_scale,
+      tvm::ffi::TensorView weight,
+      tvm::ffi::TensorView residual_out,
+      tvm::ffi::TensorView out_q4,
+      tvm::ffi::TensorView out_sf,
+      double global_scale,
+      double eps) {
+    using namespace host;
+    auto rows = SymbolicSize{"rows"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    details::verify_rows<T, kWidth>(x, rows, device);
+    details::verify_rows<U, kWidth>(projected, rows, device);
+    details::verify_vector<kWidth>(layer_scale, device);
+    details::verify_vector<kWidth>(weight, device);
+    details::verify_rows<fp32_t, kWidth>(residual_out, rows, device);
+    details::verify_nvfp4_outputs<kWidth>(out_q4, out_sf, rows, device);
+    CHECK_HOST(global_scale > 0.0) << "minimax_h3_vae_residual_norm: NVFP4 global scale must be positive";
+
+    const Params<T, U> params{
+        .x = static_cast<const T*>(x.data_ptr()),
+        .projected = static_cast<const U*>(projected.data_ptr()),
+        .projected_bias = nullptr,
+        .layer_scale = static_cast<const float*>(layer_scale.data_ptr()),
+        .weight = static_cast<const float*>(weight.data_ptr()),
+        .bias = nullptr,
+        .residual_out = static_cast<float*>(residual_out.data_ptr()),
+        .out_q = nullptr,
+        .out_s = nullptr,
+        .out = nullptr,
+        .out_q4 = static_cast<uint8_t*>(out_q4.data_ptr()),
+        .out_sf = static_cast<uint8_t*>(out_sf.data_ptr()),
+        .global_scale = static_cast<float>(global_scale),
+        .eps = static_cast<float>(eps),
+    };
+    details::launch<T, U, kWidth, NormMode::kResidualRmsNormFp4>(params, rows, device);
   }
 };
 

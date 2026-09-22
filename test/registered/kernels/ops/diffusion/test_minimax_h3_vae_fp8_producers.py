@@ -162,6 +162,38 @@ def test_silu_mul_quant_fp8_flattens_leading_dims(record_property):
     check_fp8(q, scales, F.silu(gate) * up, record_property)
 
 
+def test_residual_rmsnorm_fp8_folds_projected_bias(record_property):
+    """The pending NVFP4 down-projection bias enters before LayerScale."""
+    x = torch.randn(2, 7, WIDTH, device="cuda")
+    projected = torch.randn(2, 7, WIDTH, device="cuda", dtype=torch.float16)
+    projected_bias = torch.randn(WIDTH, device="cuda")
+    layer_scale = torch.randn(WIDTH, device="cuda") * 0.3
+    weight = torch.randn(WIDTH, device="cuda")
+    residual, q, scales = minimax_h3_vae_residual_rmsnorm_fp8(
+        x, projected, layer_scale, weight, eps=EPS, projected_bias=projected_bias
+    )
+    expected_residual = x + (projected.float() + projected_bias) * layer_scale
+    torch.testing.assert_close(residual, expected_residual, atol=1e-6, rtol=2e-6)
+    reference = F.rms_norm(expected_residual, (WIDTH,), weight, eps=EPS)
+    check_fp8(q, scales, reference, record_property)
+
+
+def test_residual_layernorm_folds_projected_bias(record_property):
+    x = torch.randn(2, 7, WIDTH, device="cuda")
+    projected = torch.randn(2, 7, WIDTH, device="cuda", dtype=torch.float16)
+    projected_bias = torch.randn(WIDTH, device="cuda")
+    layer_scale = torch.randn(WIDTH, device="cuda") * 0.3
+    weight, bias = torch.randn(2, WIDTH, device="cuda")
+    reference = F.layer_norm(
+        x + (projected.float() + projected_bias) * layer_scale, (WIDTH,), weight, bias, EPS
+    )
+    out = minimax_h3_vae_residual_layernorm(
+        x, projected, layer_scale, weight, bias, eps=EPS, projected_bias=projected_bias
+    )
+    record_error(record_property, out, reference)
+    torch.testing.assert_close(out, reference, atol=4e-6, rtol=3e-5)
+
+
 def test_reject_unsupported_inputs():
     x = torch.randn(2, 7, WIDTH, device="cuda")
     projected = torch.randn_like(x, dtype=torch.float16)
@@ -179,6 +211,10 @@ def test_reject_unsupported_inputs():
     assert not can_use_minimax_h3_vae_residual_layernorm(
         x, projected, weight, weight, bias.half(), eps=EPS
     )
+    with pytest.raises(RuntimeError):
+        minimax_h3_vae_residual_layernorm(
+            x, projected, weight, weight, bias, eps=EPS, projected_bias=bias.half()
+        )
     # A contiguous slice can still be misaligned for the vectorized loads.
     offset_rows = torch.empty(2 * WIDTH + 4, device="cuda")[1 : 2 * WIDTH + 1]
     offset_rows = offset_rows.view(2, WIDTH)

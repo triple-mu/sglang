@@ -133,6 +133,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>false</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: round the decoder output-projection input to fp16 (fp32 accumulation). Read once at load; a lossy deployment-level change outside the quality tiers, independent of <code>--component-quantizations.video_vae fp8</code>.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>cudnn</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: <code>flashinfer.mm_fp4</code> backend of the NVFP4 FFN linears installed by <code>--component-quantizations.video_vae nvfp4</code>, <code>cudnn</code> or <code>cutlass</code>. Read once at load.</td>
+    </tr>
   </tbody>
 </table>
 
