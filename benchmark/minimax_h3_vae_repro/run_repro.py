@@ -46,6 +46,21 @@ def port_free(port):
         return s.connect_ex(("127.0.0.1", port)) != 0
 
 
+_ANSI = re.compile(rb"\x1b\[[0-9;]*m")
+
+
+def bound_port(server_log_path):
+    """Port the server actually serves on: sglang moves to a free port when the requested one
+    (or a neighbour it needs) is taken, and logs it long before Uvicorn starts. The log carries
+    ANSI colour codes, so strip them before matching."""
+    text = _ANSI.sub(b"", server_log_path.read_bytes())
+    moved = re.findall(rb"Port (\d+) was unavailable, using port (\d+) instead", text)
+    if moved:
+        return int(moved[-1][1])
+    running = re.findall(rb"Uvicorn running on http://[0-9.]+:(\d+)", text)
+    return int(running[-1]) if running else None
+
+
 def cpulist(text):
     out = set()
     for part in text.strip().split(","):
@@ -215,9 +230,14 @@ def main():
                     break
             except (urllib.error.URLError, ConnectionError, OSError, HTTPException):
                 pass  # not up yet, or a transient non-HTTP socket on the port during startup
-            bound = re.findall(rb"Uvicorn running on http://[0-9.]+:(\d+)", (out / "logs" / "server.log").read_bytes())
-            if bound and int(bound[-1]) != port:
-                raise RuntimeError(f"server bound port {bound[-1].decode()} instead of {port}; port {port} was busy (stale server?)")
+            actual = bound_port(out / "logs" / "server.log")
+            if actual is not None and actual != port:
+                # port_free() passed before launch, so this is sglang's own availability check
+                # (shared node, neighbouring ports); follow the server rather than fail.
+                log(f"server moved from port {port} to {actual}; following it")
+                port = actual
+                base = f"http://127.0.0.1:{port}"
+                raw["port_actual"] = port
             if time.time() - t_start > cfg.get("ready_timeout_s", 1800):
                 raise TimeoutError("server not ready in time")
             time.sleep(2)
