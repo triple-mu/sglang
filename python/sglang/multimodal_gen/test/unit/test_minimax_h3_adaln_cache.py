@@ -192,6 +192,43 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
         cache.resolve_slots([torch.tensor([9.0])])
 
 
+def test_begin_step_lets_each_block_read_its_own_layer(tmp_path):
+    """Cache-DiT wraps the block stack, so rows go through begin_step()."""
+    cache_path = tmp_path / "adaln.safetensors"
+    block_params = (
+        torch.arange(2 * 2 * 2 * _BLOCK_WIDTH, dtype=torch.float32)
+        .reshape(2, 2, 2, _BLOCK_WIDTH)
+        .bfloat16()
+    )
+    save_file(
+        {
+            "plan_timesteps": torch.tensor([[0.5, 0.0], [1.0, 2.0]]),
+            "plan_lengths": torch.tensor([1, 2], dtype=torch.int64),
+            "block_params": block_params,
+            "final_params": torch.zeros(2, 2, _FINAL_WIDTH, dtype=torch.bfloat16),
+        },
+        cache_path,
+        metadata={"format_version": "2", "model_variant": "fl2va"},
+    )
+    cache = MiniMaxH3AdalnCache(_ARCH, path=str(cache_path), model_variant="fl2va")
+    cache.load(torch.device("cpu"))
+    slot = cache.lookup(torch.tensor([1.0, 2.0]))
+
+    with pytest.raises(ValueError, match="begin_step"):
+        cache.block_for_current_step(0)
+
+    cache.begin_step(slot, 2)
+    expected = cache.block_all(cache_plan_index=slot, num_timesteps=2)
+    for index in range(_ARCH.num_layers):
+        for got, want in zip(cache.block_for_current_step(index), expected[index]):
+            assert torch.equal(got, want)
+    # The two layers must differ, otherwise the collapse this guards against
+    # would go unnoticed.
+    assert not torch.equal(
+        cache.block_for_current_step(0)[0], cache.block_for_current_step(1)[0]
+    )
+
+
 def test_online_cache_resolve_slots_after_build(tmp_path):
     cache = _online_cache(tmp_path, max_plan_width=2)
     plan_a = torch.tensor([1.0])
