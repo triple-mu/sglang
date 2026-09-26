@@ -1722,6 +1722,33 @@ def _reject_adaln_lora(names: list[str]) -> None:
     )
 
 
+def _adaln_incompatible_quantization(quant_config: QuantizationConfig | None) -> bool:
+    """Whether this quantization stores adaln_proj quantized in the checkpoint.
+
+    The AdaLN cache rebuild reads ``blocks.N.adaln_proj.linear.{weight,bias}``
+    straight out of the checkpoint safetensors and runs one ``F.linear`` on
+    them (see ``MiniMaxH3AdalnCache.build``); it never sees the quantized
+    runtime layers. So online quantization (fp8 / mxfp8 / mxfp4 / kitchen_int8
+    applied after loading a BF16 checkpoint) is fine: what is on disk is still
+    BF16. Only a checkpoint that ships quantized adaln_proj weights breaks the
+    rebuild, because a raw low-precision tensor plus a separate scale is not
+    something F.linear can consume.
+    """
+    if quant_config is None:
+        return False
+    for flag in (
+        "is_checkpoint_fp8_serialized",
+        "is_checkpoint_mxfp4_serialized",
+        "is_checkpoint_int8_serialized",
+    ):
+        serialized = getattr(quant_config, flag, None)
+        if serialized is not None:
+            return bool(serialized)
+    # Everything else (modelopt, nunchaku, quanto, ...) only ever loads
+    # pre-quantized checkpoints.
+    return True
+
+
 class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin):
     _aliases = (
         "MiniMaxH3Transformer3DModel",
@@ -1980,9 +2007,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         arch = self.config
         if (
             adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+        ) and _adaln_incompatible_quantization(quant_config):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 AdaLN cache needs adaln_proj stored unquantized in the "
+                "checkpoint; this run loads a pre-quantized one"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
