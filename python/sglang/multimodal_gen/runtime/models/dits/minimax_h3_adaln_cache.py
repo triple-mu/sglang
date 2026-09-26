@@ -438,6 +438,9 @@ class MiniMaxH3AdalnCache(nn.Module):
         self._host_tier: MiniMaxH3AdalnHostTier | None = None
         self.stats = MiniMaxH3AdalnCacheStats()
         self.rebuilds = 0
+        # This denoising step's per-block rows, published by begin_step() and
+        # read back by each block through block_for_current_step().
+        self._step_block_params: tuple[tuple[torch.Tensor, ...], ...] | None = None
 
     def load(self, device: torch.device) -> None:
         if self.path is None:
@@ -843,6 +846,26 @@ class MiniMaxH3AdalnCache(nn.Module):
         ]
         stacked = stacked.reshape(self.num_layers, -1, 6, self.hidden_size)
         return tuple(tuple(layer.unbind(dim=1)) for layer in stacked)
+
+    def begin_step(self, cache_plan_index: torch.Tensor, num_timesteps: int) -> None:
+        """Gather this step's rows once and let each block pick its own.
+
+        The blocks cannot be handed their rows from the caller: Cache-DiT
+        replaces the block ModuleList with a single wrapper that forwards one
+        kwarg set to all of them, so anything indexed by block position
+        outside the stack collapses onto layer 0 and silently corrupts the
+        video.
+        """
+        self._step_block_params = self.block_all(
+            cache_plan_index=cache_plan_index, num_timesteps=num_timesteps
+        )
+
+    def block_for_current_step(self, index: int) -> tuple[torch.Tensor, ...]:
+        if self._step_block_params is None:
+            raise ValueError(
+                "MiniMax H3 AdaLN cache: begin_step() must run before the block stack"
+            )
+        return self._step_block_params[index]
 
     def final(
         self,

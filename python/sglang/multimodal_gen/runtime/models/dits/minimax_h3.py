@@ -1443,6 +1443,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             )
         )
         self.preserve_input_for_cache_dit = False
+        # With an AdaLN cache the block fetches its own layer's row (see
+        # MiniMaxH3AdalnCache.begin_step). The index is assigned when the stack
+        # is built; the cache reference lives in a tuple so nn.Module does not
+        # register it as a submodule 50 times.
+        self.adaln_layer_index = -1
+        self._adaln_cache_ref: tuple[MiniMaxH3AdalnCache, ...] = ()
 
     def forward(
         self,
@@ -1467,9 +1473,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm2 -> scale/shift -> MLP -> gated residual.
         """
         if adaln_params is None:
-            if self.adaln_proj is None:
+            if self.adaln_proj is not None:
+                adaln_params = self.adaln_proj(adaln_input)
+            elif self._adaln_cache_ref:
+                adaln_params = self._adaln_cache_ref[0].block_for_current_step(
+                    self.adaln_layer_index
+                )
+            else:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
-            adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
         # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
         # first gated residual writes to that tensor; the second one operates on
@@ -1726,6 +1737,33 @@ def _reject_adaln_lora(names: list[str]) -> None:
         f"adaln_proj ({len(adaln_names)} name(s), e.g. {adaln_names[0]!r}); "
         "serve this adapter with resident AdaLN weights"
     )
+
+
+def _adaln_incompatible_quantization(quant_config: QuantizationConfig | None) -> bool:
+    """Whether this quantization stores adaln_proj quantized in the checkpoint.
+
+    The AdaLN cache rebuild reads ``blocks.N.adaln_proj.linear.{weight,bias}``
+    straight out of the checkpoint safetensors and runs one ``F.linear`` on
+    them (see ``MiniMaxH3AdalnCache.build``); it never sees the quantized
+    runtime layers. So online quantization (fp8 / mxfp8 / mxfp4 / kitchen_int8
+    applied after loading a BF16 checkpoint) is fine: what is on disk is still
+    BF16. Only a checkpoint that ships quantized adaln_proj weights breaks the
+    rebuild, because a raw low-precision tensor plus a separate scale is not
+    something F.linear can consume.
+    """
+    if quant_config is None:
+        return False
+    for flag in (
+        "is_checkpoint_fp8_serialized",
+        "is_checkpoint_mxfp4_serialized",
+        "is_checkpoint_int8_serialized",
+    ):
+        serialized = getattr(quant_config, flag, None)
+        if serialized is not None:
+            return bool(serialized)
+    # Everything else (modelopt, nunchaku, quanto, ...) only ever loads
+    # pre-quantized checkpoints.
+    return True
 
 
 class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin):
@@ -1986,9 +2024,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         arch = self.config
         if (
             adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+        ) and _adaln_incompatible_quantization(quant_config):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 AdaLN cache needs adaln_proj stored unquantized in the "
+                "checkpoint; this run loads a pre-quantized one"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
@@ -2128,6 +2167,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             if self._adaln_precomputed
             else None
         )
+        if self.adaln_cache is not None:
+            for index, block in enumerate(self.blocks):
+                block.adaln_layer_index = index
+                block._adaln_cache_ref = (self.adaln_cache,)
         # Component overrides disappear when the loader context exits. Preserve
         # only that selection; process-wide overrides are resolved at first use.
         self._component_attention_backend_override = (
@@ -2780,9 +2823,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     adaln_cache_plan_index = self.adaln_cache.lookup(
                         unique_timesteps.view(-1).to(device)
                     )
-                block_adaln_params = self.adaln_cache.block_all(
-                    cache_plan_index=adaln_cache_plan_index,
-                    num_timesteps=adaln_input.shape[0],
+                # Not handed down by block index: Cache-DiT swaps the block stack
+                # for one wrapper, and position-indexed rows from outside the
+                # stack would all collapse onto layer 0. Publish the step and let
+                # every block read its own layer.
+                self.adaln_cache.begin_step(
+                    adaln_cache_plan_index, adaln_input.shape[0]
                 )
             elif self._can_batch_block_adaln():
                 local_adaln = torch.stack(

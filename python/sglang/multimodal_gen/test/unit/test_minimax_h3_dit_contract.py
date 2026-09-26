@@ -622,6 +622,30 @@ def _meta_h3(quant_config) -> MiniMaxH3DiTModel:
         )
 
 
+def test_adaln_rebuild_accepts_online_quantization_only():
+    """The rebuild reads BF16 adaln_proj rows from disk, so online fp8 is fine
+    while a pre-quantized checkpoint is not."""
+    _ensure_single_process_parallel_runtime()
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=Fp8Config(is_checkpoint_fp8_serialized=False),
+            adaln_weight_files=["unused.safetensors"],
+        )
+    assert model.adaln_cache is not None
+    assert model.blocks[0].adaln_proj is None
+
+    with pytest.raises(ValueError, match="pre-quantized"):
+        with torch.device("meta"):
+            MiniMaxH3DiTModel(
+                config=MiniMaxH3DiTConfig(),
+                hf_config={},
+                quant_config=_block_fp8_quant_config(),
+                adaln_weight_files=["unused.safetensors"],
+            )
+
+
 def test_offline_block_fp8_checkpoint_layout_and_cpu_load():
     quant_config = _block_fp8_quant_config(
         ignored_layers=[
