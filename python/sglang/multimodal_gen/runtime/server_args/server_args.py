@@ -496,6 +496,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
+    # Stage / denoising-loop / step ranges only, without the recursive
+    # per-module hooks: those are steps x layers x ranks ranges, and at 50
+    # steps no viewer opens the report. Implied by the layerwise flag.
+    enable_stage_nvtx_marker: bool = False
 
     # Warmup is controlled by the canonical `warmup_mode` knob: one of WARMUP_MODES.
     #   - "off":     no warmup.
@@ -508,6 +512,11 @@ class ServerArgs(DisaggServerArgsMixin):
 
     warmup_resolutions: list[str] = None
     warmup_num_frames: int | None = None
+    # The serving step count the synthetic warmup request mimics (its
+    # pre-trim num_inference_steps); None falls back to the model's sampling
+    # default. Step-count-keyed warm state (e.g. the MiniMax H3 AdaLN plan
+    # prewarm) only covers real requests when this matches their step count.
+    warmup_num_inference_steps: int | None = None
     warmup_steps: int = 1
     # JSON overrides for the representative request shape used by synthetic
     # warmup and automatic residency planning. Execution remains bounded by
@@ -1386,6 +1395,11 @@ class ServerArgs(DisaggServerArgsMixin):
             )
         if self.warmup_num_frames is not None and self.warmup_num_frames <= 0:
             raise ValueError("--warmup-num-frames must be a positive integer.")
+        if (
+            self.warmup_num_inference_steps is not None
+            and self.warmup_num_inference_steps <= 0
+        ):
+            raise ValueError("--warmup-num-inference-steps must be a positive integer.")
 
         if self.enable_torch_compile and self.warmup_mode is None:
             self.warmup_mode = "server"
@@ -1398,7 +1412,9 @@ class ServerArgs(DisaggServerArgsMixin):
         # Explicit warmup shapes need a request path unless an existing server
         # default already supplies the synthetic startup request.
         if (
-            self.warmup_resolutions is not None or self.warmup_num_frames is not None
+            self.warmup_resolutions is not None
+            or self.warmup_num_frames is not None
+            or self.warmup_num_inference_steps is not None
         ) and self.warmup_mode in (None, "off"):
             self.warmup_mode = "request"
 
@@ -2478,6 +2494,15 @@ class ServerArgs(DisaggServerArgsMixin):
             "sub-operations, and every transformer submodule forward (recursive). "
             "Warmup steps are excluded to keep captured traces clean.",
         )
+        parser.add_argument(
+            "--enable-stage-nvtx-marker",
+            action=StoreBoolean,
+            default=ServerArgs.enable_stage_nvtx_marker,
+            help="Enable NVTX ranges around each pipeline stage, the denoising "
+            "loop and every denoising step, without the recursive per-module "
+            "hooks of --enable-layerwise-nvtx-marker (whose ranges scale with "
+            "steps x layers x ranks). Warmup steps are excluded.",
+        )
 
         # warmup
         parser.add_argument(
@@ -2511,6 +2536,20 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Override the synthetic video warmup frame count. Use this with "
                 "breakable CUDA graphs when serving a non-default frame count so "
                 "the captured latent shape matches the request."
+            ),
+        )
+        parser.add_argument(
+            "--warmup-num-inference-steps",
+            type=int,
+            default=ServerArgs.warmup_num_inference_steps,
+            help=(
+                "The serving step count the synthetic warmup request mimics "
+                "(its pre-trim num_inference_steps; the warmup still runs only "
+                "--warmup-steps of it). Set this to the real requests' "
+                "num_inference_steps so step-count-keyed warm state (e.g. the "
+                "MiniMax H3 AdaLN plan prewarm) covers them. Defaults to the "
+                "model's sampling default; `sglang generate` defaults it to "
+                "the request's --num-inference-steps."
             ),
         )
         parser.add_argument(

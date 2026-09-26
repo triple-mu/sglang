@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     ConditioningCache,
     conditioning_cache_group,
@@ -33,6 +34,28 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def _maybe_cuda_profiler_range(batch: Req):
+    """Bracket the real (non-warmup) request with cudaProfilerStart/Stop.
+
+    Pairs with ``nsys profile --capture-range=cudaProfilerApi``: weight
+    loading, distributed init and warmup stay outside the report, so the
+    capture is the inference alone. Every rank opens the range: a range
+    opened on only some ranks deadlocks the next collective, and nsys
+    collects session-wide anyway.
+    """
+    if not envs.SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE or getattr(
+        batch, "is_warmup", False
+    ):
+        yield
+        return
+    torch.cuda.profiler.start()
+    try:
+        yield
+    finally:
+        torch.cuda.profiler.stop()
 
 
 class Timer(StageProfiler):
@@ -113,9 +136,10 @@ class PipelineExecutor(ABC):
         return getattr(payload, "is_warmup", False)
 
     def _should_use_stage_nvtx(self, payload: Any, server_args: ServerArgs) -> bool:
-        return server_args.enable_layerwise_nvtx_marker and not self._is_warmup_payload(
-            payload
-        )
+        return (
+            server_args.enable_stage_nvtx_marker
+            or server_args.enable_layerwise_nvtx_marker
+        ) and not self._is_warmup_payload(payload)
 
     def _run_stage_with_executor_hooks(
         self,
@@ -152,9 +176,10 @@ class PipelineExecutor(ABC):
         server_args: ServerArgs,
     ) -> OutputBatch:
 
-        with self.profile_execution(batch, dump_rank=0):
-            with current_platform.inference_mode():
-                batch = self.execute(stages, batch, server_args)
+        with _maybe_cuda_profiler_range(batch):
+            with self.profile_execution(batch, dump_rank=0):
+                with current_platform.inference_mode():
+                    batch = self.execute(stages, batch, server_args)
 
         return batch
 
