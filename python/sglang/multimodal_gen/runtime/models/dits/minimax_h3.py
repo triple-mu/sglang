@@ -1425,6 +1425,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             )
         )
         self.preserve_input_for_cache_dit = False
+        # With an AdaLN cache the block fetches its own layer's row (see
+        # MiniMaxH3AdalnCache.begin_step). The index is assigned when the stack
+        # is built; the cache reference lives in a tuple so nn.Module does not
+        # register it as a submodule 50 times.
+        self.adaln_layer_index = -1
+        self._adaln_cache_ref: tuple[MiniMaxH3AdalnCache, ...] = ()
 
     def forward(
         self,
@@ -1449,9 +1455,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm2 -> scale/shift -> MLP -> gated residual.
         """
         if adaln_params is None:
-            if self.adaln_proj is None:
+            if self.adaln_proj is not None:
+                adaln_params = self.adaln_proj(adaln_input)
+            elif self._adaln_cache_ref:
+                adaln_params = self._adaln_cache_ref[0].block_for_current_step(
+                    self.adaln_layer_index
+                )
+            else:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
-            adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
         # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
         # first gated residual writes to that tensor; the second one operates on
@@ -2110,6 +2121,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             if self._adaln_precomputed
             else None
         )
+        if self.adaln_cache is not None:
+            for index, block in enumerate(self.blocks):
+                block.adaln_layer_index = index
+                block._adaln_cache_ref = (self.adaln_cache,)
         # Component overrides disappear when the loader context exits. Preserve
         # only that selection; process-wide overrides are resolved at first use.
         self._component_attention_backend_override = (
@@ -2762,9 +2777,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     adaln_cache_plan_index = self.adaln_cache.lookup(
                         unique_timesteps.view(-1).to(device)
                     )
-                block_adaln_params = self.adaln_cache.block_all(
-                    cache_plan_index=adaln_cache_plan_index,
-                    num_timesteps=adaln_input.shape[0],
+                # Not handed down by block index: Cache-DiT swaps the block stack
+                # for one wrapper, and position-indexed rows from outside the
+                # stack would all collapse onto layer 0. Publish the step and let
+                # every block read its own layer.
+                self.adaln_cache.begin_step(
+                    adaln_cache_plan_index, adaln_input.shape[0]
                 )
             elif self._can_batch_block_adaln():
                 local_adaln = torch.stack(
