@@ -832,6 +832,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         warmup_mode=None,
         warmup_resolutions=None,
         warmup_num_frames=None,
+        warmup_num_inference_steps=None,
         enable_torch_compile=False,
         enable_breakable_cuda_graph=False,
         disagg_role=None,
@@ -842,6 +843,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.warmup_mode = warmup_mode
         sa.warmup_resolutions = warmup_resolutions
         sa.warmup_num_frames = warmup_num_frames
+        sa.warmup_num_inference_steps = warmup_num_inference_steps
         sa.enable_torch_compile = enable_torch_compile
         sa.enable_breakable_cuda_graph = enable_breakable_cuda_graph
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
@@ -870,6 +872,16 @@ class TestWarmupModeNormalization(unittest.TestCase):
     def test_num_frames_forces_warmup_on(self):
         sa = self._resolve(warmup_mode="off", warmup_num_frames=17)
         self.assertEqual(sa.warmup_mode, "request")
+
+    def test_num_inference_steps_forces_warmup_on(self):
+        sa = self._resolve(warmup_mode="off", warmup_num_inference_steps=9)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_num_inference_steps_must_be_positive(self):
+        for steps in (0, -3):
+            with self.subTest(steps=steps):
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    self._resolve(warmup_num_inference_steps=steps)
 
     def test_num_frames_must_be_positive(self):
         for num_frames in (0, -1):

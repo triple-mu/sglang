@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE: bool = False
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
@@ -314,6 +315,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Bracket every non-warmup request with cudaProfilerStart/Stop so that
+    # `nsys profile --capture-range=cudaProfilerApi` records the inference
+    # alone (weight loading, distributed init and warmup stay out).
+    "SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE": _lazy_bool(
+        "SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE"
+    ),
     # Kill-switch for the warmup-calibrated auto residency promotion that runs
     # under `--performance-mode auto` with server warmup. Set to disable the
     # promotion without giving up the rest of the auto performance policy.

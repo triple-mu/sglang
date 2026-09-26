@@ -128,6 +128,36 @@ nsys profile \
 - `--duration N`: Capture for N seconds (focus on specific stages)
 - `--force-overwrite`: Overwrite existing output files
 
+### Capture Only the Inference
+
+Multi-GPU runs load weights and warm up for minutes before the first request; a
+whole-process capture buries the inference under that. Set
+`SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE=1` to bracket every non-warmup request with
+`cudaProfilerStart` / `cudaProfilerStop` on every rank, and let Nsight Systems
+start on that range:
+
+```bash
+SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE=1 \
+nsys profile \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=stop \
+  --trace=cuda,nvtx \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --force-overwrite=true \
+  -o minimax_h3_inference \
+  sglang generate \
+    --model-path MiniMaxAI/MiniMax-H3 \
+    --enable-stage-nvtx-marker \
+    --warmup-mode request --warmup-steps 2 \
+    --prompt "..." --save-output
+```
+
+`--enable-stage-nvtx-marker` adds the `stage_*`, `denoising_loop` and
+`denoising_step_*` ranges without the recursive per-module hooks of
+`--enable-layerwise-nvtx-marker`, whose range count scales with
+steps x layers x ranks and keeps a 50-step multi-GPU report from opening.
+
 ## Notes
 
 - **Reduce trace size**: Use `--num-profiled-timesteps` with smaller values or `--delay`/`--duration` with Nsight Systems
