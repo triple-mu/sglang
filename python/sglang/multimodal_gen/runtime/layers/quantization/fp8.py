@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm import fp8_scaled_mm
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
@@ -388,6 +389,19 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple) and not self.block_quant:
+            # A producer already quantised per token (fp8 rows, [M, 1] fp32
+            # scales); feed the per-row-scaled CUTLASS GEMM directly.
+            qinput, input_scale = x
+            return fp8_scaled_mm(
+                qinput,
+                layer.weight,
+                input_scale,
+                layer.weight_scale,
+                out_dtype=torch.bfloat16,
+                bias=bias,
+            )
+
         # The activation quantization kernels assert on row-major input, and
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by
