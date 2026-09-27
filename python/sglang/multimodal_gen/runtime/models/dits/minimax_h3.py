@@ -415,19 +415,34 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
     )
 
 
-def _accepts_per_token_fp8_input(linear: nn.Module) -> bool:
-    """Online per-channel FP8 weights whose GEMM takes per-row activation scales."""
+def _per_token_fp8_blockers(linear: nn.Module) -> list[str]:
+    """Why `linear` cannot take a per-token pre-quantised fp8 activation; empty when it can."""
     from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 
     method = linear.quant_method
-    return (
-        envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT
-        and isinstance(method, Fp8LinearMethod)
-        and not method.block_quant
-        and not method.use_marlin
-        and method.cutlass_fp8_supported
-        and linear.weight_scale.numel() == linear.weight.shape[1]
-    )
+    if not envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT:
+        return ["SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0"]
+    if not isinstance(method, Fp8LinearMethod):
+        return [f"quant method {type(method).__name__}"]
+    blockers = []
+    if method.block_quant:
+        blockers.append("block-quantised weights")
+    if method.use_marlin:
+        blockers.append("marlin")
+    if not method.cutlass_fp8_supported:
+        blockers.append("no CUTLASS fp8 GEMM")
+    weight_scale = linear.weight_scale
+    if weight_scale is None or weight_scale.numel() != linear.weight.shape[1]:
+        blockers.append(
+            f"weight scale {None if weight_scale is None else tuple(weight_scale.shape)} "
+            f"is not per output channel of weight {tuple(linear.weight.shape)}"
+        )
+    return blockers
+
+
+def _accepts_per_token_fp8_input(linear: nn.Module) -> bool:
+    """Online per-channel FP8 weights whose GEMM takes per-row activation scales."""
+    return not _per_token_fp8_blockers(linear)
 
 
 def _modulate_scale_shift(
@@ -1294,8 +1309,18 @@ class MiniMaxH3MLP(nn.Module):
             self.fc2
         ) and can_use_silu_mul_per_token_quant_fp8(hidden):
             # One pass: SwiGLU, per-token amax and the fp8 rows fc2 consumes.
+            logger.info_once(
+                "MiniMax-H3 MLP: fused SwiGLU + per-token fp8 quantisation feeds fc2"
+            )
             out, _ = self.fc2(silu_mul_per_token_quant_fp8(hidden))
             return out
+        blockers = _per_token_fp8_blockers(self.fc2)
+        if blockers != ["SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0"]:
+            logger.info_once(
+                "MiniMax-H3 MLP keeps the unfused activation path: %s",
+                "; ".join(blockers)
+                or f"fc1 output {tuple(hidden.shape)} {hidden.dtype} not eligible",
+            )
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
