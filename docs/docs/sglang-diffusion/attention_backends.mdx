@@ -85,6 +85,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Training-free SubBlock sparsity for MiniMax-H3 on CUDA SM90, SM100, and SM120. The default compute mode is BF16; <code>compute_mode=sage_fp8</code> is an approximate SM90-only path that requires <code>SpargeAttn</code>. See the <a href="/cookbook/diffusion/MiniMax/MiniMax-H3#subblock-sparse-attention">MiniMax-H3 recipe</a>.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`subblock_sparse_sage_sm120`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SUBBLOCK_SPARSE_SAGE_SM120`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 on SM120 only. SubBlock routing on the in-tree Cake Sage INT8/FP8 block-sparse kernel, with the Ulysses all-to-all carrying the quantized Q/K/V instead of BF16. Takes the <code>subblock_sparse_attn</code> schedule keys; <code>lowp_a2a=false</code> keeps the BF16 exchange for comparison. Fails closed on other GPUs.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`video_sparse_attn_h3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`VIDEO_SPARSE_ATTN_H3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree Triton block-sparse kernel (SM90 / SM100 / SM103); no external package. Configure via <code>--attention-backend-config</code>.</td>

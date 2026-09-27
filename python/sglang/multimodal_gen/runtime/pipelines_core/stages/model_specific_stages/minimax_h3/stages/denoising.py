@@ -12,6 +12,9 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
@@ -706,6 +709,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ctx,
             emb,
             include_video_pos=subblock_enabled,
+            alignment=server_args.pipeline_config.packed_sequence_alignment(
+                server_args
+            ),
         )
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
@@ -822,6 +828,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     collector=collector,
                 )
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
+            sage_lowp = _sage_lowp_route_log(server_args)
+            if sage_lowp is not None:
+                sage_lowp.reset()
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -866,6 +875,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     batch.rollout_trajectory_data = (
                         rollout_ctx.collector.build_trajectory_data()
                     )
+            if sage_lowp is not None:
+                sage_lowp.log()
         finally:
             self._finish_active_component_use()
         _publish_full_loop_outputs(
@@ -1114,11 +1125,48 @@ def _maybe_prepare_vsa_h3_step_metadata(
     return build
 
 
+class _SageLowpRouteLog:
+    """Per-request route counters of the quantised Ulysses exchange."""
+
+    def reset(self) -> None:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_sage_sm120 import (
+            reset_lowp_counters,
+        )
+
+        reset_lowp_counters()
+
+    def log(self) -> None:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_sage_sm120 import (
+            get_lowp_counters,
+        )
+
+        counters = get_lowp_counters()
+        fallbacks = {
+            k: v for k, v in counters.items() if k.startswith("bf16_a2a_total")
+        }
+        log = logger.warning if fallbacks else logger.info
+        log(
+            "MiniMax-H3 SubBlock Sage SM120 route counters for this request: "
+            f"quantised exchange {counters.get('lowp_a2a_total', 0)} calls, "
+            f"BF16 exchange {fallbacks or 0}"
+        )
+
+
+def _sage_lowp_route_log(server_args: ServerArgs) -> _SageLowpRouteLog | None:
+    backend = server_args.pipeline_config.resolve_transformer_attention_backend(
+        server_args
+    )
+    if backend is not AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120:
+        return None
+    return _SageLowpRouteLog()
+
+
 def _build_packed_layout(
     ctx: _FullLoopContext,
     emb: Mapping[str, Any],
     *,
     include_video_pos: bool = False,
+    alignment: int = MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
 ) -> dict[str, torch.Tensor]:
     """Build the per-task packed layout for the positive branch."""
 
@@ -1140,6 +1188,7 @@ def _build_packed_layout(
             keyframe_frame_indices=ctx.keyframe_frame_indices,
             frame_count=ctx.keyframe_frame_count,
             include_video_pos=include_video_pos,
+            alignment=alignment,
         )
     else:
         packed = minimax_h3_packed_sequence(
@@ -1154,6 +1203,7 @@ def _build_packed_layout(
             ),
             frame_count=ctx.keyframe_frame_count,
             include_video_pos=include_video_pos,
+            alignment=alignment,
         )
     return packed
 
