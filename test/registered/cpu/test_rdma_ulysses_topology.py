@@ -191,7 +191,19 @@ class TestCommunicatorViews(CustomTestCase):
         ):
             transport._register("chunks", a2a.MODE_CHUNKS, 4096)
             transport._register("gather", a2a.MODE_GATHER, 8192)
+            transport._register("stats", a2a.MODE_CHUNKS, 1024)
         return transport, module
+
+    def test_stats_all_gather_replicates_the_record_into_every_chunk(self):
+        transport, module = self._transport()
+        stats = torch.arange(2 * 4 * 8, dtype=torch.float32).view(2, 1, 4, 8)
+        out = transport.exchange_stats(stats)
+        self.assertEqual(tuple(out.shape), (2, 2, 1, 4, 8))
+        index, _, landing = transport._slots["stats"]
+        self.assertEqual(module.exchanges[-1][0], index)
+        sent = landing[: 2 * stats.numel() * 4].view(2, -1).view(torch.float32)
+        self.assertTrue(torch.equal(sent[0], stats.flatten()))
+        self.assertTrue(torch.equal(sent[1], stats.flatten()))
 
     def test_capacities_cover_the_768p_geometry(self):
         self.assertEqual(a2a.chunks_capacity_bytes(37888, 56, 8) % 128, 0)

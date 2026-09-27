@@ -7,6 +7,9 @@ rank its own mlx5 RoCE port and moves the exchange with RDMA writes into
 pre-registered buffers. Two operations serve the attention core:
 
 * `exchange_chunks`: the quantised `[W, C]` payload, all_to_all_single semantics;
+* `exchange_stats`: the per-layer quantisation statistics, all_gather semantics
+  (a chunk exchange whose W chunks are copies of one record; NCCL's ring
+  all-gather of this half-megabyte measured 8 ms per layer on the PCIe box);
 * `gather_heads`: the attention output `[S_global, H_local, D] -> [S_local, H, D]`.
 
 Construction and slot registration are collective (every rank all-gathers
@@ -56,6 +59,11 @@ def chunks_capacity_bytes(max_seq_len: int, heads: int, world_size: int) -> int:
         batch=1, local_sequence=local, num_heads=heads, world_size=world_size
     )
     return _round_up(spec.world_size * spec.chunk_bytes, _ALIGN)
+
+
+def stats_capacity_bytes(heads: int, head_dim: int, world_size: int) -> int:
+    """Capacity of the statistics all-gather: `[W, 2 * heads * head_dim]` fp32."""
+    return _round_up(world_size * 2 * heads * head_dim * 4, _ALIGN)
 
 
 def gather_capacity_bytes(
@@ -139,6 +147,20 @@ class RdmaUlyssesA2A:
             self._module.exchange(self._handle, index, payload, out)
         self._count()
         return out
+
+    def exchange_stats(self, stats: torch.Tensor) -> torch.Tensor:
+        """All-gather of one contiguous record: `[...]` -> `[W, ...]`, row `i` from rank `i`."""
+        nbytes = stats.numel() * stats.element_size()
+        index, output, landing = self._slot("stats", self.world_size * nbytes)
+        send = landing[: self.world_size * nbytes].view(self.world_size, nbytes)
+        send.copy_(
+            stats.reshape(1, -1).view(torch.uint8).expand(self.world_size, nbytes)
+        )
+        out = output[: self.world_size * nbytes].view(self.world_size, nbytes)
+        with maybe_nvtx_range("rdma_a2a_exchange_stats"):
+            self._module.exchange(self._handle, index, send, out)
+        self._count()
+        return out.view(stats.dtype).view(self.world_size, *stats.shape)
 
     def gather_heads(self, x: torch.Tensor) -> torch.Tensor:
         """`[S_global, H_local, D]` -> `[S_local, H, D]`, heads ordered by source rank."""
@@ -288,6 +310,9 @@ def _build(
             MODE_GATHER,
             gather_capacity_bytes(max_seq_len, heads, head_dim, 2),
         )
+        transport._register(
+            "stats", MODE_CHUNKS, stats_capacity_bytes(heads, head_dim, world_size)
+        )
         torch.cuda.synchronize(device)
         error = None
     except Exception as exc:  # noqa: BLE001
@@ -358,4 +383,5 @@ __all__ = [
     "gather_capacity_bytes",
     "get_rdma_ulysses_a2a",
     "shutdown_rdma_ulysses_a2a",
+    "stats_capacity_bytes",
 ]
