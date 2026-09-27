@@ -57,6 +57,12 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_DECODER_TILE_BATCH: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_WINDOW_BATCH: int = 1
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16: bool = False
+    # Fused bitexact adaLN chain in the MiniMax-H3 DiT blocks; 0 keeps the
+    # eager norm / modulate / gate kernels
+    SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN: bool = True
+    # Fused SwiGLU + per-token fp8 quantisation feeding fc2 in the fp8 MLP; 0
+    # keeps the bf16 activation plus per-tensor quantisation
+    SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT: bool = True
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -371,6 +377,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp16 input for the decoder output projection (lossy, deployment-level).
     "SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16"
+    ),
+    "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "true"
+    ),
+    "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT", "true"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

@@ -24,15 +24,23 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_indexed_scale_shift,
     can_use_mxfp8_swizzled,
+    can_use_rmsnorm_indexed_scale_shift,
     can_use_silu_mul_mxfp8,
+    can_use_silu_mul_per_token_quant_fp8,
     fused_inplace_qknorm_rope,
+    gate_residual_rmsnorm_indexed_scale_shift_,
     indexed_gate_bf16,
     indexed_gate_bf16_,
+    indexed_scale_shift,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_mxfp8_,
+    rmsnorm_indexed_scale_shift,
     silu_mul_mxfp8,
+    silu_mul_per_token_quant_fp8,
 )
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
@@ -169,6 +177,9 @@ def _diffusers_h3_checkpoint(
 
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+# The fused adaLN chain replicates aten's bf16 RMSNorm bit for bit; the first
+# fused step proves that against the installed torch, or the eager chain stays.
+_FUSED_ADALN_GATE = BitExactFusionGate("minimax_h3_fused_adaln")
 _MPS_MLP_TOKEN_CHUNK_SIZE = 128
 # keep MPS activation chunks below the allocator high-watermark; CUDA keeps
 # its fused full-sequence projection
@@ -402,6 +413,21 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
         isinstance(linear, LinearBase)
         and linear.quant_method is not None
         and linear.quant_method.accepts_mxfp8_input(linear)
+    )
+
+
+def _accepts_per_token_fp8_input(linear: nn.Module) -> bool:
+    """Online per-channel FP8 weights whose GEMM takes per-row activation scales."""
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
+
+    method = linear.quant_method
+    return (
+        envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT
+        and isinstance(method, Fp8LinearMethod)
+        and not method.block_quant
+        and not method.use_marlin
+        and method.cutlass_fp8_supported
+        and linear.weight_scale.numel() == linear.weight.shape[1]
     )
 
 
@@ -1265,6 +1291,12 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
+        if _accepts_per_token_fp8_input(
+            self.fc2
+        ) and can_use_silu_mul_per_token_quant_fp8(hidden):
+            # One pass: SwiGLU, per-token amax and the fp8 rows fc2 consumes.
+            out, _ = self.fc2(silu_mul_per_token_quant_fp8(hidden))
+            return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
@@ -1561,6 +1593,73 @@ class MiniMaxH3DiTBlock(nn.Module):
             dtype=_BF16_DTYPE,
         )
 
+    def forward_fused(
+        self,
+        x: torch.Tensor,
+        *,
+        adaln_params: tuple[torch.Tensor, ...],
+        pending_gate: tuple[torch.Tensor, torch.Tensor] | None,
+        combined_indices: torch.Tensor,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+        max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None = None,
+        ulysses_active: bool = False,
+        ring_active: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """`forward` with norm + modulation fused, each absorbing the gated residual before it.
+
+        `pending_gate` is the previous block's `(gate_mlp, mlp_out)`, applied to `x`
+        in place inside this block's first fused norm; this block's own trailing
+        gate is returned the same way as `(residual, (gate_mlp, mlp_out))`. The
+        arithmetic is the eager chain's, bit for bit.
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
+        if pending_gate is None:
+            residual = x
+            h = rmsnorm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                scale_msa,
+                shift_msa,
+                combined_indices,
+                eps=self.norm1.eps,
+            )
+        else:
+            prev_gate, prev_update = pending_gate
+            h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+                x,
+                prev_update,
+                prev_gate,
+                self.norm1.weight,
+                scale_msa,
+                shift_msa,
+                combined_indices,
+                eps=self.norm1.eps,
+            )
+        h = self.attn(
+            h,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+        )
+        h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+            residual,
+            h,
+            gate_msa,
+            self.norm2.weight,
+            scale_mlp,
+            shift_mlp,
+            combined_indices,
+            eps=self.norm2.eps,
+        )
+        return residual, (gate_mlp, self.mlp(h))
+
 
 class MiniMaxH3FinalLayer(nn.Module):
     def __init__(
@@ -1713,9 +1812,15 @@ class MiniMaxH3FinalLayer(nn.Module):
                 torch.mps.empty_cache()
             assert video is not None and audio is not None
             return video, audio
-        h = _modulate_rmsnorm_scale_shift(
-            x, self.norm, shift, scale, inverse_indices, dtype=_BF16_DTYPE
-        )
+        h = self.norm(x)
+        if can_use_indexed_scale_shift(h, shift, scale, inverse_indices):
+            # The bf16 modulation chain stored as fp32 for the output heads.
+            return self._project(
+                indexed_scale_shift(
+                    h, shift, scale, inverse_indices, out_dtype=_FP32_DTYPE
+                )
+            )
+        h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         return self._project(h)
@@ -1933,6 +2038,124 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         self.validate_weight_update_source(weights_path=weights_path)
         cache.weight_files = native_adaln_weight_files(weights_path)
         cache.invalidate()
+
+    def _block_adaln_params(
+        self,
+        block: MiniMaxH3DiTBlock,
+        index: int,
+        adaln_input: torch.Tensor,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None,
+    ) -> tuple[torch.Tensor, ...]:
+        if block_adaln_params is not None:
+            return block_adaln_params[index]
+        if block._adaln_cache_ref:
+            return block._adaln_cache_ref[0].block_for_current_step(
+                block.adaln_layer_index
+            )
+        return block.adaln_proj(adaln_input)
+
+    def _fused_adaln_ready(
+        self,
+        hidden: torch.Tensor,
+        adaln_input: torch.Tensor,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None,
+        indices: torch.Tensor,
+    ) -> bool:
+        """Whether this step runs the fused block loop (see `MiniMaxH3DiTBlock.forward_fused`).
+
+        Cache-DiT and layerwise offload wrap the block stack, so the deferred
+        gate cannot cross blocks there; the first eligible step also proves the
+        fused chain bit-exact against the eager one on this torch build.
+        """
+        if (
+            not envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN
+            or not _FUSED_ADALN_GATE.can_attempt_once()
+            or not hidden.is_cuda
+            or hidden.dtype is not _BF16_DTYPE
+            or hidden.dim() != 2
+            or not hidden.is_contiguous()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or is_layerwise_offloaded_module(self)
+            or not self.blocks
+            or any(
+                type(block) is not MiniMaxH3DiTBlock
+                or block.preserve_input_for_cache_dit
+                for block in self.blocks
+            )
+        ):
+            return False
+        first = self.blocks[0]
+        params = self._block_adaln_params(first, 0, adaln_input, block_adaln_params)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = params
+        if not (
+            can_use_rmsnorm_indexed_scale_shift(
+                hidden, first.norm1.weight, scale_msa, shift_msa, indices
+            )
+            and can_use_rmsnorm_indexed_scale_shift(
+                hidden, first.norm2.weight, scale_mlp, shift_mlp, indices
+            )
+            and gate_msa.shape == scale_msa.shape
+            and gate_msa.stride() == scale_msa.stride()
+        ):
+            return False
+        if _FUSED_ADALN_GATE.verified:
+            return True
+        return self._verify_fused_adaln(first, hidden, params, indices)
+
+    def _verify_fused_adaln(
+        self,
+        block: MiniMaxH3DiTBlock,
+        hidden: torch.Tensor,
+        params: tuple[torch.Tensor, ...],
+        indices: torch.Tensor,
+    ) -> bool:
+        """One-time proof that both fused plans reproduce the eager chain bitwise."""
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = params
+        x = hidden.detach().clone()
+        try:
+            fused_a = rmsnorm_indexed_scale_shift(
+                x,
+                block.norm1.weight,
+                scale_msa,
+                shift_msa,
+                indices,
+                eps=block.norm1.eps,
+            )
+            eager_a = indexed_scale_shift_bf16_(
+                block.norm1(x), shift_msa, scale_msa, indices
+            )
+            update = fused_a
+            eager_y = indexed_gate_bf16(x, gate_msa, update, indices)
+            eager_b = indexed_scale_shift_bf16_(
+                block.norm2(eager_y), shift_mlp, scale_mlp, indices
+            )
+            fused_b, fused_y = gate_residual_rmsnorm_indexed_scale_shift_(
+                x.clone(),
+                update,
+                gate_msa,
+                block.norm2.weight,
+                scale_mlp,
+                shift_mlp,
+                indices,
+                eps=block.norm2.eps,
+            )
+        except Exception as error:  # noqa: BLE001 -- a build or launch failure disables the path
+            _FUSED_ADALN_GATE.on_exception(error, logger=logger)
+            return False
+        _FUSED_ADALN_GATE.accept_or_fallback(
+            (fused_a, fused_y, fused_b),
+            (eager_a, eager_y, eager_b),
+            equal=lambda a, b: all(torch.equal(u, v) for u, v in zip(a, b)),
+            logger=logger,
+            mismatch_msg=(
+                "MiniMax-H3 fused adaLN chain is not bit-exact against this torch "
+                "build's RMSNorm; keeping the eager norm/modulate/gate kernels"
+            ),
+        )
+        if _FUSED_ADALN_GATE.verified:
+            logger.info("MiniMax-H3 fused adaLN chain engaged (verified bit-exact)")
+        return _FUSED_ADALN_GATE.verified
 
     def _can_batch_block_adaln(self) -> bool:
         return (
@@ -2847,24 +3070,48 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
-            for index, block in enumerate(self.blocks):
-                hidden = block(
-                    hidden,
-                    adaln_input=adaln_input,
-                    combined_indices=block_combined,
-                    rope_cache=rope_cache,
-                    cu_seqlens=cu_seqlens,
-                    cu_seqlens_host=cu_seqlens_host,
-                    max_seqlen=max_seqlen,
-                    subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
-                    ulysses_active=ulysses_ws > 1,
-                    ring_active=ring_ws > 1,
-                    adaln_params=(
-                        None
-                        if block_adaln_params is None
-                        else block_adaln_params[index]
-                    ),
+            block_kwargs = dict(
+                combined_indices=block_combined,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+                ulysses_active=ulysses_ws > 1,
+                ring_active=ring_ws > 1,
+            )
+            if self._fused_adaln_ready(
+                hidden, adaln_input, block_adaln_params, block_combined
+            ):
+                # Each block defers its trailing gated residual into the next block's
+                # fused norm; the last one runs eagerly because the final layer keeps
+                # its own norm.
+                pending_gate = None
+                for index, block in enumerate(self.blocks):
+                    hidden, pending_gate = block.forward_fused(
+                        hidden,
+                        adaln_params=self._block_adaln_params(
+                            block, index, adaln_input, block_adaln_params
+                        ),
+                        pending_gate=pending_gate,
+                        **block_kwargs,
+                    )
+                last_gate, last_update = pending_gate
+                hidden = _modulate_gate(
+                    hidden, last_gate, last_update, block_combined, dtype=_BF16_DTYPE
                 )
+            else:
+                for index, block in enumerate(self.blocks):
+                    hidden = block(
+                        hidden,
+                        adaln_input=adaln_input,
+                        adaln_params=(
+                            None
+                            if block_adaln_params is None
+                            else block_adaln_params[index]
+                        ),
+                        **block_kwargs,
+                    )
             if spectrum_on:
                 self._h3_spectrum_record_targets(
                     hidden, audio_pos, infer_out_pos, row_start, row_stop
