@@ -376,6 +376,9 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         Returns `[S_global, H_local, D]`, or None when the caller must run the
         BF16 exchange instead.
         """
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.rdma_ulysses_a2a import (
+            active_rdma_ulysses_a2a,
+        )
         from sglang.multimodal_gen.runtime.distributed.parallel_state import (
             get_sp_group,
             get_ulysses_parallel_rank,
@@ -408,6 +411,8 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
 
         rank = get_ulysses_parallel_rank()
         device = query.device
+        group = get_sp_group().ulysses_group
+        transport = active_rdma_ulysses_a2a(group)
         spec = ulysses_lowp_payload_spec(
             batch=1,
             local_sequence=local_sequence,
@@ -419,12 +424,17 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         gathered = _a2a_staging_buffer(
             "sage_lowp_stats", (world_size, *stats.shape), torch.float32, device
         )
-        dist.all_gather_into_tensor(gathered, stats, group=get_sp_group().ulysses_group)
+        dist.all_gather_into_tensor(gathered, stats, group=group)
         k_mean, v_scale = ulysses_lowp_finalize_stats(
             gathered, world_size=world_size, used_sequence=used, dtype=query.dtype
         )
-        send = _a2a_staging_buffer(
-            "sage_lowp_send", spec.payload_shape, torch.uint8, device
+        # The RDMA transport reads its own landing buffer, so pack straight into it.
+        send = (
+            transport.packed_input_buffer(spec.payload_shape)
+            if transport is not None
+            else _a2a_staging_buffer(
+                "sage_lowp_send", spec.payload_shape, torch.uint8, device
+            )
         )
         ulysses_lowp_quant_pack(
             q4,
@@ -437,7 +447,11 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
             used_sequence=used,
             out=send,
         )
-        recv = _usp_all_to_all_single(send, role="sage_lowp_recv")
+        recv = (
+            transport.exchange_chunks(send)
+            if transport is not None
+            else _usp_all_to_all_single(send, role="sage_lowp_recv")
+        )
         h = spec.local_heads
         operands = _unpack(
             recv,
@@ -456,6 +470,23 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
             total=spec.global_sequence,
             sparse_query_block_mask=sparse_query_block_mask,
         )
+
+    def gather_output(self, out: torch.Tensor) -> torch.Tensor:
+        """Ulysses output all-to-all of `[S_global, H_local, D]` -> `[S_local, H, D]`."""
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.rdma_ulysses_a2a import (
+            active_rdma_ulysses_a2a,
+        )
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_sp_group,
+        )
+        from sglang.multimodal_gen.runtime.layers.usp import _usp_output_all_to_all
+
+        transport = active_rdma_ulysses_a2a(get_sp_group().ulysses_group)
+        if transport is None:
+            return _usp_output_all_to_all(out[None], head_dim=2)[0]
+        landing = transport.gather_landing(tuple(out.shape), out.dtype)
+        landing.copy_(out)
+        return transport.gather_heads(landing)
 
     def _attend(
         self,
