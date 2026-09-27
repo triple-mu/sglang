@@ -604,7 +604,7 @@ struct Kernels {
     const Shard vs = shard(v, "v", B, L, H, device);
     TensorMatcher({B, H, kHeadDim}).template with_dtype<T>().template with_device<kDLCUDA>(device).verify(k_mean);
     TensorMatcher({B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(v_scale);
-    CHECK_HOST(world_size >= 2 && rank >= 0 && rank < world_size) << "need 0 <= rank < world_size, world_size >= 2";
+    CHECK_HOST(world_size >= 1 && rank >= 0 && rank < world_size) << "need 0 <= rank < world_size";
     CHECK_HOST(qs.num_heads % world_size == 0) << "heads " << qs.num_heads << " must split evenly over " << world_size;
     const int64_t local_heads = qs.num_heads / world_size;
     const int64_t global_sequence = qs.local_sequence * world_size;
@@ -694,7 +694,7 @@ struct Kernels {
       int64_t scale_sequence,
       int64_t used_sequence) {
     using namespace host;
-    CHECK_HOST(world_size >= 2) << "world_size must be at least 2";
+    CHECK_HOST(world_size >= 1) << "world_size must be positive";
     CHECK_HOST(local_sequence > 0 && local_sequence % kShardAlignment == 0)
         << "local_sequence must be a positive multiple of " << kShardAlignment;
     const int64_t global_sequence = local_sequence * world_size;

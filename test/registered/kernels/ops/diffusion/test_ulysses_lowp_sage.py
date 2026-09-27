@@ -129,7 +129,12 @@ def _assert_fp8_close(got, want, name):
 @pytest.mark.parametrize("layout", ["interleaved", "split"])
 @pytest.mark.parametrize(
     "batch,local,heads,world_size,used",
-    [(1, 256, 16, 8, 2048), (2, 128, 8, 4, 500), (1, 384, 8, 2, 700)],
+    [
+        (1, 256, 16, 8, 2048),
+        (2, 128, 8, 4, 500),
+        (1, 384, 8, 2, 700),
+        (1, 512, 8, 1, 500),
+    ],
 )
 def test_pack_unpack_matches_reference_quantizer(
     layout, batch, local, heads, world_size, used
