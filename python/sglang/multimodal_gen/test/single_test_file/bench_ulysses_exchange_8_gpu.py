@@ -47,6 +47,7 @@ def _worker() -> int:
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
+    torch.inference_mode().__enter__()  # the attention core runs under inference mode
     init_distributed_environment(world_size=world, rank=rank, local_rank=rank)
     initialize_model_parallel(sequence_parallel_degree=world, ulysses_degree=world, ring_degree=1)
     group = get_sp_group().ulysses_group
@@ -95,6 +96,10 @@ def _worker() -> int:
 
     timed("bf16 packed QKV a2a (_usp_input_all_to_all_packed_qkv)", lambda: _usp_input_all_to_all_packed_qkv(q, k, v))
     timed(f"uint8 payload a2a ({payload.numel() / 1e6:.1f} MB/rank)", lambda: _usp_all_to_all_single(payload, role="bench_u8"))
+    recv = torch.empty_like(payload)
+    timed("uint8 payload a2a, plain dist.all_to_all_single", lambda: dist.all_to_all_single(recv.view(-1), payload.view(-1), group=group))
+    half = torch.empty(payload.numel() // 2, dtype=torch.bfloat16, device="cuda")
+    timed("bf16 same bytes a2a, plain dist.all_to_all_single", lambda: dist.all_to_all_single(torch.empty_like(half), half, group=group))
     timed("stats all_gather_into_tensor", lambda: dist.all_gather_into_tensor(gathered, stats, group=group))
     timed("bf16 output a2a (_usp_output_all_to_all)", lambda: _usp_output_all_to_all(attn_out[None], head_dim=2))
 
