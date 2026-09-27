@@ -111,7 +111,16 @@ def _worker() -> int:
             if not torch.equal(got, want):
                 failures.append(f"zero-copy gather_heads S={s_global} {dtype} differs")
 
-        expected = 6 + 6
+        stats = torch.randn(
+            2, 1, HEADS, HEAD_DIM, generator=g, device="cuda", dtype=torch.float32
+        )
+        want = torch.empty(world, *stats.shape, device="cuda")
+        dist.all_gather_into_tensor(want, stats, group=group)
+        got = transport.exchange_stats(stats)
+        if not torch.equal(got, want):
+            failures.append("exchange_stats differs from all_gather_into_tensor")
+
+        expected = 6 + 6 + 1
         if transport.exchanges != expected:
             failures.append(f"exchange counter {transport.exchanges} != {expected}")
 

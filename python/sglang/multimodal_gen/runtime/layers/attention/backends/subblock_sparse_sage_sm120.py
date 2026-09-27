@@ -421,10 +421,13 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         )
         q4, k4, v4 = (t.unsqueeze(0) for t in (query, key, value))
         stats = ulysses_lowp_k_sum_v_amax(k4, v4)
-        gathered = _a2a_staging_buffer(
-            "sage_lowp_stats", (world_size, *stats.shape), torch.float32, device
-        )
-        dist.all_gather_into_tensor(gathered, stats, group=group)
+        if transport is not None:
+            gathered = transport.exchange_stats(stats)
+        else:
+            gathered = _a2a_staging_buffer(
+                "sage_lowp_stats", (world_size, *stats.shape), torch.float32, device
+            )
+            dist.all_gather_into_tensor(gathered, stats, group=group)
         k_mean, v_scale = ulysses_lowp_finalize_stats(
             gathered, world_size=world_size, used_sequence=used, dtype=query.dtype
         )

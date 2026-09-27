@@ -198,6 +198,7 @@ def _worker() -> int:
         timed(
             "RDMA exchange_chunks (staged)", lambda: transport.exchange_chunks(payload)
         )
+        timed("RDMA exchange_stats", lambda: transport.exchange_stats(stats))
         gather_landing = transport.gather_landing(tuple(attn_out.shape), attn_out.dtype)
         gather_landing.copy_(attn_out)
         timed(
