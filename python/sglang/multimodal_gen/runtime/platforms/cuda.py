@@ -491,6 +491,33 @@ class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
 
 
+class _SubBlockSparseSageSM120BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120
+
+    # The vendored Cake Sage kernel and the quantised Ulysses exchange are
+    # compiled for sm_120a only; other capabilities fail closed.
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability is None or (capability.major, capability.minor) != (12, 0):
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "subblock_sparse_sage_sm120 needs compute capability 12.0; "
+                f"this device reports {found}."
+            )
+        from sglang.kernels.ops.diffusion import can_use_sage_block_sparse_attn_sm120
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_sage_sm120 import (  # noqa: F401
+            SubBlockSparseSageSM120Backend,
+        )
+
+        if not can_use_sage_block_sparse_attn_sm120():
+            raise ImportError(
+                "subblock_sparse_sage_sm120 needs the vendored Cake SM120 Sage kernel "
+                "(python/sglang/kernels/jit/csrc/diffusion/cake_sage_bsa_sm120)."
+            )
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_sage_sm120.SubBlockSparseSageSM120Backend"
+
+
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA2
 
@@ -567,6 +594,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
+        _SubBlockSparseSageSM120BackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,

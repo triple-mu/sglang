@@ -127,10 +127,11 @@ def minimax_h3_packed_sequence(
     keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
     frame_count: int | None = None,
     include_video_pos: bool = False,
+    alignment: int = MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
 ) -> dict[str, Any]:
     """Build the packed-sequence structural fields for one CFG branch.
 
-    The used length is padded up to a multiple of 64.
+    The used length is padded up to a multiple of ``alignment``.
     """
     ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
     frame_rows = ph * pw
@@ -146,11 +147,7 @@ def minimax_h3_packed_sequence(
     video_rows = latent_t * frame_rows
     audio_rows = audio_t * audio_channel
     used = text_len + cond_rows + audio_rows + video_rows
-    seq_len = (
-        (used + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
-        // MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-        * MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-    )
+    seq_len = (used + alignment - 1) // alignment * alignment
 
     text_sl = slice(0, text_len)
     cond_sl = slice(text_len, text_len + cond_rows)
@@ -304,6 +301,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     audio_channel: int = 2,
     seq_len: int | None = None,
     include_video_pos: bool = False,
+    alignment: int = MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
 ) -> dict[str, Any]:
     """General ref2va-family packed layout.
 
@@ -384,11 +382,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     ref_rows = ref_visual_rows + ref_audio_rows
     used = text_len + keyframe_rows + ref_rows + audio_rows + video_rows
     if seq_len is None:
-        seq_len = (
-            (used + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
-            // MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-            * MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-        )
+        seq_len = (used + alignment - 1) // alignment * alignment
     if seq_len < used:
         raise ValueError(f"seq_len {seq_len} < used rows {used}")
 
