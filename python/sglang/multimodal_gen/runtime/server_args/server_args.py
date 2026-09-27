@@ -406,6 +406,13 @@ class ServerArgs(DisaggServerArgsMixin):
     # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
     # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
     minimax_h3_adaln_host_cache_gb: float = 8.0
+    # Ulysses exchange of the MiniMax-H3 attention on subblock_sparse_sage_sm120:
+    # "nccl", or "rdma" for per-rank mlx5 RoCE writes (single node, no NVLink).
+    minimax_h3_ulysses_transport: str = "nccl"
+    # Refuse to fall back to NCCL when the RDMA transport cannot start.
+    minimax_h3_ulysses_strict: bool = False
+    # Widest packed sequence the RDMA slots are registered for.
+    minimax_h3_ulysses_max_seq_len: int = 98304
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -694,6 +701,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        self._validate_minimax_h3_ulysses()
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
@@ -706,6 +714,40 @@ class ServerArgs(DisaggServerArgsMixin):
             logger.warning(
                 "--minimax-h3-adaln-host-cache-gb only takes effect with "
                 "--minimax-h3-adaln-online; ignoring it"
+            )
+
+    def _validate_minimax_h3_ulysses(self) -> None:
+        transport = self.minimax_h3_ulysses_transport
+        if transport not in ("nccl", "rdma"):
+            raise ValueError(
+                f"--minimax-h3-ulysses-transport must be nccl or rdma, got {transport!r}"
+            )
+        if self.minimax_h3_ulysses_strict and transport != "rdma":
+            raise ValueError(
+                "--minimax-h3-ulysses-strict needs --minimax-h3-ulysses-transport rdma"
+            )
+        if transport != "rdma":
+            return
+        if self.attention_backend != "subblock_sparse_sage_sm120":
+            raise ValueError(
+                "--minimax-h3-ulysses-transport rdma serves --attention-backend "
+                "subblock_sparse_sage_sm120 only"
+            )
+        if self.nnodes != 1 or (self.ring_degree or 1) != 1:
+            raise ValueError(
+                "--minimax-h3-ulysses-transport rdma needs a single node and --ring-degree 1"
+            )
+        if self.enable_breakable_cuda_graph or self.enable_torch_compile:
+            raise ValueError(
+                "--minimax-h3-ulysses-transport rdma posts and polls RDMA work from the "
+                "host; it cannot run under the breakable CUDA graph or torch.compile"
+            )
+        if (
+            self.minimax_h3_ulysses_max_seq_len <= 0
+            or self.minimax_h3_ulysses_max_seq_len % 128
+        ):
+            raise ValueError(
+                "--minimax-h3-ulysses-max-seq-len must be a positive multiple of 128"
             )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
@@ -2122,6 +2164,39 @@ class ServerArgs(DisaggServerArgsMixin):
                 "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
                 "(ref2va) GB; the default 8 holds several. Groups are evicted "
                 "LRU and over-cap groups just recompute. 0 disables the tier."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-transport",
+            type=str,
+            choices=["nccl", "rdma"],
+            default=ServerArgs.minimax_h3_ulysses_transport,
+            help=(
+                "How the MiniMax-H3 attention exchanges its Ulysses payload under "
+                "--attention-backend subblock_sparse_sage_sm120. 'rdma' gives every "
+                "rank its own mlx5 RoCE port and moves the quantized payload and the "
+                "attention output with RDMA writes; single node, no NVLink, "
+                "--ring-degree 1. Falls back to NCCL unless --minimax-h3-ulysses-strict."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-strict",
+            action=StoreBoolean,
+            default=ServerArgs.minimax_h3_ulysses_strict,
+            help=(
+                "Fail instead of falling back to NCCL when the RDMA Ulysses transport "
+                "cannot start. Turn it on for benchmarks, or a slow run may be "
+                "measuring NCCL under an RDMA label."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-max-seq-len",
+            type=int,
+            default=ServerArgs.minimax_h3_ulysses_max_seq_len,
+            help=(
+                "Widest packed sequence the RDMA Ulysses slots are registered for "
+                "(the registrations are fixed for the process). The default covers "
+                "every MiniMax-H3 task at 768p 5 s; a longer request falls back to NCCL."
             ),
         )
         parser.add_argument(

@@ -68,6 +68,12 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # RDMA Ulysses transport (--minimax-h3-ulysses-transport rdma): rank-ordered
+    # comma lists overriding the sysfs choice of mlx5 device and GID index, and
+    # the bound on any one exchange phase
+    SGLANG_DIFFUSION_RDMA_ULYSSES_NICS: str | None = None
+    SGLANG_DIFFUSION_RDMA_ULYSSES_GID_INDICES: str | None = None
+    SGLANG_DIFFUSION_RDMA_ULYSSES_TIMEOUT_MS: float = 10000.0
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -423,6 +429,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
+    "SGLANG_DIFFUSION_RDMA_ULYSSES_NICS": _lazy_str(
+        "SGLANG_DIFFUSION_RDMA_ULYSSES_NICS"
+    ),
+    "SGLANG_DIFFUSION_RDMA_ULYSSES_GID_INDICES": _lazy_str(
+        "SGLANG_DIFFUSION_RDMA_ULYSSES_GID_INDICES"
+    ),
+    "SGLANG_DIFFUSION_RDMA_ULYSSES_TIMEOUT_MS": _lazy_float(
+        "SGLANG_DIFFUSION_RDMA_ULYSSES_TIMEOUT_MS", 10000.0
     ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
