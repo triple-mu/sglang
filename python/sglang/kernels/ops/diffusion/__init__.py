@@ -40,6 +40,7 @@ from sglang.kernels.spec import (
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
+_CUDA_SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 
 # ---------------------------------------------------------------------------
@@ -495,6 +496,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "LingBot Video group-limited MoE top-k expert selection.",
     ),
     (
+        "diffusion.sage_block_sparse_attn_sm120",
+        KernelBackend.JIT,
+        "attention.sage_block_sparse_sm120_cake:sage_block_sparse_attn_sm120",
+        _CUDA_SM120,
+        "Sage QK-INT8 / PV-FP8 block-sparse attention over 64-token blocks (vendored Cake kernel).",
+    ),
+    (
         "diffusion.usp_merge_heads",
         KernelBackend.JIT,
         "layout.usp_relayout_jit:usp_merge_heads",
@@ -771,6 +779,9 @@ _EXPORTS: dict[str, str] = {
     "silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",
+    "can_use_sage_block_sparse_attn_sm120": "attention.sage_block_sparse_sm120_cake",
+    "sage_block_sparse_attn_sm120": "attention.sage_block_sparse_sm120_cake",
+    "sage_block_sparse_dense_block_index": "attention.sage_block_sparse_sm120_cake",
     "can_use_minimax_h3_vae_assemble_tiles": "layout.minimax_h3_vae_output_jit",
     "can_use_minimax_h3_vae_denorm_clamp": "layout.minimax_h3_vae_output_jit",
     "can_use_minimax_h3_vae_temporal_blend_write": "layout.minimax_h3_vae_output_jit",
