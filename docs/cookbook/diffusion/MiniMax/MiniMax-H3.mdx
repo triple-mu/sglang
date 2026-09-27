@@ -506,6 +506,138 @@ Both are deployment-level precision changes outside the quality contract:
 strict 4xH200 fingerprint behind `"quality": "high"` requires both to be off.
 Measure against an `exact` server on the target GPU before serving them.
 
+### 8x RTX PRO 5000 (SM120) without NVLink
+
+An eight-GPU SM120 host has no NVLink and no official SageAttention build, so
+the two things that dominate an H3 step there are the Ulysses all-to-all over
+PCIe and dense BF16 attention over 37.9k tokens. Three in-tree pieces address
+them, all SM120-only and each proven active from the server log:
+
+- `--attention-backend subblock_sparse_sage_sm120`: SubBlock routing on the
+  vendored Cake INT8/FP8 Sage block-sparse kernel. Every rank quantises its own
+  Q/K/V shard once and the Ulysses exchange carries the INT8/FP8 bytes instead
+  of BF16; the receiver ranks key blocks on dequantised copies and runs one
+  kernel for dense warmup steps and sparse steps alike. Takes the
+  `subblock_sparse_attn` schedule keys (`sparsity`, `skip_first_steps`, `n_k`,
+  `n_q`, `min_seq_len`); `compute_mode` is fixed. The packed sequence is padded
+  to 128 rows per Ulysses rank. The text encoder is set to `torch_sdpa`
+  automatically. Log: `SubBlock Sage SM120 route counters for this request:
+  quantised exchange N calls, BF16 exchange 0`.
+- `--minimax-h3-ulysses-transport rdma`: each rank drives its nearest mlx5
+  RoCE v2 port and moves the quantised payload, the attention output and the
+  per-layer quantisation statistics with RDMA writes into pre-registered
+  buffers (one JIT module, `libibverbs` + `libmlx5` at build time, one IPv4
+  RoCE v2 GID per port, CUDA peer access between all GPUs for the epoch
+  barrier, `--ring-degree 1`, no torch.compile or breakable CUDA graph). Pass
+  `--minimax-h3-ulysses-strict` for benchmarks so a transport that cannot start
+  fails instead of silently measuring NCCL. Logs: `RDMA Ulysses ready: 8 ranks,
+  NICs [...]` and `RDMA exchanges N` in the route counters.
+- Fused adaLN chain and fused SwiGLU + per-token FP8 quantisation in the DiT
+  blocks, on by default for every H3 deployment: both reproduce the eager
+  kernels bit for bit (the first fused step verifies this against the installed
+  torch and falls back for good otherwise). Logs: `fused adaLN chain engaged
+  (verified bit-exact)` and `fused SwiGLU + per-token fp8 quantisation feeds
+  fc2`. Kill switches: `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN=0`,
+  `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0`.
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 8 \
+  --tp-size 1 \
+  --ulysses-degree 8 \
+  --ring-degree 1 \
+  --performance-mode speed \
+  --quantization fp8 \
+  --minimax-h3-adaln-online true \
+  --minimax-h3-adaln-plan-width 2 \
+  --attention-backend subblock_sparse_sage_sm120 \
+  --attention-backend-config '{"sparsity": 0.75, "skip_first_steps": 10}' \
+  --minimax-h3-ulysses-transport rdma \
+  --minimax-h3-ulysses-strict \
+  --component-quantizations.video_vae fp8 \
+  --component-residency video_vae=resident \
+  --warmup-mode request --warmup-resolutions 1344x768 --warmup-steps 50 \
+  --port 30010
+```
+
+Requests then add `"quality": "extra-high"` for the FP8 video VAE fast path.
+`--warmup-steps` equal to the serving step count lets the online AdaLN rebuild
+prepare the serving plans during warmup; a shorter warmup pushes a 4 s rebuild
+into the first request. Transport overrides: `SGLANG_DIFFUSION_RDMA_ULYSSES_NICS`
+and `SGLANG_DIFFUSION_RDMA_ULYSSES_GID_INDICES` (rank-ordered comma lists),
+`SGLANG_DIFFUSION_RDMA_ULYSSES_TIMEOUT_MS` (default 10000);
+`--minimax-h3-ulysses-max-seq-len` (default 98304) sizes the registered slots,
+about 264 MB per slot per rank. `lowp_a2a: false` in the backend config keeps a
+BF16 exchange for comparison.
+
+For the PDD eight-step adapter (see [PDD acceleration LoRAs](#pdd-acceleration-loras)),
+add `--transformer-weights-path "$PDD_DIR/transformer"` and
+`SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS`, send `num_inference_steps: 9` with
+`flow_shift: 12.0` and `audio_flow_shift: 3.0`, and use `--warmup-steps 9`.
+
+Measured on one such host (t2va, 1344x768, 124 frames, 5 s of video, fp8
+GEMMs, online AdaLN; `sglang generate` end to end including the VAE decode,
+medians of the per-step denoise time with step 0 dropped). The 50-step rows
+are medians of three interleaved runs; their per-step spread is 17 ms for the
+first row and under 1 ms for the RDMA rows. Sparse rows keep dense Sage
+attention for the first ten steps and route with sparsity 0.75 afterwards:
+
+| Deployment | Steps | End to end (s) | Per step (ms) | Speed-up | PSNR against the first row (dB, all frames / worst frame) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| dense `torch_sdpa`, NCCL, fusions off (the default path) | 50 | 106.7 | 2056 | 1.00x | reference; bit-identical to the baseline taken before the SM120 pieces landed |
+| dense `fp8_fa_sm120`, NCCL | 50 | 102.3 | 1944 | 1.06x | 25.9 / 24.2 |
+| `subblock_sparse_sage_sm120` with a BF16 exchange (`lowp_a2a: false`), NCCL | 50 | 63.7 | 1073 | 1.92x | 23.3 / 22.8 |
+| `subblock_sparse_sage_sm120`, quantised exchange, NCCL | 50 | 58.7 | 931 | 2.21x | 22.7 / 22.1 |
+| same over `--minimax-h3-ulysses-transport rdma` | 50 | 52.3 | 863 | 2.38x | bit-identical to the NCCL row |
+| same plus the fused adaLN chain and fused SwiGLU quantisation (default) | 50 | 51.5 | 846 | 2.43x | bit-identical to the RDMA row |
+| PDD 8-step, dense `torch_sdpa`, NCCL, lossless VAE | 9 | 18.25 | 2015 | | PDD anchor |
+| PDD 8-step, sparse Sage from step 2 + RDMA + fusions, lossless VAE | 9 | 9.73 | 838 | 1.88x over the anchor | 20.2 / 18.7 against the PDD anchor |
+| same plus the FP8 video VAE (`extra-high`) | 9 | 8.87 | 840 | 2.06x over the anchor | decode 2.01 s to 1.14 s |
+| PDD 8-step, sparse Sage + RDMA + fusions, Cache-DiT caching steps 4 and 6 (default dynamic settings or the static mask below), lossless VAE | 9 | 8.10 | 841 | 2.25x over the anchor | 20.2 / 18.6 against the PDD anchor, 32.0 / 29.8 against the uncached row |
+
+The fl2va task moves the same way: 126.6 s to 61.0 s end to end (2434 to
+1017 ms per step) at 25.6 dB (worst frame 22.6 dB) against the dense run.
+An nsys capture of the last 50-step row shows no `ncclDevKernel_SendRecv`
+left, the Cake kernel on every attention call and the fused kernels on every
+block; fp8 GEMMs are then 45% of the GPU kernel time, attention 30%, the
+RDMA exchange and quantisation 8%.
+
+PSNR against the BF16 `torch_sdpa` output measures how far the sampling
+trajectory moves, not perceptual quality, and every reduced-precision
+attention on this host lands in the 22 to 26 dB band after 50 steps: the
+dense FP8 flash attention at 25.9 dB, Sage INT8/FP8 attention at 22.7 dB
+(23.3 dB when only the attention is quantised and the exchange stays BF16).
+On the eight-step PDD schedule the distance from the PDD anchor again comes
+from the quantised attention itself, not from the sparsity: dense Sage
+attention on every step lands at 20.5 dB (worst frame 19.3 dB), and sparsity
+0.5 to 0.75 starting at step 2 to 4 stays within 1 dB of that. Choose the
+sparse schedule for speed and validate the quantised attention on the target
+prompts before serving it.
+
+Cache-DiT mounts on this deployment only for requests that leave `quality`
+unset: an explicit `quality`, including the `extra-high` the FP8 VAE fast path
+needs, keeps the generic Cache-DiT off, and `quality: "high"` is refused
+outside the 4xH200 fingerprint. On the eight-step PDD schedule the default
+DBCache settings (`SGLANG_CACHE_DIT_ENABLED=true` with Fn=1, Bn=0, four
+warmup steps, residual threshold 0.24, at most three consecutive cached steps)
+cache steps 4 and 6 and recompute the other six: the denoise stage goes from
+7.6 s to 6.1 s and stays at 32 dB (worst frame 29.8 dB) against the uncached
+run. Two warmup steps or a threshold of 0.5 cache three steps (5.3 s, 25 to
+28 dB). A static step mask pins the same six-of-eight schedule regardless of
+the residuals:
+
+```bash Static Cache-DiT mask, six of eight PDD steps computed
+SGLANG_CACHE_DIT_ENABLED=true SGLANG_CACHE_DIT_SCM_POLICY=static \
+SGLANG_CACHE_DIT_SCM_COMPUTE_BINS=4,1,1 SGLANG_CACHE_DIT_SCM_CACHE_BINS=1,1 \
+SGLANG_CACHE_DIT_WARMUP=0 SGLANG_CACHE_DIT_FN=1 SGLANG_CACHE_DIT_BN=0
+```
+
+Runs and logs behind these numbers live under
+`h3-experiments/minimax-h3-sm120-all/2026-09-26/` in the maintainer's
+experiment tree.
+
 ### Serve MiniMax-H3 on Ascend NPUs
 
 For Ascend NPU, follow the
