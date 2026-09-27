@@ -88,7 +88,7 @@ def ulysses_lowp_payload_spec(
         raise ValueError(
             f"local_sequence must be a positive multiple of {SHARD_ALIGNMENT}, got {local_sequence}"
         )
-    if world_size < 2 or num_heads % world_size:
+    if world_size < 1 or num_heads % world_size:
         raise ValueError(
             f"num_heads {num_heads} must split evenly over world_size {world_size}"
         )
@@ -133,7 +133,7 @@ def can_use_ulysses_lowp_sage(
     return (
         head_dim == HEAD_DIM
         and local_sequence % SHARD_ALIGNMENT == 0
-        and world_size >= 2
+        and world_size >= 1
         and heads % world_size == 0
         and all(t.stride(-1) == 1 for t in (q, k, v))
     )
