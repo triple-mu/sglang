@@ -255,13 +255,29 @@ inline ibv_mr* RegisterGpuMr(ibv_pd* pd, void* pointer, size_t bytes, int access
   return mr;
 }
 
-inline bool IsCompact(TensorView tensor) {
-  int64_t expected = 1;
-  for (int axis = tensor.ndim() - 1; axis >= 0; --axis) {
-    if (tensor.size(axis) != 1 && tensor.stride(axis) != expected) return false;
-    expected *= tensor.size(axis);
-  }
-  return true;
+// A uint8 view over transport-owned device memory. The DLManagedTensor lives
+// on the heap because tvm-ffi keeps the pointer it is handed and calls its
+// deleter from the Tensor destructor; the memory itself stays the slot's.
+inline Tensor ViewDeviceBytes(void* data, int64_t bytes, int device) {
+  struct Blob {
+    DLManagedTensor managed{};
+    int64_t shape[1]{};
+    int64_t strides[1]{1};
+  };
+  auto* blob = new Blob{};
+  blob->shape[0] = bytes;
+  blob->managed.dl_tensor = DLTensor{
+      .data = data,
+      .device = DLDevice{kDLCUDA, device},
+      .ndim = 1,
+      .dtype = DLDataType{kDLUInt, 8, 1},
+      .shape = blob->shape,
+      .strides = blob->strides,
+      .byte_offset = 0,
+  };
+  blob->managed.manager_ctx = blob;
+  blob->managed.deleter = [](DLManagedTensor* self) { delete static_cast<Blob*>(self->manager_ctx); };
+  return Tensor::FromDLPack(&blob->managed);
 }
 
 inline int64_t ElementBytes(TensorView tensor) {
@@ -910,7 +926,7 @@ inline Slot* FindSlot(Transport* transport, int64_t index) {
 inline Geometry DescribeGeometry(int mode, TensorView input, TensorView output, int world_size) {
   Geometry geometry{};
   geometry.mode = mode;
-  CHECK_HOST(IsCompact(input) && IsCompact(output)) << "RDMA Ulysses operands must be contiguous";
+  CHECK_HOST(input.IsContiguous() && output.IsContiguous()) << "RDMA Ulysses operands must be contiguous";
   CHECK_HOST(input.dtype().bits == output.dtype().bits && input.dtype().lanes == output.dtype().lanes)
       << "input/output element size mismatch";
   const int64_t element = ElementBytes(input);
@@ -1084,12 +1100,8 @@ inline Tuple<int64_t, Tensor, Tensor, Array<int64_t>> register_slot(int64_t hand
     }
   }
 
-  const DLDataType u8{kDLUInt, 8, 1};
-  const DLDevice dl_device{kDLCUDA, transport->device};
-  int64_t shape[1] = {capacity_bytes};
-  const tvm::ffi::ShapeView shape_view(shape, 1);
-  Tensor output = host::ffi::from_blob(slot->output, shape_view, u8, dl_device);
-  Tensor landing = host::ffi::from_blob(slot->landing, shape_view, u8, dl_device);
+  Tensor output = ViewDeviceBytes(slot->output, capacity_bytes, transport->device);
+  Tensor landing = ViewDeviceBytes(slot->landing, capacity_bytes, transport->device);
   transport->slots.push_back(std::move(slot));
   return Tuple<int64_t, Tensor, Tensor, Array<int64_t>>(
       static_cast<int64_t>(transport->slots.size() - 1), output, landing, Encode(wire));
