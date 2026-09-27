@@ -6,7 +6,10 @@ import torch
 
 from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
+    MiniMaxH3DiTConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
 )
@@ -126,12 +129,49 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         attention_backend = self._server_arg_value(attention_backend)
         return AttentionBackendEnum[str(attention_backend).strip().upper()]
 
+    def _validate_subblock_sage_sm120(self, server_args) -> None:
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.to_int() != 120:
+            raise ValueError(
+                "subblock_sparse_sage_sm120 needs compute capability 12.0; "
+                f"found {capability.as_version_str()}."
+            )
+        if "compute_mode" in (server_args.attention_backend_config or {}):
+            raise ValueError(
+                "subblock_sparse_sage_sm120 always runs the Sage INT8/FP8 kernel; "
+                "drop compute_mode from --attention-backend-config."
+            )
+        heads = self.dit_config.arch_config.num_attention_heads // int(
+            server_args.tp_size or 1
+        )
+        ulysses_degree = int(server_args.ulysses_degree or 1)
+        if heads % ulysses_degree:
+            raise ValueError(
+                "subblock_sparse_sage_sm120 needs the attention heads to split "
+                f"evenly over Ulysses: {heads} heads per TP rank, "
+                f"--ulysses-degree {ulysses_degree}."
+            )
+
     def uses_subblock_attention(self, server_args) -> bool:
         """Return whether H3 must build SubBlock-only request metadata."""
-        return (
-            self.resolve_transformer_attention_backend(server_args)
-            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        return self.resolve_transformer_attention_backend(server_args) in (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120,
         )
+
+    def packed_sequence_alignment(self, server_args) -> int:
+        """Row alignment of the packed sequence.
+
+        The quantised Ulysses exchange quantises in 32- and 64-token groups
+        that must not straddle ranks, so every rank's shard is a whole number
+        of 128-row blocks; the extra rows are zero padding after `used`.
+        """
+        if (
+            self.resolve_transformer_attention_backend(server_args)
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120
+        ):
+            return 128 * int(server_args.ulysses_degree or 1)
+        return MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
 
     def validate_quality_deployment(self, server_args) -> None:
         """Fail closed unless the resident server matches the deployment
@@ -312,6 +352,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     )
 
                     _load_sm120_sage_ops()
+        if selected_backend is AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120:
+            self._validate_subblock_sage_sm120(server_args)
         if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
             if server_args.ring_degree > 1:
                 raise ValueError(

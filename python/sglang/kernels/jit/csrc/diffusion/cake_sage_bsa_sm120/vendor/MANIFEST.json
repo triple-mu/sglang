@@ -1,0 +1,149 @@
+{
+  "arch": "sm_120a",
+  "arg_plan": [
+    [
+      "tma_buffer",
+      "Q_map"
+    ],
+    [
+      "tma_buffer",
+      "K_map"
+    ],
+    [
+      "tma_buffer",
+      "V_map"
+    ],
+    [
+      "tma_buffer",
+      "O_map"
+    ],
+    [
+      "buffer",
+      "q_scale"
+    ],
+    [
+      "buffer",
+      "k_scale"
+    ],
+    [
+      "buffer",
+      "v_scale"
+    ],
+    [
+      "buffer",
+      "q2k_block_index"
+    ],
+    [
+      "buffer",
+      "q2k_block_nums"
+    ],
+    [
+      "buffer",
+      "block_sizes"
+    ],
+    [
+      "parameter",
+      "seqlen_q"
+    ],
+    [
+      "parameter",
+      "seqlen_k"
+    ],
+    [
+      "parameter",
+      "num_heads"
+    ],
+    [
+      "parameter",
+      "q2k_capacity"
+    ],
+    [
+      "parameter",
+      "num_k_blocks"
+    ],
+    [
+      "parameter",
+      "block_sparse_num"
+    ],
+    [
+      "parameter",
+      "softmax_scale"
+    ],
+    [
+      "workspace",
+      "tma_descriptor_workspace"
+    ],
+    [
+      "grid",
+      "grid_x"
+    ],
+    [
+      "grid",
+      "grid_y"
+    ],
+    [
+      "grid",
+      "grid_z"
+    ]
+  ],
+  "arg_plan_sha256": "1c1469cf505675f0870f0391cc3016b884a7465663d1c9781231f5f06f5c98f9",
+  "closure": [
+    {
+      "bytes": 109524,
+      "path": "csrc/cake_sage_block_sparse_attention/sm_120a/cake_sage_block_sparse_attention_939d22c4b83f8f4c938f_kernel.cu",
+      "sha256": "faacbf9c99619f01d553cf17a9a9a0fd6d1a259c2f887fd9d0c6f5f04f55b59b"
+    },
+    {
+      "bytes": 23822,
+      "path": "csrc/cake_sage_block_sparse_attention/sm_120a/cake_sage_block_sparse_attention_939d22c4b83f8f4c938f_binding.cu",
+      "sha256": "291a2415960efed14e3ce357d095c6321920aed5e4342d5451f01df44649be95"
+    }
+  ],
+  "closure_sha256": "762b8b7db80349a2099daeebf5048461b5972d66e83096e2ae674e792b8cdb29",
+  "compile_flags": [
+    "--use_fast_math"
+  ],
+  "kernel_symbol": "kernel_cake_sage_block_sparse_attention_939d22c4b83f8f4c938f",
+  "launch": {
+    "block": [
+      128,
+      1,
+      1
+    ],
+    "cluster": [
+      1,
+      1,
+      1
+    ],
+    "cooperative": false,
+    "dynamic_smem_bytes": 25600,
+    "use_pdl": false
+  },
+  "module_ident": "cake_sage_block_sparse_attention_939d22c4b83f8f4c938f_sm_120a",
+  "name": "cake_sage_block_sparse_attention_939d22c4b83f8f4c938f",
+  "provenance": {
+    "commit": "8db743f1218915866f6bc2f0e8921e4b8901967c",
+    "commit_date": "2026-09-03T23:00:39-07:00",
+    "license": "Apache-2.0 (vendor/LICENSE)",
+    "manifest": "csrc/cake_sage_block_sparse_attention/cake_sage_block_sparse_attention_manifest.json",
+    "not_vendored": [
+      "csrc/cake_sage_block_sparse_attention/sm_120a/cake_sage_block_sparse_attention_939d22c4b83f8f4c938f_binding.cu (tvm_ffi_utils.h binding; replaced by entry.cuh)"
+    ],
+    "pull_request": "https://github.com/flashinfer-ai/flashinfer/pull/4951",
+    "repository": "https://github.com/flashinfer-ai/flashinfer.git",
+    "vendored": [
+      "csrc/cake_sage_block_sparse_attention/sm_120a/cake_sage_block_sparse_attention_939d22c4b83f8f4c938f_kernel.cu"
+    ]
+  },
+  "route": {
+    "source_identity": "939d22c4b83f8f4c938faa376b9d48e5413ef785d48cb1b28122fc4362eaccac"
+  },
+  "specialization": {
+    "BLOCK_SIZES_MODE": 0,
+    "CONTIGUOUS_BLOCK_INDICES": 0,
+    "FULL_K64_TILES": 1,
+    "HAS_BLOCK_NUMS": 1,
+    "UNIFORM_NONEMPTY": 0
+  },
+  "tma_workspace_bytes": 512
+}

@@ -674,15 +674,6 @@ def _minimax_h3_attention_core_impl(
     kernel and sequence-parallel collectives execute eagerly.
     """
 
-    if ulysses_active:
-        from sglang.multimodal_gen.runtime.layers.usp import (
-            _usp_all_gather,
-            _usp_input_all_to_all_packed_qkv,
-            _usp_output_all_to_all,
-        )
-
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
-
     if attention._attention_impl is None:
         attention._set_attention_backend(
             get_attn_backend(
@@ -692,6 +683,32 @@ def _minimax_h3_attention_core_impl(
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
+
+    if ulysses_active:
+        from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_all_gather,
+            _usp_input_all_to_all_packed_qkv,
+            _usp_output_all_to_all,
+        )
+
+        if (
+            attention._attention_backend_enum
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120
+        ):
+            # Quantised exchange: the shard is quantised before the all-to-all
+            # and the heads come back attended. None means run the BF16 path.
+            out = attention._attention_impl.forward_ulysses_lowp(
+                q,
+                k,
+                v,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                ring_active=ring_active,
+                sparse_query_block_mask=subblock_sparse_query_block_mask,
+            )
+            if out is not None:
+                return _usp_output_all_to_all(out[None], head_dim=2)[0]
+        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
         attn_metadata = (
@@ -747,9 +764,9 @@ def _minimax_h3_attention_core_impl(
             ring_ws=ring_ws,
         )
     else:
-        if (
-            attention._attention_backend_enum
-            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        if attention._attention_backend_enum in (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120,
         ):
             impl = attention._attention_impl
             sparse_will_run = (

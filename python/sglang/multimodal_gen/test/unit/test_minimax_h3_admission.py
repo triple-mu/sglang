@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args.server_args import Backend
 
 TARGET = {
@@ -364,6 +365,7 @@ def _quality_server_args():
         num_gpus=4,
         backend=Backend.AUTO,
         component_attention_backends={},
+        component_quantizations={},
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
@@ -547,6 +549,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
         component_attention_backends={},
+        component_quantizations={},
         attention_backend="sage_attn",
         ring_degree=1,
         resolve_component_attention_backend=lambda *_names: (None, None),
@@ -582,6 +585,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
         component_attention_backends={"transformer": "subblock_sparse_attn"},
+        component_quantizations={},
         attention_backend="fa",
         attention_backend_config={},
         ring_degree=1,
@@ -608,11 +612,14 @@ def test_resolve_transformer_attention_backend_uses_selector_precedence():
     subblock = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
     fa = AttentionBackendEnum.FA
     sdpa = AttentionBackendEnum.TORCH_SDPA
+    sage = AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120
     cases = (
         ("fa", subblock, None, subblock),
         ("subblock_sparse_attn", fa, None, fa),
         (subblock, None, None, subblock),
         ("fa", subblock, sdpa, sdpa),
+        ("subblock_sparse_sage_sm120", None, None, sage),
+        ("fa", sage, None, sage),
     )
     for global_backend, component_backend, forced_backend, expected in cases:
         server_args = SimpleNamespace(
@@ -630,7 +637,92 @@ def test_resolve_transformer_attention_backend_uses_selector_precedence():
             resolved = config.resolve_transformer_attention_backend(server_args)
             assert resolved is expected
             assert config.uses_subblock_attention(server_args) is (
-                expected is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+                expected in (AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN, sage)
+            )
+
+
+def _sage_sm120_server_args(**overrides):
+    args = dict(
+        component_attention_backends={},
+        component_quantizations={},
+        attention_backend="subblock_sparse_sage_sm120",
+        attention_backend_config={},
+        ring_degree=1,
+        tp_size=1,
+        ulysses_degree=8,
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+def _sm120_capability():
+    return patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.current_platform.get_device_capability",
+        return_value=DeviceCapability(12, 0),
+    )
+
+
+def test_sage_sm120_aligns_the_packed_sequence_to_128_rows_per_rank():
+    config = MiniMaxH3PipelineConfig()
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_global_forced_attn_backend",
+        return_value=None,
+    ):
+        assert config.packed_sequence_alignment(_sage_sm120_server_args()) == 1024
+        assert (
+            config.packed_sequence_alignment(
+                _sage_sm120_server_args(ulysses_degree=None)
+            )
+            == 128
+        )
+        assert (
+            config.packed_sequence_alignment(
+                _sage_sm120_server_args(attention_backend="subblock_sparse_attn")
+            )
+            == 64
+        )
+
+
+def test_sage_sm120_admission_checks_topology_and_device():
+    config = MiniMaxH3PipelineConfig()
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.layers.attention.selector.get_global_forced_attn_backend",
+            return_value=None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+        ),
+    ):
+        with _sm120_capability():
+            MiniMaxH3PipelineConfig.validate_server_args(
+                config, _sage_sm120_server_args()
+            )
+            with pytest.raises(ValueError, match="split evenly over Ulysses"):
+                MiniMaxH3PipelineConfig.validate_server_args(
+                    config, _sage_sm120_server_args(ulysses_degree=3)
+                )
+            with pytest.raises(ValueError, match="compute_mode"):
+                MiniMaxH3PipelineConfig.validate_server_args(
+                    config,
+                    _sage_sm120_server_args(
+                        attention_backend_config={"compute_mode": "bf16"}
+                    ),
+                )
+            with pytest.raises(ValueError, match="ring parallelism"):
+                MiniMaxH3PipelineConfig.validate_server_args(
+                    config, _sage_sm120_server_args(ring_degree=2)
+                )
+        with (
+            patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.current_platform.get_device_capability",
+                return_value=DeviceCapability(9, 0),
+            ),
+            pytest.raises(ValueError, match="compute capability 12.0"),
+        ):
+            MiniMaxH3PipelineConfig.validate_server_args(
+                config, _sage_sm120_server_args()
             )
 
 
@@ -644,6 +736,7 @@ def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
     }
     server_args = SimpleNamespace(
         component_attention_backends={},
+        component_quantizations={},
         attention_backend=None,
         enable_torch_compile=False,
         ring_degree=1,
