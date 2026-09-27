@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE: bool = False
+    SGLANG_DIFFUSION_NSYS_CAPTURE_STAGE: str | None = None
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
@@ -328,6 +329,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # alone (weight loading, distributed init and warmup stay out).
     "SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE": _lazy_bool(
         "SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE"
+    ),
+    # Name of the one pipeline stage to bracket instead of the whole request
+    # (e.g. MiniMaxH3DenoisingStage): the nsys capture then holds the model
+    # alone, without text encoding or VAE decode.
+    "SGLANG_DIFFUSION_NSYS_CAPTURE_STAGE": _lazy_str(
+        "SGLANG_DIFFUSION_NSYS_CAPTURE_STAGE"
     ),
     # Kill-switch for the warmup-calibrated auto residency promotion that runs
     # under `--performance-mode auto` with server warmup. Set to disable the
