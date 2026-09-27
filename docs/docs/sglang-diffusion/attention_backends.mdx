@@ -82,7 +82,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`subblock_sparse_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SUBBLOCK_SPARSE_ATTN`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Training-free SubBlock sparsity for MiniMax-H3 on CUDA SM90, SM100, and SM120. The default compute mode is BF16; <code>compute_mode=sage_fp8</code> is an approximate SM90-only path that requires <code>SpargeAttn</code>. See the <a href="/cookbook/diffusion/MiniMax/MiniMax-H3#subblock-sparse-attention">MiniMax-H3 recipe</a>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Training-free SubBlock sparsity for MiniMax-H3 on CUDA SM90, SM100, and SM120. The default compute mode is BF16; <code>compute_mode=sage_fp8</code> is an approximate INT8/FP8 path on SM90 (needs <code>SpargeAttn</code>) and SM120 (needs FlashInfer's CuTe-DSL Sage kernel). On SM120, <code>subblock_sparse_sage_sm120</code> below carries the Sage kernel in tree. See the <a href="/cookbook/diffusion/MiniMax/MiniMax-H3#subblock-sparse-attention">MiniMax-H3 recipe</a>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`subblock_sparse_sage_sm120`</td>
