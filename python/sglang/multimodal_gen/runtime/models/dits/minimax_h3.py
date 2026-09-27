@@ -1308,7 +1308,9 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_per_token_fp8_input(
             self.fc2
         ) and can_use_silu_mul_per_token_quant_fp8(hidden):
-            # One pass: SwiGLU, per-token amax and the fp8 rows fc2 consumes.
+            # One pass: SwiGLU, per-token amax and the fp8 rows fc2 consumes; the
+            # same per-token quantisation the fp8 GEMM applies itself, one kernel
+            # and one activation round trip fewer.
             logger.info_once(
                 "MiniMax-H3 MLP: fused SwiGLU + per-token fp8 quantisation feeds fc2"
             )
