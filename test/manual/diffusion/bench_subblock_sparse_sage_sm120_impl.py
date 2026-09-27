@@ -9,7 +9,6 @@ the MiniMax-H3 768p 5 s geometry, for a dense-table step and a routed step.
 
 from __future__ import annotations
 
-import time
 from unittest.mock import patch
 
 import torch
@@ -24,7 +23,11 @@ SCALE = HEAD_DIM**-0.5
 
 
 class _FakeServerArgs:
-    attention_backend_config = {"sparsity": 0.75, "skip_first_steps": 2, "min_seq_len": 4096}
+    attention_backend_config = {
+        "sparsity": 0.75,
+        "skip_first_steps": 2,
+        "min_seq_len": 4096,
+    }
 
 
 def _impl():
@@ -33,10 +36,16 @@ def _impl():
             "sglang.multimodal_gen.runtime.server_args.get_global_server_args",
             return_value=_FakeServerArgs(),
         ),
-        patch.object(mod.SubBlockSparseSageSM120Impl, "_build_dense_impl", return_value=None),
+        patch.object(
+            mod.SubBlockSparseSageSM120Impl, "_build_dense_impl", return_value=None
+        ),
     ):
         return mod.SubBlockSparseSageSM120Impl(
-            num_heads=HEADS, head_size=HEAD_DIM, causal=False, softmax_scale=SCALE, prefix="blocks.3.attn"
+            num_heads=HEADS,
+            head_size=HEAD_DIM,
+            causal=False,
+            softmax_scale=SCALE,
+            prefix="blocks.3.attn",
         )
 
 
@@ -78,42 +87,72 @@ def main():
     with _step(0):
         timed("forward_varlen dense table", lambda: impl.forward_varlen(q, k, v, **kw))
     with _step(5):
-        timed("forward_varlen routed, no mask", lambda: impl.forward_varlen(q, k, v, **kw))
+        timed(
+            "forward_varlen routed, no mask", lambda: impl.forward_varlen(q, k, v, **kw)
+        )
         timed(
             "forward_varlen routed, video mask",
-            lambda: impl.forward_varlen(q, k, v, first_segment_sparse_query_block_mask=mask, **kw),
+            lambda: impl.forward_varlen(
+                q, k, v, first_segment_sparse_query_block_mask=mask, **kw
+            ),
         )
 
-    op = timed("_quantize_local (W=1 kernels)", lambda: mod._quantize_local(q, k, v, used=USED))
+    op = timed(
+        "_quantize_local (W=1 kernels)", lambda: mod._quantize_local(q, k, v, used=USED)
+    )
     cut = -(-USED // 64) * 64
     route = timed(
         "_dequantize_for_routing",
-        lambda: mod._dequantize_for_routing(op.q[:, :, :USED], op.k[:, :, :USED], op.k_scale),
+        lambda: mod._dequantize_for_routing(
+            op.q[:, :, :USED], op.k[:, :, :USED], op.k_scale
+        ),
     )
     plan = timed(
         "router.route",
         lambda: impl.router.route(
-            route[0].transpose(1, 2), route[1].transpose(1, 2), sparsity=0.75, softmax_scale=SCALE
+            route[0].transpose(1, 2),
+            route[1].transpose(1, 2),
+            sparsity=0.75,
+            softmax_scale=SCALE,
         ),
     )
     num_blocks = cut // 64
-    timed("cake_block_tables no mask", lambda: mod.cake_block_tables(plan.index, plan.topk, num_blocks, None))
+    timed(
+        "cake_block_tables no mask",
+        lambda: mod.cake_block_tables(plan.index, plan.topk, num_blocks, None),
+    )
     tables = timed(
         "cake_block_tables video mask",
         lambda: mod.cake_block_tables(plan.index, plan.topk, num_blocks, mask),
     )
     out = torch.empty(1, HEADS, SEQ, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    dense_index, dense_nums = mod.sage_block_sparse_dense_block_index(1, HEADS, cut, cut, q.device)
-    sparse_index, sparse_nums = mod.cake_block_tables(plan.index, plan.topk, num_blocks, None)
+    dense_index, dense_nums = mod.sage_block_sparse_dense_block_index(
+        1, HEADS, cut, cut, q.device
+    )
+    sparse_index, sparse_nums = mod.cake_block_tables(
+        plan.index, plan.topk, num_blocks, None
+    )
 
     def cake(index, nums):
         return sage_block_sparse_attn_sm120(
-            op.q, op.k, op.v, op.q_scale, op.k_scale, op.v_scale, index, nums,
-            out=out, seqlen_q=cut, seqlen_k=cut, softmax_scale=SCALE,
+            op.q,
+            op.k,
+            op.v,
+            op.q_scale,
+            op.k_scale,
+            op.v_scale,
+            index,
+            nums,
+            out=out,
+            seqlen_q=cut,
+            seqlen_k=cut,
+            softmax_scale=SCALE,
         )
 
     timed("cake dense table (592/592)", lambda: cake(dense_index, dense_nums))
-    timed(f"cake sparse table ({plan.topk}/592)", lambda: cake(sparse_index, sparse_nums))
+    timed(
+        f"cake sparse table ({plan.topk}/592)", lambda: cake(sparse_index, sparse_nums)
+    )
     timed("cake heterogeneous (video mask)", lambda: cake(*tables))
     print(f"plan: topk={plan.topk} of {num_blocks} blocks")
 
