@@ -326,9 +326,8 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         )
 
     def forward(self, query, key, value, attn_metadata=None) -> torch.Tensor:
-        raise NotImplementedError(
-            "subblock_sparse_sage_sm120 serves MiniMax-H3's packed varlen attention only"
-        )
+        """`[B, S, H, D]` attention outside the DiT (the video VAE reaches every backend): dense."""
+        return self.dense_impl.forward(query, key, value, attn_metadata)
 
     def forward_varlen(
         self,
