@@ -46,9 +46,28 @@ def _maybe_cuda_profiler_range(batch: Req):
     opened on only some ranks deadlocks the next collective, and nsys
     collects session-wide anyway.
     """
-    if not envs.SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE or getattr(
-        batch, "is_warmup", False
+    if (
+        not envs.SGLANG_DIFFUSION_NSYS_CAPTURE_RANGE
+        or envs.SGLANG_DIFFUSION_NSYS_CAPTURE_STAGE
+        or getattr(batch, "is_warmup", False)
     ):
+        yield
+        return
+    torch.cuda.profiler.start()
+    try:
+        yield
+    finally:
+        torch.cuda.profiler.stop()
+
+
+@contextlib.contextmanager
+def _maybe_cuda_profiler_stage_range(stage_name: str, is_warmup: bool):
+    """Bracket one named stage instead of the whole request.
+
+    ``SGLANG_DIFFUSION_NSYS_CAPTURE_STAGE`` selects the stage; nsys then
+    records the model alone, without text encoding or VAE decode.
+    """
+    if is_warmup or envs.SGLANG_DIFFUSION_NSYS_CAPTURE_STAGE != stage_name:
         yield
         return
     torch.cuda.profiler.start()
@@ -153,14 +172,17 @@ class PipelineExecutor(ABC):
         stage_name = stage._component_stage_name()
         self.before_stage(stage, stage_index, payload, server_args)
         with maybe_record_function(f"STAGE {stage_name}"):
-            with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
-                with conditioning_cache_group(
-                    enabled=(isinstance(payload, list) and len(payload) > 1)
-                    or (isinstance(payload, Req) and payload.batch_size > 1)
-                ):
-                    payload = self.run_stage_with_context(
-                        stage, payload, server_args, run_stage
-                    )
+            with _maybe_cuda_profiler_stage_range(
+                stage_name, self._is_warmup_payload(payload)
+            ):
+                with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                    with conditioning_cache_group(
+                        enabled=(isinstance(payload, list) and len(payload) > 1)
+                        or (isinstance(payload, Req) and payload.batch_size > 1)
+                    ):
+                        payload = self.run_stage_with_context(
+                            stage, payload, server_args, run_stage
+                        )
         return payload
 
     @staticmethod
