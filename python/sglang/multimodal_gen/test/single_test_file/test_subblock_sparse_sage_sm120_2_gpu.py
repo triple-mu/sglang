@@ -51,7 +51,11 @@ def _worker() -> int:
     )
 
     class _FakeServerArgs:
-        attention_backend_config = {"sparsity": 0.5, "skip_first_steps": 10}
+        attention_backend_config = {
+            "sparsity": 0.5,
+            "skip_first_steps": 10,
+            "min_seq_len": 512,
+        }
 
     class _Ctx:
         current_timestep = 0
