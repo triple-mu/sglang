@@ -940,8 +940,11 @@ def destroy_model_parallel() -> None:
     # The IPC transport keeps CUDA mappings associated with the current
     # Ulysses group. Drop them before tearing down the process groups.
     from .device_communicators.ipc_a2a import IPC_A2A
+    from .device_communicators.rdma_ulysses_a2a import shutdown_rdma_ulysses_a2a
     from .parallel_groups import PROCESS_GROUP
 
+    # Collective: the RDMA slots hold peer IPC imports and registered memory.
+    shutdown_rdma_ulysses_a2a()
     IPC_A2A.reset()
 
     destroyed_groups = []

@@ -707,7 +707,7 @@ def _minimax_h3_attention_core_impl(
                 sparse_query_block_mask=subblock_sparse_query_block_mask,
             )
             if out is not None:
-                return _usp_output_all_to_all(out[None], head_dim=2)[0]
+                return attention._attention_impl.gather_output(out)
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:

@@ -828,7 +828,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     collector=collector,
                 )
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
-            sage_lowp = _sage_lowp_route_log(server_args)
+            sage_lowp = _sage_lowp_route_log(server_args, device)
             if sage_lowp is not None:
                 sage_lowp.reset()
             with (
@@ -1129,7 +1129,11 @@ def _maybe_prepare_vsa_h3_step_metadata(
 
 
 class _SageLowpRouteLog:
-    """Per-request route counters of the quantised Ulysses exchange."""
+    """Per-request route counters of the quantised Ulysses exchange and its transport."""
+
+    def __init__(self, server_args: ServerArgs, device: torch.device) -> None:
+        self._transport = _ulysses_rdma_transport(server_args, device)
+        self._exchanges_before = 0
 
     def reset(self) -> None:
         from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_sage_sm120 import (
@@ -1137,6 +1141,8 @@ class _SageLowpRouteLog:
         )
 
         reset_lowp_counters()
+        if self._transport is not None:
+            self._exchanges_before = self._transport.exchanges
 
     def log(self) -> None:
         from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_sage_sm120 import (
@@ -1147,21 +1153,54 @@ class _SageLowpRouteLog:
         fallbacks = {
             k: v for k, v in counters.items() if k.startswith("bf16_a2a_total")
         }
+        rdma = (
+            "no RDMA transport"
+            if self._transport is None
+            else f"RDMA exchanges {self._transport.exchanges - self._exchanges_before}"
+        )
         log = logger.warning if fallbacks else logger.info
         log(
             "MiniMax-H3 SubBlock Sage SM120 route counters for this request: "
             f"quantised exchange {counters.get('lowp_a2a_total', 0)} calls, "
-            f"BF16 exchange {fallbacks or 0}"
+            f"BF16 exchange {fallbacks or 0}, {rdma}"
         )
 
 
-def _sage_lowp_route_log(server_args: ServerArgs) -> _SageLowpRouteLog | None:
+def _ulysses_rdma_transport(server_args: ServerArgs, device: torch.device):
+    """The RDMA transport for this Ulysses group, built collectively on first use."""
+    if server_args.minimax_h3_ulysses_transport != "rdma":
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.rdma_ulysses_a2a import (
+        get_rdma_ulysses_a2a,
+    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_sp_group,
+        get_tp_world_size,
+        get_ulysses_parallel_world_size,
+    )
+
+    if get_ulysses_parallel_world_size() < 2:
+        return None
+    arch = server_args.pipeline_config.dit_config.arch_config
+    return get_rdma_ulysses_a2a(
+        get_sp_group().ulysses_group,
+        device,
+        max_seq_len=server_args.minimax_h3_ulysses_max_seq_len,
+        heads=arch.num_attention_heads // get_tp_world_size(),
+        head_dim=arch.attention_head_dim,
+        strict=server_args.minimax_h3_ulysses_strict,
+    )
+
+
+def _sage_lowp_route_log(
+    server_args: ServerArgs, device: torch.device
+) -> _SageLowpRouteLog | None:
     backend = server_args.pipeline_config.resolve_transformer_attention_backend(
         server_args
     )
     if backend is not AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120:
         return None
-    return _SageLowpRouteLog()
+    return _SageLowpRouteLog(server_args, device)
 
 
 def _build_packed_layout(
