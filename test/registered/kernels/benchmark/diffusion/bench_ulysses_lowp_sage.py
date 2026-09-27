@@ -24,7 +24,7 @@ def _sm120() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
-@marker.parametrize("local_sequence", [4736, 2368], [2368])
+@marker.parametrize("local_sequence", [4736, 2048], [2048])
 @marker.benchmark("kernel", ["k_sum_v_amax", "quant_pack", "unpack_for_sage"])
 def benchmark(local_sequence: int, kernel: str):
     if not _sm120():
