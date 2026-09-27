@@ -109,7 +109,12 @@ class RdmaUlyssesA2A:
         )
         wires = _gather_object(self.group, list(wire), self.device)
         self._module.connect_slot(self._handle, index, [b for w in wires for b in w])
-        self._slots[name] = (index, output, landing)
+        # The module hands back tvm-ffi views of its own cudaMalloc memory.
+        self._slots[name] = (
+            index,
+            torch.from_dlpack(output),
+            torch.from_dlpack(landing),
+        )
 
     def _slot(self, name: str, nbytes: int) -> tuple[int, torch.Tensor, torch.Tensor]:
         index, output, landing = self._slots[name]
