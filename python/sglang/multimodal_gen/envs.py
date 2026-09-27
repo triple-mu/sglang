@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     # eager norm / modulate / gate kernels
     SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN: bool = True
     # Fused SwiGLU + per-token fp8 quantisation feeding fc2 in the fp8 MLP; 0
-    # keeps the bf16 activation plus per-tensor quantisation
+    # keeps the separate activation and quantisation kernels (same numerics)
     SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT: bool = True
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
