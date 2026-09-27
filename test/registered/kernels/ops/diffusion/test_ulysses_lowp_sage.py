@@ -71,7 +71,9 @@ def _simulate(q, k, v, *, world_size, used):
     )
     payloads = []
     for r, (qs, ks, vs) in enumerate(shards):
-        out = torch.empty(spec.payload_shape, dtype=torch.uint8, device="cuda")
+        # The kernel never writes the 128-byte alignment tail of each chunk;
+        # start from zeros so whole-payload comparisons stay meaningful.
+        out = torch.zeros(spec.payload_shape, dtype=torch.uint8, device="cuda")
         ulysses_lowp_quant_pack(
             qs,
             ks,
