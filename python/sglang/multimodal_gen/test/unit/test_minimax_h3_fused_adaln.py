@@ -142,3 +142,122 @@ def test_fused_loop_stays_off_under_cache_dit_or_the_kill_switch(monkeypatch):
     blocks[0].preserve_input_for_cache_dit = False
     assert model._fused_adaln_ready(x, None, params, indices)
     assert not model._fused_adaln_ready(x.float(), None, params, indices)
+
+
+class _AdalnCache:
+    """Stand-in for the online AdaLN cache: one parameter set per layer."""
+
+    def __init__(self, params):
+        self.params = params
+
+    def block_for_current_step(self, layer_index):
+        return self.params[layer_index]
+
+
+def _cache_dit_blocks(num_blocks: int, groups: int):
+    """Blocks as Cache-DiT sees them: inputs preserved, AdaLN resolved per layer."""
+    blocks = [_block(seed) for seed in range(num_blocks)]
+    params = _params(num_blocks, groups, 7)
+    cache = _AdalnCache(params)
+    for index, block in enumerate(blocks):
+        block.preserve_input_for_cache_dit = True
+        block._adaln_cache_ref = (cache,)
+        block.adaln_layer_index = index
+    return blocks, params
+
+
+def _eager_middle(blocks, params, x, indices, rows):
+    out = x
+    for index, block in enumerate(blocks, start=1):
+        out = block(
+            out,
+            adaln_input=None,
+            combined_indices=indices,
+            adaln_params=params[index],
+            **_kwargs(rows),
+        )
+    return out
+
+
+@requires_cuda
+def test_cache_dit_middle_blocks_run_the_fused_chain_bitwise(monkeypatch):
+    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
+    monkeypatch.setattr(envs, "SGLANG_CACHE_DIT_ENABLED", True)
+    monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
+    rows, groups = 2048, 4
+    blocks, params = _cache_dit_blocks(4, groups)
+    model = _model(blocks)
+    g = torch.Generator(device="cuda").manual_seed(11)
+    x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    indices = torch.randint(0, groups, (rows,), generator=g, device="cuda")
+    middle = blocks[1:]
+    want = _eager_middle(middle, params, x, indices, rows)
+
+    kept = x.clone()
+    got = model.run_cache_dit_middle_blocks(
+        middle, x, adaln_input=None, combined_indices=indices, **_kwargs(rows)
+    )
+    assert got is not None
+    assert torch.equal(got, want)
+    assert torch.equal(x, kept)  # Cache-DiT still holds the range input
+    # the model-level fused loop stays off while Cache-DiT owns the loop
+    assert not model._fused_adaln_ready(x, None, params, indices)
+
+
+@requires_cuda
+def test_cache_dit_middle_blocks_decline_when_the_chain_cannot_run(monkeypatch):
+    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", False)
+    monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
+    blocks, params = _cache_dit_blocks(2, 2)
+    model = _model(blocks)
+    x = torch.randn(256, HIDDEN, device="cuda").to(torch.bfloat16)
+    indices = torch.zeros(256, dtype=torch.int64, device="cuda")
+    assert (
+        model.run_cache_dit_middle_blocks(
+            blocks[1:], x, adaln_input=None, combined_indices=indices, **_kwargs(256)
+        )
+        is None
+    )
+    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
+    # per-block parameters handed in by position belong to the eager loop
+    assert (
+        model.run_cache_dit_middle_blocks(
+            blocks[1:],
+            x,
+            adaln_input=None,
+            adaln_params=params[0],
+            combined_indices=indices,
+            **_kwargs(256),
+        )
+        is None
+    )
+
+
+@requires_cuda
+def test_patched_cache_dit_middle_range_returns_hidden_and_residual(monkeypatch):
+    from cache_dit.caching.cache_blocks.pattern_3_4_5 import (
+        CachedBlocks_Pattern_3_4_5,
+    )
+
+    from sglang.multimodal_gen.runtime.cache import cache_dit_integration
+
+    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
+    monkeypatch.setattr(envs, "SGLANG_CACHE_DIT_ENABLED", True)
+    monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
+    cache_dit_integration._patch_cache_dit_middle_blocks()
+    rows, groups = 1024, 3
+    blocks, params = _cache_dit_blocks(3, groups)
+    model = _model(blocks)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    indices = torch.randint(0, groups, (rows,), generator=g, device="cuda")
+    middle = blocks[1:]
+    want = _eager_middle(middle, params, x, indices, rows)
+
+    wrapper = SimpleNamespace(transformer=model, _Mn_blocks=lambda: middle)
+    hidden, encoder, residual = CachedBlocks_Pattern_3_4_5.call_Mn_blocks(
+        wrapper, x, adaln_input=None, combined_indices=indices, **_kwargs(rows)
+    )
+    assert encoder is None
+    assert torch.equal(hidden, want)
+    assert torch.equal(residual, want - x)
