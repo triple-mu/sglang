@@ -2090,21 +2090,16 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     ) -> bool:
         """Whether this step runs the fused block loop (see `MiniMaxH3DiTBlock.forward_fused`).
 
-        Cache-DiT and layerwise offload wrap the block stack, so the deferred
-        gate cannot cross blocks there; the first eligible step also proves the
-        fused chain bit-exact against the eager one on this torch build.
+        Layerwise offload wraps the block stack, so the deferred gate cannot
+        cross blocks there; Cache-DiT owns the loop and hands its middle range
+        to `run_cache_dit_middle_blocks` instead. The first eligible step also
+        proves the fused chain bit-exact against the eager one on this torch
+        build.
         """
         if (
-            not envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN
-            or not _FUSED_ADALN_GATE.can_attempt_once()
-            or not hidden.is_cuda
-            or hidden.dtype is not _BF16_DTYPE
-            or hidden.dim() != 2
-            or not hidden.is_contiguous()
-            or envs.SGLANG_CACHE_DIT_ENABLED
+            envs.SGLANG_CACHE_DIT_ENABLED
             or hasattr(self, "_sglang_cache_dit_adapter")
             or is_layerwise_offloaded_module(self)
-            or not self.blocks
             or any(
                 type(block) is not MiniMaxH3DiTBlock
                 or block.preserve_input_for_cache_dit
@@ -2112,7 +2107,31 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             )
         ):
             return False
-        first = self.blocks[0]
+        return self._fused_chain_ready(
+            hidden, list(self.blocks), adaln_input, block_adaln_params, indices
+        )
+
+    def _fused_chain_ready(
+        self,
+        hidden: torch.Tensor,
+        blocks: list[nn.Module],
+        adaln_input: torch.Tensor,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None,
+        indices: torch.Tensor,
+    ) -> bool:
+        """Whether `blocks` can run on `hidden` as one fused chain."""
+        if (
+            not envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN
+            or not _FUSED_ADALN_GATE.can_attempt_once()
+            or not hidden.is_cuda
+            or hidden.dtype is not _BF16_DTYPE
+            or hidden.dim() != 2
+            or not hidden.is_contiguous()
+            or not blocks
+            or any(type(block) is not MiniMaxH3DiTBlock for block in blocks)
+        ):
+            return False
+        first = blocks[0]
         params = self._block_adaln_params(first, 0, adaln_input, block_adaln_params)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = params
         if not (
@@ -2129,6 +2148,39 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         if _FUSED_ADALN_GATE.verified:
             return True
         return self._verify_fused_adaln(first, hidden, params, indices)
+
+    def run_cache_dit_middle_blocks(
+        self,
+        blocks: list[nn.Module],
+        hidden_states: torch.Tensor,
+        *,
+        adaln_input: torch.Tensor,
+        adaln_params: tuple[torch.Tensor, ...] | None = None,
+        combined_indices: torch.Tensor,
+        **block_kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Cache-DiT's middle blocks through the fused adaLN chain; None keeps its eager loop.
+
+        Cache-DiT computed the first block eagerly for its residual test and
+        still holds `hidden_states`, so the chain starts from a copy and closes
+        its last gate before returning.
+        """
+        if adaln_params is not None or not self._fused_chain_ready(
+            hidden_states, blocks, adaln_input, None, combined_indices
+        ):
+            return None
+        hidden = hidden_states.clone()
+        pending_gate = None
+        for block in blocks:
+            hidden, pending_gate = block.forward_fused(
+                hidden,
+                adaln_params=self._block_adaln_params(block, 0, adaln_input, None),
+                pending_gate=pending_gate,
+                combined_indices=combined_indices,
+                **block_kwargs,
+            )
+        gate, update = pending_gate
+        return _modulate_gate(hidden, gate, update, combined_indices, dtype=_BF16_DTYPE)
 
     def _verify_fused_adaln(
         self,
