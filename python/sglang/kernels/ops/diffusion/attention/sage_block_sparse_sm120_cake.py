@@ -153,14 +153,21 @@ def sage_block_sparse_attn_sm120(
     return out
 
 
+_DENSE_TABLES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def sage_block_sparse_dense_block_index(
     batch: int, heads: int, seqlen_q: int, seqlen_k: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Full-density routing tables: every query block keeps every key block.
 
     Used for the dense warmup steps of a sparse schedule so that one kernel
-    serves both regimes.
+    serves both regimes. The tables are read-only and cached per shape.
     """
+    key = (batch, heads, seqlen_q, seqlen_k, str(device))
+    cached = _DENSE_TABLES.get(key)
+    if cached is not None:
+        return cached
     q_blocks = -(-seqlen_q // _BLOCK)
     k_blocks = seqlen_k // _BLOCK
     index = (
@@ -172,6 +179,7 @@ def sage_block_sparse_dense_block_index(
     nums = torch.full(
         (batch, heads, q_blocks), k_blocks, device=device, dtype=torch.int32
     )
+    _DENSE_TABLES[key] = (index, nums)
     return index, nums
 
 
