@@ -546,6 +546,17 @@ class Transport {
     return teardown_safe && !phase_inflight && !unsafe_release && OutstandingWrs() == 0;
   }
 
+  // The closing barrier runs behind the host; give it the timeout to finish before a teardown vote.
+  bool SettleClosingBarrier() noexcept {
+    if (!phase_inflight) return true;
+    if (phase_done == nullptr ||
+        QueryEventUntil(phase_done, std::chrono::steady_clock::now() + timeout) != cudaSuccess) {
+      return false;
+    }
+    phase_inflight = false;
+    return true;
+  }
+
   // The peer and direction ride in the completion so the shared CQ retires the
   // exact per-QP ledger, also while several QPs flush after a failure.
   uint64_t NewWrId(int peer, bool receive) {
@@ -1231,13 +1242,17 @@ inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView
 }
 
 inline int64_t teardown_safe(int64_t handle) {
-  return AsTransport(handle)->TeardownSafe() ? 1 : 0;
+  auto* transport = AsTransport(handle);
+  ScopedCudaDevice device_guard(transport->device);
+  transport->SettleClosingBarrier();
+  return transport->TeardownSafe() ? 1 : 0;
 }
 
 /*! \brief Close every slot's peer imports; every rank must finish this before any rank disposes. */
 inline void disconnect(int64_t handle) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
+  transport->SettleClosingBarrier();
   CHECK_HOST(transport->TeardownSafe())
       << "cannot disconnect after unbounded native GPU work; terminate the process";
   for (auto& slot : transport->slots) slot->Disconnect();
@@ -1246,6 +1261,7 @@ inline void disconnect(int64_t handle) {
 inline void dispose(int64_t handle) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
+  transport->SettleClosingBarrier();
   CHECK_HOST(transport->TeardownSafe())
       << "cannot dispose after unbounded native GPU work; terminate the process";
   CHECK_HOST(!transport->unsafe_release) << "transport has an unrecoverable teardown ledger";
