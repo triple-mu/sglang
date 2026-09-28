@@ -851,6 +851,7 @@ _EXPORTS: dict[str, str] = {
     "UlyssesLowpSpec": "quantization.ulysses_lowp_sage_jit",
     "can_use_ulysses_lowp_sage": "quantization.ulysses_lowp_sage_jit",
     "ulysses_lowp_finalize_stats": "quantization.ulysses_lowp_sage_jit",
+    "ulysses_lowp_finalize_stats_local": "quantization.ulysses_lowp_sage_jit",
     "ulysses_lowp_k_sum_v_amax": "quantization.ulysses_lowp_sage_jit",
     "ulysses_lowp_payload_spec": "quantization.ulysses_lowp_sage_jit",
     "can_use_gate_residual_rmsnorm_indexed_scale_shift": "norm.rmsnorm_indexed_modulate_jit",

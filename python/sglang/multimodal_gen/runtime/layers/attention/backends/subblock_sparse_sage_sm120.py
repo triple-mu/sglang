@@ -42,6 +42,7 @@ from sglang.kernels.ops.diffusion import (
     subblock_block_tables,
     subblock_pool_int8,
     ulysses_lowp_finalize_stats,
+    ulysses_lowp_finalize_stats_local,
     ulysses_lowp_k_sum_v_amax,
     ulysses_lowp_payload_spec,
     ulysses_lowp_quant_pack,
@@ -413,16 +414,27 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
             world_size=world_size,
         )
         q4, k4, v4 = (t.unsqueeze(0) for t in (query, key, value))
-        stats = ulysses_lowp_k_sum_v_amax(k4, v4)
+        h = spec.local_heads
         if transport is not None:
-            gathered = transport.exchange_stats(stats)
+            # The statistics kernel writes the replicated payload and this rank's
+            # result row itself, so the all-gather moves no bytes locally.
+            send_stats, own_stats = transport.stats_buffers(
+                (2, 1, heads, HEAD_DIM), torch.float32
+            )
+            ulysses_lowp_k_sum_v_amax(k4, v4, out=send_stats, own=own_stats)
+            gathered = transport.exchange_stats(send_stats, own_in_place=True)
         else:
+            stats = ulysses_lowp_k_sum_v_amax(k4, v4)
             gathered = _a2a_staging_buffer(
                 "sage_lowp_stats", (world_size, *stats.shape), torch.float32, device
             )
             dist.all_gather_into_tensor(gathered, stats, group=group)
-        k_mean, v_scale = ulysses_lowp_finalize_stats(
-            gathered, world_size=world_size, used_sequence=used, dtype=query.dtype
+        k_mean, v_scale, v_scale_local = ulysses_lowp_finalize_stats_local(
+            gathered,
+            world_size=world_size,
+            used_sequence=used,
+            rank=rank,
+            local_heads=h,
         )
         # The RDMA transport reads its own landing buffer, so pack straight into it.
         send = (
@@ -442,29 +454,35 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
             world_size=world_size,
             used_sequence=used,
             out=send,
+            own_out=(
+                transport.own_chunk_buffer(spec.payload_shape)
+                if transport is not None
+                else None
+            ),
         )
         recv = (
-            transport.exchange_chunks(send)
+            transport.exchange_chunks(send, own_in_place=True)
             if transport is not None
             else _usp_all_to_all_single(send, role="sage_lowp_recv")
         )
-        h = spec.local_heads
-        operands = _unpack(
-            recv,
-            spec,
-            used=used,
-            v_scale=v_scale[:, rank * h : (rank + 1) * h],
-            device=device,
-        )
+        operands = _unpack(recv, spec, used=used, v_scale=v_scale_local, device=device)
         logger.info_once(
             f"SubBlock Sage SM120: quantised Ulysses exchange active (L={local_sequence}, "
             f"S={spec.global_sequence}, {spec.chunk_bytes * world_size} uint8 bytes per rank)"
         )
+        out = None
+        if transport is not None:
+            # Cake writes token-major straight into the gather buffer; no relayout copy.
+            landing = transport.gather_landing(
+                (spec.global_sequence, h, HEAD_DIM), torch.bfloat16
+            )
+            out = landing.permute(1, 0, 2).unsqueeze(0)
         return self._attend(
             operands,
             used=used,
             total=spec.global_sequence,
             sparse_query_block_mask=sparse_query_block_mask,
+            out=out,
         )
 
     def gather_output(self, out: torch.Tensor) -> torch.Tensor:
@@ -480,9 +498,7 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         transport = active_rdma_ulysses_a2a(get_sp_group().ulysses_group)
         if transport is None:
             return _usp_output_all_to_all(out[None], head_dim=2)[0]
-        landing = transport.gather_landing(tuple(out.shape), out.dtype)
-        landing.copy_(out)
-        return transport.gather_heads(landing)
+        return transport.gather_heads(out)
 
     def _attend(
         self,
@@ -491,8 +507,14 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         used: int,
         total: int,
         sparse_query_block_mask: torch.Tensor | None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Route (or keep every block) and run the Cake kernel; returns `[total, h, D]`."""
+        """Route (or keep every block) and run the Cake kernel; returns `[total, h, D]`.
+
+        `out` is a `[1, h, total, D]` view the kernel writes through its own
+        strides (a token-major gather buffer, for one); it defaults to a
+        head-major staging buffer.
+        """
         from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
 
         cut = -(-used // BLOCK) * BLOCK
@@ -533,9 +555,13 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
             index, nums = sage_block_sparse_dense_block_index(
                 1, heads, cut, cut, op.q.device
             )
-        out = _a2a_staging_buffer(
-            "sage_lowp_out", (1, heads, total, HEAD_DIM), torch.bfloat16, op.q.device
-        )
+        if out is None:
+            out = _a2a_staging_buffer(
+                "sage_lowp_out",
+                (1, heads, total, HEAD_DIM),
+                torch.bfloat16,
+                op.q.device,
+            )
         sage_block_sparse_attn_sm120(
             op.q,
             op.k,

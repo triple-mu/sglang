@@ -168,9 +168,9 @@ class _FakeModule:
     def connect_slot(self, handle, index, flat):
         pass
 
-    def exchange(self, handle, index, inp, out):
+    def exchange(self, handle, index, inp, out, own_in_place):
         self.exchanges.append(
-            (index, inp.data_ptr(), tuple(inp.shape), tuple(out.shape))
+            (index, inp.data_ptr(), tuple(inp.shape), tuple(out.shape), own_in_place)
         )
 
 

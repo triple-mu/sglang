@@ -131,6 +131,33 @@ class RdmaUlyssesA2A:
         _, _, landing = self._slot("chunks", world_size * chunk)
         return landing[: world_size * chunk].view(world_size, chunk)
 
+    def own_chunk_buffer(self, shape: tuple[int, int]) -> torch.Tensor:
+        """This rank's row of the `[W, C]` result; a producer writing it there skips the self-copy."""
+        world_size, chunk = (int(v) for v in shape)
+        _, output, _ = self._slot("chunks", world_size * chunk)
+        return output[self.rank * chunk : (self.rank + 1) * chunk]
+
+    def stats_buffers(
+        self, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(send [W, *shape], own [*shape])`: the replicated record the NIC reads and this rank's result row."""
+        numel = 1
+        for v in shape:
+            numel *= int(v)
+        nbytes = numel * dtype.itemsize
+        _, output, landing = self._slot("stats", self.world_size * nbytes)
+        send = (
+            landing[: self.world_size * nbytes]
+            .view(dtype)
+            .view(self.world_size, *shape)
+        )
+        own = (
+            output[self.rank * nbytes : (self.rank + 1) * nbytes]
+            .view(dtype)
+            .view(*shape)
+        )
+        return send, own
+
     def gather_landing(
         self, shape: tuple[int, int, int], dtype: torch.dtype
     ) -> torch.Tensor:
@@ -142,30 +169,54 @@ class RdmaUlyssesA2A:
         return landing[: numel * dtype.itemsize].view(dtype).view(shape)
 
     # ------------------------------------------------------------- exchange --
-    def exchange_chunks(self, payload: torch.Tensor) -> torch.Tensor:
-        """`[W, C]` uint8 in, `[W, C]` out; row `i` of the result came from rank `i`."""
+    def exchange_chunks(
+        self, payload: torch.Tensor, *, own_in_place: bool = False
+    ) -> torch.Tensor:
+        """`[W, C]` uint8 in, `[W, C]` out; row `i` of the result came from rank `i`.
+
+        `own_in_place` says the producer already wrote row `rank` of the result
+        (see `own_chunk_buffer`), so no self-copy is needed.
+        """
         if payload.dtype is not torch.uint8 or payload.ndim != 2:
             raise ValueError("exchange_chunks takes a [world_size, C] uint8 payload")
         index, output, _ = self._slot("chunks", payload.numel())
         out = output[: payload.numel()].view(payload.shape)
         with maybe_nvtx_range("rdma_a2a_exchange_chunks"):
-            self._module.exchange(self._handle, index, payload, out)
+            self._module.exchange(self._handle, index, payload, out, int(own_in_place))
         self._count()
         return out
 
-    def exchange_stats(self, stats: torch.Tensor) -> torch.Tensor:
-        """All-gather of one contiguous record: `[...]` -> `[W, ...]`, row `i` from rank `i`."""
-        nbytes = stats.numel() * stats.element_size()
-        index, output, landing = self._slot("stats", self.world_size * nbytes)
-        send = landing[: self.world_size * nbytes].view(self.world_size, nbytes)
-        send.copy_(
-            stats.reshape(1, -1).view(torch.uint8).expand(self.world_size, nbytes)
-        )
+    def exchange_stats(
+        self, stats: torch.Tensor, *, own_in_place: bool = False
+    ) -> torch.Tensor:
+        """All-gather of one contiguous record: `[...]` -> `[W, ...]`, row `i` from rank `i`.
+
+        With `own_in_place`, `stats` is the `[W, ...]` send buffer from
+        `stats_buffers` whose rows already hold this rank's record, and the own
+        result row was written by the producer too.
+        """
+        if own_in_place:
+            shape = tuple(stats.shape[1:])
+            nbytes = stats[0].numel() * stats.element_size()
+            index, output, landing = self._slot("stats", self.world_size * nbytes)
+            if stats.data_ptr() != landing.data_ptr():
+                raise ValueError(
+                    "own_in_place stats must be the stats_buffers send view"
+                )
+            send = stats.view(torch.uint8).view(self.world_size, nbytes)
+        else:
+            shape = tuple(stats.shape)
+            nbytes = stats.numel() * stats.element_size()
+            index, output, landing = self._slot("stats", self.world_size * nbytes)
+            send = landing[: self.world_size * nbytes].view(self.world_size, nbytes)
+            send.copy_(
+                stats.reshape(1, -1).view(torch.uint8).expand(self.world_size, nbytes)
+            )
         out = output[: self.world_size * nbytes].view(self.world_size, nbytes)
         with maybe_nvtx_range("rdma_a2a_exchange_stats"):
-            self._module.exchange(self._handle, index, send, out)
+            self._module.exchange(self._handle, index, send, out, int(own_in_place))
         self._count()
-        return out.view(stats.dtype).view(self.world_size, *stats.shape)
+        return out.view(stats.dtype).view(self.world_size, *shape)
 
     def gather_heads(self, x: torch.Tensor) -> torch.Tensor:
         """`[S_global, H_local, D]` -> `[S_local, H, D]`, heads ordered by source rank."""
@@ -183,7 +234,7 @@ class RdmaUlyssesA2A:
             .view(s_global // self.world_size, h_local * self.world_size, dim)
         )
         with maybe_nvtx_range("rdma_a2a_gather_heads"):
-            self._module.exchange(self._handle, index, x, out)
+            self._module.exchange(self._handle, index, x, out, 0)
         self._count()
         return out
 
