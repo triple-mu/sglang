@@ -52,6 +52,7 @@ class AttentionBackendEnum(enum.Enum):
     SUBBLOCK_SPARSE_SAGE_SM120 = enum.auto()
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
+    VEDA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -76,6 +77,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
             AttentionBackendEnum.SUBBLOCK_SPARSE_SAGE_SM120,
             AttentionBackendEnum.CUBE_SPARSE_ATTN,
+            AttentionBackendEnum.VEDA_ATTN,
         }
 
 

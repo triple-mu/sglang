@@ -745,6 +745,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             num_steps=len(sigmas_video) - 1,
             device=device,
         )
+        veda_metadata = _build_veda_attn_metadata(
+            server_args,
+            packed=packed,
+            ctx=ctx,
+            num_steps=len(sigmas_video) - 1,
+        )
+        if veda_metadata is not None:
+            attn_metadata = veda_metadata
 
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
@@ -1059,6 +1067,47 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
         raw_indices = ctx.keyframe.get("semantic_frame_indices")
         ctx.keyframe_frame_indices = [int(v) for v in raw_indices]
         ctx.keyframe_frame_count = int(ctx.keyframe["frame_count"])
+
+
+def _build_veda_attn_metadata(
+    server_args: ServerArgs,
+    *,
+    packed: Mapping[str, torch.Tensor],
+    ctx: _FullLoopContext,
+    num_steps: int,
+):
+    """Request-static Veda metadata when that backend serves the transformer.
+
+    Veda tiles the target video span and keeps every other real row global,
+    so it only needs the span, the real row count and the padded length; the
+    loop advances ``current_timestep`` like it does for cube metadata.
+    """
+    if (
+        server_args.pipeline_config.resolve_transformer_attention_backend(server_args)
+        is not AttentionBackendEnum.VEDA_ATTN
+    ):
+        return None
+    if ctx.is_ref2va:
+        raise NotImplementedError(
+            "Veda attention tiles the t2va / fl2va packed layout; ref2va "
+            "reference blocks are not tiled. Use --attention-backend fa for ref2va."
+        )
+    from sglang.multimodal_gen.runtime.layers.attention.backends.veda_attn_h3 import (
+        VedaAttentionMetadata,
+    )
+
+    grid = tuple(int(v) for v in packed["stream_layout"]["target_shape"])
+    cu_seqlens = [int(v) for v in packed["cu_seqlens"].tolist()]
+    used, seq_len = cu_seqlens[1], cu_seqlens[2]
+    video_rows = grid[0] * grid[1] * grid[2]
+    return VedaAttentionMetadata(
+        current_timestep=0,
+        video_start=used - video_rows,
+        grid=grid,
+        used=used,
+        seq_len=seq_len,
+        num_steps=num_steps,
+    )
 
 
 def _maybe_prepare_vsa_h3_step_metadata(
