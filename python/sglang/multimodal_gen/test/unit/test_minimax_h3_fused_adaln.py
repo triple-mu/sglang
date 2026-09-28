@@ -23,8 +23,9 @@ class _Mixer(nn.Module):
 
     def __init__(self, seed: int):
         super().__init__()
-        # The eager block probes these projections for MXFP8 input support.
+        # The blocks probe these projections for pre-quantised input support.
         self.qkv_proj = self.fc1 = SimpleNamespace(quant_method=None)
+        self.needs_bf16_rows = False
         g = torch.Generator(device="cuda").manual_seed(seed)
         self.weight = nn.Parameter(
             (torch.randn(HIDDEN, HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5).to(

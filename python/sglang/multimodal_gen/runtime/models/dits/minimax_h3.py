@@ -31,12 +31,14 @@ from sglang.kernels.ops.diffusion import (
     can_use_silu_mul_per_token_quant_fp8,
     fused_inplace_qknorm_rope,
     gate_residual_rmsnorm_indexed_scale_shift_,
+    gate_residual_rmsnorm_indexed_scale_shift_fp8_,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
+    rmsnorm_indexed_scale_shift_fp8,
     silu_mul_mxfp8,
     silu_mul_per_token_quant_fp8,
 )
@@ -421,8 +423,6 @@ def _per_token_fp8_blockers(linear: nn.Module) -> list[str]:
     from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 
     method = linear.quant_method
-    if not envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT:
-        return ["SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0"]
     if not isinstance(method, Fp8LinearMethod):
         return [f"quant method {type(method).__name__}"]
     blockers = []
@@ -444,6 +444,14 @@ def _per_token_fp8_blockers(linear: nn.Module) -> list[str]:
 def _accepts_per_token_fp8_input(linear: nn.Module) -> bool:
     """Online per-channel FP8 weights whose GEMM takes per-row activation scales."""
     return not _per_token_fp8_blockers(linear)
+
+
+def _fused_norm_feeds_fp8(linear: nn.Module) -> bool:
+    """Whether the fused adaLN norm in front of `linear` should emit fp8 rows for it."""
+    return (
+        envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT
+        and _accepts_per_token_fp8_input(linear)
+    )
 
 
 def _modulate_scale_shift(
@@ -936,6 +944,11 @@ class MiniMaxH3Attention(nn.Module):
         self.hybrid = MiniMaxH3VDNHybridAttention.build(
             arch, quant_config, prefix=prefix, local_heads=self.num_heads
         )
+        # Both read the modulated bf16 rows after qkv_proj, so a caller may
+        # hand over only the fp8 pair when neither exists.
+        self.needs_bf16_rows = (
+            self.to_gate_compress is not None or self.hybrid is not None
+        )
 
     def _set_attention_backend(self, backend) -> None:
         if (
@@ -1132,7 +1145,7 @@ class MiniMaxH3Attention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | None,
         *,
         rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
         cu_seqlens: torch.Tensor,
@@ -1145,7 +1158,8 @@ class MiniMaxH3Attention(nn.Module):
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
-        ``x_prequant``: ``x`` already quantized for ``qkv_proj`` as ``(fp8, scales)``.
+        ``x_prequant``: ``x`` already quantized for ``qkv_proj`` as ``(fp8, scales)``;
+        ``x`` may then be None unless ``needs_bf16_rows``.
 
         Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
         on q/k -> variable-length non-causal flash attention -> output projection.
@@ -1156,7 +1170,7 @@ class MiniMaxH3Attention(nn.Module):
         so cu_seqlens retains global packed-document semantics. The inverse
         all-to-all restores the row shard before the output projection.
         """
-        if x.device.type == "mps" and not ulysses_active:
+        if x is not None and x.device.type == "mps" and not ulysses_active:
             return self._forward_mps_streamed_attention(
                 x,
                 rope_cache=rope_cache,
@@ -1165,7 +1179,8 @@ class MiniMaxH3Attention(nn.Module):
                 max_seqlen=max_seqlen,
             )
 
-        total = x.shape[0]
+        rows = x if x_prequant is None else x_prequant[0]
+        total = rows.shape[0]
         qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
@@ -1306,9 +1321,11 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
-        if _accepts_per_token_fp8_input(
-            self.fc2
-        ) and can_use_silu_mul_per_token_quant_fp8(hidden):
+        if (
+            envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT
+            and _accepts_per_token_fp8_input(self.fc2)
+            and can_use_silu_mul_per_token_quant_fp8(hidden)
+        ):
             # One pass: SwiGLU, per-token amax and the fp8 rows fc2 consumes; the
             # same per-token quantisation the fp8 GEMM applies itself, one kernel
             # and one activation round trip fewer.
@@ -1318,7 +1335,7 @@ class MiniMaxH3MLP(nn.Module):
             out, _ = self.fc2(silu_mul_per_token_quant_fp8(hidden))
             return out
         blockers = _per_token_fp8_blockers(self.fc2)
-        if blockers != ["SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0"]:
+        if envs.SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT:
             logger.info_once(
                 "MiniMax-H3 MLP keeps the unfused activation path: %s",
                 "; ".join(blockers)
@@ -1643,9 +1660,33 @@ class MiniMaxH3DiTBlock(nn.Module):
         arithmetic is the eager chain's, bit for bit.
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
+        # The norms quantise their rows per token for the fp8 GEMMs behind them.
+        attn_fp8 = not self.attn.needs_bf16_rows and _fused_norm_feeds_fp8(
+            self.attn.qkv_proj
+        )
+        mlp_fp8 = _fused_norm_feeds_fp8(self.mlp.fc1)
+        if attn_fp8 or mlp_fp8:
+            logger.info_once(
+                "MiniMax-H3 fused adaLN norms emit per-token fp8 rows: qkv_proj=%s fc1=%s",
+                attn_fp8,
+                mlp_fp8,
+            )
+        norm1 = (
+            rmsnorm_indexed_scale_shift_fp8 if attn_fp8 else rmsnorm_indexed_scale_shift
+        )
+        gated1 = (
+            gate_residual_rmsnorm_indexed_scale_shift_fp8_
+            if attn_fp8
+            else gate_residual_rmsnorm_indexed_scale_shift_
+        )
+        gated2 = (
+            gate_residual_rmsnorm_indexed_scale_shift_fp8_
+            if mlp_fp8
+            else gate_residual_rmsnorm_indexed_scale_shift_
+        )
         if pending_gate is None:
             residual = x
-            h = rmsnorm_indexed_scale_shift(
+            h = norm1(
                 x,
                 self.norm1.weight,
                 scale_msa,
@@ -1655,7 +1696,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             )
         else:
             prev_gate, prev_update = pending_gate
-            h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+            h, residual = gated1(
                 x,
                 prev_update,
                 prev_gate,
@@ -1666,7 +1707,8 @@ class MiniMaxH3DiTBlock(nn.Module):
                 eps=self.norm1.eps,
             )
         h = self.attn(
-            h,
+            None if attn_fp8 else h,
+            x_prequant=h if attn_fp8 else None,
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
@@ -1675,7 +1717,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        h, residual = gate_residual_rmsnorm_indexed_scale_shift_(
+        h, residual = gated2(
             residual,
             h,
             gate_msa,

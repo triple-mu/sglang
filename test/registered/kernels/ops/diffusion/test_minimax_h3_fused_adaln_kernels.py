@@ -19,10 +19,12 @@ from sglang.kernels.ops.diffusion import (
     can_use_indexed_scale_shift,
     can_use_rmsnorm_indexed_scale_shift,
     gate_residual_rmsnorm_indexed_scale_shift_,
+    gate_residual_rmsnorm_indexed_scale_shift_fp8_,
     indexed_gate_bf16,
     indexed_scale_shift,
     indexed_scale_shift_bf16_,
     rmsnorm_indexed_scale_shift,
+    rmsnorm_indexed_scale_shift_fp8,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -120,3 +122,77 @@ def test_indexed_scale_shift_matches_triton_and_widens_exactly():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _per_token_fp8(rows_bf16: torch.Tensor):
+    """Per-token fp8 as the kernel defines it: scale = amax / 448 and q = sat(x / scale),
+    both correctly rounded (tensor denominators; torch's scalar division multiplies by a
+    reciprocal instead)."""
+    x = rows_bf16.float()
+    amax = x.abs().amax(dim=-1, keepdim=True)
+    scale = amax / torch.full_like(amax, 448.0)
+    inv = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
+    q = (x * inv).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return q, scale
+
+
+@pytest.mark.parametrize("rows,groups", [(4736, 8), (1000, 3)])
+def test_fp8_plan_a_quantises_the_bf16_chain_per_token(rows, groups):
+    x, params, indices, norm = _case(rows, groups, 21)
+    shift_msa, scale_msa = params[0], params[1]
+    x[3] = 0
+    shift_msa[indices[3]] = 0  # row 3 modulates to all zeros: zero scale, zero codes
+    want_rows = rmsnorm_indexed_scale_shift(
+        x, norm.weight, scale_msa, shift_msa, indices, eps=EPS
+    )
+    want_q, want_s = _per_token_fp8(want_rows)
+    q, s = rmsnorm_indexed_scale_shift_fp8(
+        x, norm.weight, scale_msa, shift_msa, indices, eps=EPS
+    )
+    assert q.dtype is torch.float8_e4m3fn and tuple(s.shape) == (rows, 1)
+    assert torch.equal(s, want_s)
+    assert torch.equal(q.view(torch.uint8), want_q.view(torch.uint8))
+    assert s[3].item() == 0 and not q[3].view(torch.uint8).any()
+
+
+@pytest.mark.parametrize("rows,groups", [(4736, 8), (1000, 3)])
+def test_fp8_plan_b_quantises_the_gated_chain_per_token(rows, groups):
+    x, params, indices, norm = _case(rows, groups, 22)
+    shift_msa, scale_msa, gate_msa = params[0], params[1], params[2]
+    g = torch.Generator(device="cuda").manual_seed(23)
+    update = (torch.randn(rows, HIDDEN, generator=g, device="cuda") * 0.7).to(
+        torch.bfloat16
+    )
+    want_rows, want_residual = gate_residual_rmsnorm_indexed_scale_shift_(
+        x.clone(), update, gate_msa, norm.weight, scale_msa, shift_msa, indices, eps=EPS
+    )
+    want_q, want_s = _per_token_fp8(want_rows)
+    (q, s), residual = gate_residual_rmsnorm_indexed_scale_shift_fp8_(
+        x.clone(), update, gate_msa, norm.weight, scale_msa, shift_msa, indices, eps=EPS
+    )
+    assert torch.equal(residual, want_residual)
+    assert torch.equal(s, want_s)
+    assert torch.equal(q.view(torch.uint8), want_q.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0),
+    reason="the GEMM quantiser is built with fast math on SM90 (per_token_quant_fp8.py)",
+)
+def test_fp8_plan_a_matches_the_gemm_quantiser():
+    """The pair is what the fp8 GEMM would have computed from the bf16 rows itself."""
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+
+    x, params, indices, norm = _case(4736, 8, 24)
+    shift_msa, scale_msa = params[0], params[1]
+    rows = rmsnorm_indexed_scale_shift(
+        x, norm.weight, scale_msa, shift_msa, indices, eps=EPS
+    )
+    want_q = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
+    want_s = torch.empty((rows.shape[0], 1), dtype=torch.float32, device="cuda")
+    sgl_per_token_quant_fp8(rows, want_q, want_s)
+    q, s = rmsnorm_indexed_scale_shift_fp8(
+        x, norm.weight, scale_msa, shift_msa, indices, eps=EPS
+    )
+    assert torch.equal(s, want_s)
+    assert torch.equal(q.view(torch.uint8), want_q.view(torch.uint8))
