@@ -491,6 +491,37 @@ class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
 
 
+class _VedaAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.VEDA_ATTN
+
+    # Veda runs on the FlashAttention-4 CuTe block-sparse kernels through
+    # Miowtion: natively on SM90 / SM100, and on SM8x / SM120 through
+    # Miowtion's vendored FA4 patch. Miowtion decides per device.
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from miowtion.kernels import fa4
+            from miowtion.veda import bundle  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.veda_attn_h3 import (  # noqa: F401
+                VedaAttentionBackend,
+            )
+        except ImportError as e:
+            logger.error("Failed to import the Veda attention backend: %s", str(e))
+            raise ImportError(
+                "Veda attention needs Miowtion (pip install -e <Miowtion checkout>) "
+                "with its pinned flash-attn-4 CuTe build."
+            ) from e
+        if torch.cuda.is_available() and not fa4.available(torch.device("cuda")):
+            capability = platform.get_device_capability()
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "Veda attention needs FA4 block sparsity, which Miowtion does not "
+                f"provide on compute capability {found} in this install."
+            )
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.veda_attn_h3.VedaAttentionBackend"
+
+
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA2
 
@@ -567,6 +598,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
+        _VedaAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,

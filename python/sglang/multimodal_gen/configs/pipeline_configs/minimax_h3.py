@@ -305,6 +305,27 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "validated under torch.compile or the breakable CUDA "
                     "graph; disable them or use --attention-backend fa."
                 )
+        if selected_backend is AttentionBackendEnum.VEDA_ATTN:
+            if server_args.ring_degree > 1:
+                raise ValueError(
+                    "Veda attention does not support --ring-degree > 1; use "
+                    "Ulysses sequence parallelism."
+                )
+            if (
+                server_args.enable_torch_compile
+                or server_args.enable_breakable_cuda_graph
+            ):
+                raise ValueError(
+                    "Veda attention permutes tiles eagerly per layer and is not "
+                    "validated under torch.compile or the breakable CUDA graph; "
+                    "disable them or use --attention-backend fa."
+                )
+            attention_config = server_args.attention_backend_config or {}
+            if not attention_config.get("veda_bundle"):
+                raise ValueError(
+                    "Veda attention needs --attention-backend-config "
+                    "veda_bundle=<predictor bundle .safetensors>"
+                )
         from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
             AttentionRequirements,
         )
