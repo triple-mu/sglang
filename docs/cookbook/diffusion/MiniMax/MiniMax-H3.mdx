@@ -535,10 +535,15 @@ them, all SM120-only and each proven active from the server log:
 - Fused adaLN chain and fused SwiGLU + per-token FP8 quantisation in the DiT
   blocks, on by default for every H3 deployment: both reproduce the eager
   kernels bit for bit (the first fused step verifies this against the installed
-  torch and falls back for good otherwise). Logs: `fused adaLN chain engaged
-  (verified bit-exact)` and `fused SwiGLU + per-token fp8 quantisation feeds
-  fc2`. Kill switches: `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN=0`,
-  `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0`.
+  torch and falls back for good otherwise). With per-channel FP8 GEMMs the
+  fused norms also hand `qkv_proj` and `fc1` their rows already quantised per
+  token, the same quantisation the GEMM applies itself, so the bf16 rows are
+  never written. Logs: `fused adaLN chain engaged (verified bit-exact)`,
+  `fused SwiGLU + per-token fp8 quantisation feeds fc2` and `fused adaLN norms
+  emit per-token fp8 rows`. Kill switches:
+  `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN=0`,
+  `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0`,
+  `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT=0`.
 
 ```bash Command
 sglang serve \

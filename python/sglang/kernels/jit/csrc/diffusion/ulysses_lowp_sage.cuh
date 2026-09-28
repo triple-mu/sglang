@@ -151,9 +151,11 @@ SGL_DEVICE uint64_t section_offset(
 
 // ---------------------------------------------------------------------------
 // Statistics: per-channel K sum and V amax over the local shard.
-// Stage 1 reduces fixed 256-token chunks (grid z); stage 2 combines the chunk
-// partials in ascending chunk order, so the fp32 sum is bit-identical run to
-// run and identical on every rank once the partials are all-gathered.
+// Stage 1 reduces fixed 256-token chunks (grid z): 16 token lanes x 16 threads,
+// each thread loading 8 channels (16 bytes) of K and V per token, so a CTA
+// streams 16 rows per iteration; stage 2 combines the chunk partials in
+// ascending chunk order. The fp32 sum is bit-identical run to run and identical
+// on every rank once the partials are all-gathered.
 // ---------------------------------------------------------------------------
 template <typename T, bool kUsePDL>
 __global__ void KSumVAmaxPartialKernel(
@@ -170,54 +172,83 @@ __global__ void KSumVAmaxPartialKernel(
     int64_t v_stride_batch,
     int64_t v_stride_token,
     int64_t v_stride_head) {
-  constexpr uint32_t kTokenLanes = 2;
-  constexpr uint32_t kThreads = kTokenLanes * kHeadDim;
+  constexpr uint32_t kPack = 8;
+  constexpr uint32_t kPacksPerRow = kHeadDim / kPack;  // 16 threads cover one 128-channel row
+  constexpr uint32_t kTokenLanes = 16;
+  constexpr uint32_t kThreads = kTokenLanes * kPacksPerRow;
   const uint32_t thread_id = threadIdx.x;
-  const uint32_t d_id = thread_id % kHeadDim;
-  const uint32_t token_lane = thread_id / kHeadDim;
+  const uint32_t d_base = (thread_id % kPacksPerRow) * kPack;
+  const uint32_t token_lane = thread_id / kPacksPerRow;
   const uint32_t head_id = blockIdx.x;
   const uint32_t batch_id = blockIdx.y;
   const uint32_t chunk_id = blockIdx.z;
   const uint32_t token_begin = chunk_id * kStatsChunkTokens;
   const uint32_t token_end = min(token_begin + kStatsChunkTokens, num_tokens);
 
-  float local_sum = 0.0f;
-  float local_amax = 0.0f;
+  float local_sum[kPack];
+  float local_amax[kPack];
+#pragma unroll
+  for (uint32_t j = 0; j < kPack; ++j) {
+    local_sum[j] = 0.0f;
+    local_amax[j] = 0.0f;
+  }
   device::PDLWaitPrimary<kUsePDL>();
   for (uint32_t token_id = token_begin + token_lane; token_id < token_end; token_id += kTokenLanes) {
     const uint64_t k_offset = static_cast<uint64_t>(batch_id) * k_stride_batch +
                               static_cast<uint64_t>(token_id) * k_stride_token +
-                              static_cast<uint64_t>(head_id) * k_stride_head + d_id;
+                              static_cast<uint64_t>(head_id) * k_stride_head + d_base;
     const uint64_t v_offset = static_cast<uint64_t>(batch_id) * v_stride_batch +
                               static_cast<uint64_t>(token_id) * v_stride_token +
-                              static_cast<uint64_t>(head_id) * v_stride_head + d_id;
-    local_sum += details::to_float(k[k_offset]);
-    local_amax = fmaxf(local_amax, fabsf(details::to_float(v[v_offset])));
+                              static_cast<uint64_t>(head_id) * v_stride_head + d_base;
+    T k_val[kPack];
+    T v_val[kPack];
+    *reinterpret_cast<float4*>(&k_val[0]) = *reinterpret_cast<const float4*>(k + k_offset);
+    *reinterpret_cast<float4*>(&v_val[0]) = *reinterpret_cast<const float4*>(v + v_offset);
+#pragma unroll
+    for (uint32_t j = 0; j < kPack; ++j) {
+      local_sum[j] += details::to_float(k_val[j]);
+      local_amax[j] = fmaxf(local_amax[j], fabsf(details::to_float(v_val[j])));
+    }
   }
 
-  __shared__ float shared_sum[kThreads];
-  __shared__ float shared_amax[kThreads];
-  shared_sum[thread_id] = local_sum;
-  shared_amax[thread_id] = local_amax;
+  // Combine the 16 token lanes in lane order for every channel.
+  __shared__ float shared_sum[kTokenLanes][kHeadDim];
+  __shared__ float shared_amax[kTokenLanes][kHeadDim];
+#pragma unroll
+  for (uint32_t j = 0; j < kPack; ++j) {
+    shared_sum[token_lane][d_base + j] = local_sum[j];
+    shared_amax[token_lane][d_base + j] = local_amax[j];
+  }
   __syncthreads();
-
-  if (token_lane == 0) {
+  if (thread_id < kHeadDim) {
+    float s = 0.0f;
+    float m = 0.0f;
+#pragma unroll
+    for (uint32_t lane = 0; lane < kTokenLanes; ++lane) {
+      s += shared_sum[lane][thread_id];
+      m = fmaxf(m, shared_amax[lane][thread_id]);
+    }
     const uint64_t out =
-        (((static_cast<uint64_t>(batch_id) * num_heads + head_id) * num_chunks) + chunk_id) * kHeadDim + d_id;
-    k_partial[out] = shared_sum[d_id] + shared_sum[kHeadDim + d_id];
-    v_partial[out] = fmaxf(shared_amax[d_id], shared_amax[kHeadDim + d_id]);
+        (((static_cast<uint64_t>(batch_id) * num_heads + head_id) * num_chunks) + chunk_id) * kHeadDim + thread_id;
+    k_partial[out] = s;
+    v_partial[out] = m;
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+/// Writes the `[2, B, H, 128]` record (K sum, then V amax) `replicas` times at `replica_stride`
+/// floats apart -- the replicated all-gather payload -- and once more into `own`.
 template <bool kUsePDL>
 __global__ void KSumVAmaxCombineKernel(
     const float* __restrict__ k_partial,
     const float* __restrict__ v_partial,
-    float* __restrict__ k_sum,
-    float* __restrict__ v_amax,
+    float* __restrict__ stats,
+    float* __restrict__ own,
     uint32_t num_heads,
-    uint32_t num_chunks) {
+    uint32_t num_chunks,
+    uint32_t replicas,
+    uint64_t replica_stride,
+    uint64_t half) {
   const uint32_t d_id = threadIdx.x;
   const uint32_t head_id = blockIdx.x;
   const uint32_t batch_id = blockIdx.y;
@@ -230,9 +261,51 @@ __global__ void KSumVAmaxCombineKernel(
     m = fmaxf(m, v_partial[(base + c) * kHeadDim + d_id]);
   }
   const uint64_t out = (static_cast<uint64_t>(batch_id) * num_heads + head_id) * kHeadDim + d_id;
-  k_sum[out] = s;
-  v_amax[out] = m;
+  for (uint32_t r = 0; r < replicas; ++r) {
+    stats[r * replica_stride + out] = s;
+    stats[r * replica_stride + half + out] = m;
+  }
+  own[out] = s;
+  own[half + out] = m;
   device::PDLTriggerSecondary<kUsePDL>();
+}
+
+/// `k_mean = bf16(sum_r k_sum[r] / used)` and `v_scale = max_r v_amax[r] / 2.25` from the gathered
+/// `[W, 2, B, H, 128]` records, bit for bit the torch path (`ulysses_lowp_finalize_stats`): the sum
+/// runs in rank order 0..W-1 in fp32, and a division by a scalar is torch's multiply by the fp32
+/// reciprocal. `v_scale_local` receives the heads this rank attends to.
+template <typename T>
+__global__ void FinalizeStatsKernel(
+    const float* __restrict__ gathered,
+    T* __restrict__ k_mean,
+    float* __restrict__ v_scale,
+    float* __restrict__ v_scale_local,
+    uint32_t world_size,
+    uint32_t num_heads,
+    uint32_t local_heads,
+    uint32_t rank,
+    uint32_t used_sequence,
+    uint64_t half) {
+  const uint32_t d_id = threadIdx.x;
+  const uint32_t head_id = blockIdx.x;
+  const uint32_t batch_id = blockIdx.y;
+  const uint64_t out = (static_cast<uint64_t>(batch_id) * num_heads + head_id) * kHeadDim + d_id;
+  const uint64_t stride = 2 * half;
+  float sum = 0.f;
+  float m = 0.f;
+  for (uint32_t r = 0; r < world_size; ++r) {
+    sum += gathered[r * stride + out];
+    m = fmaxf(m, gathered[r * stride + half + out]);
+  }
+  const float inv_used = __fdiv_rn(1.0f, static_cast<float>(used_sequence));
+  const float inv_v_scale_max = __fdiv_rn(1.0f, kVScaleMax);
+  k_mean[out] = details::from_float<T>(__fmul_rn(sum, inv_used));
+  const float scale = __fmul_rn(m, inv_v_scale_max);
+  v_scale[out] = scale;
+  const uint32_t first = rank * local_heads;
+  if (head_id >= first && head_id < first + local_heads) {
+    v_scale_local[(static_cast<uint64_t>(batch_id) * local_heads + head_id - first) * kHeadDim + d_id] = scale;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +323,8 @@ __global__ void QuantInt8FusedAmaxPackKernel(
     const T* __restrict__ input,
     const T* __restrict__ mean,
     uint8_t* __restrict__ output,
+    uint8_t* __restrict__ own_output,
+    uint32_t rank,
     uint32_t local_sequence,
     uint32_t global_offset,
     uint32_t num_heads,
@@ -276,6 +351,7 @@ __global__ void QuantInt8FusedAmaxPackKernel(
   const uint32_t global_token = global_offset + local_token;
   const uint32_t destination = head_id / local_heads;
   const uint32_t local_head = head_id % local_heads;
+  uint8_t* chunk = destination == rank ? own_output : output + static_cast<uint64_t>(destination) * chunk_bytes;
 
   T x_val[kPack];
   float x_val_float[kPack];
@@ -315,7 +391,7 @@ __global__ void QuantInt8FusedAmaxPackKernel(
   __shared__ float shared_group_amax;
   if (thread_id == 0) {
     shared_group_amax = block_amax_val;
-    float* scale_output = reinterpret_cast<float*>(output + static_cast<uint64_t>(destination) * chunk_bytes + scale_offset);
+    float* scale_output = reinterpret_cast<float*>(chunk + scale_offset);
     scale_output[(static_cast<uint64_t>(batch_id) * local_heads + local_head) * slots + slot] = block_amax_val / 127.0f;
   }
   __syncthreads();
@@ -330,9 +406,9 @@ __global__ void QuantInt8FusedAmaxPackKernel(
         details::float_to_int8_rn(x_val_float[j * 4 + 2] * reciprocal_scale),
         details::float_to_int8_rn(x_val_float[j * 4 + 3] * reciprocal_scale));
   }
-  const uint64_t packed_offset = static_cast<uint64_t>(destination) * chunk_bytes + section_offset +
-                                 details::section_offset(local_token, batch_id, batch_size, local_head, local_heads, d_base);
-  *reinterpret_cast<float2*>(output + packed_offset) = *reinterpret_cast<float2*>(&quantized[0]);
+  const uint64_t packed_offset =
+      section_offset + details::section_offset(local_token, batch_id, batch_size, local_head, local_heads, d_base);
+  *reinterpret_cast<float2*>(chunk + packed_offset) = *reinterpret_cast<float2*>(&quantized[0]);
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -344,6 +420,8 @@ __global__ void QuantVFP8PackKernel(
     const T* __restrict__ input,
     const float* __restrict__ scale,
     uint8_t* __restrict__ output,
+    uint8_t* __restrict__ own_output,
+    uint32_t rank,
     uint64_t num_packs,
     uint32_t num_heads,
     uint32_t local_heads,
@@ -372,8 +450,9 @@ __global__ void QuantVFP8PackKernel(
                                 static_cast<uint64_t>(token_id) * stride_token +
                                 static_cast<uint64_t>(head_id) * stride_head + d_base;
   const uint64_t scale_offset = (static_cast<uint64_t>(batch_id) * num_heads + head_id) * kHeadDim + d_base;
-  const uint64_t output_offset = static_cast<uint64_t>(destination) * chunk_bytes + 2 * main_bytes +
-                                 details::section_offset(token_id, batch_id, batch_size, local_head, local_heads, d_base);
+  uint8_t* chunk = destination == rank ? own_output : output + static_cast<uint64_t>(destination) * chunk_bytes;
+  const uint64_t output_offset =
+      2 * main_bytes + details::section_offset(token_id, batch_id, batch_size, local_head, local_heads, d_base);
 
   T x_val[kPack];
   float scale_val[kPack];
@@ -393,7 +472,7 @@ __global__ void QuantVFP8PackKernel(
   }
   details::floatx4_to_e4m3x4(x_val_fp8, x_val_float, x_val_float + 2);
   details::floatx4_to_e4m3x4(x_val_fp8 + 1, x_val_float + 4, x_val_float + 6);
-  *reinterpret_cast<uint2*>(output + output_offset) = *reinterpret_cast<uint2*>(&x_val_fp8[0]);
+  *reinterpret_cast<uint2*>(chunk + output_offset) = *reinterpret_cast<uint2*>(&x_val_fp8[0]);
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -531,29 +610,35 @@ struct Kernels {
     CHECK_HOST(L.unwrap() % kShardAlignment == 0)
         << name << ": the local sequence must be a whole number of " << kShardAlignment << "-token blocks, got "
         << L.unwrap();
+    // Every kernel reads rows with 16-byte vector loads.
+    CHECK_HOST(SB.unwrap() % 8 == 0 && ST.unwrap() % 8 == 0 && SH.unwrap() % 8 == 0)
+        << name << ": strides must be multiples of 8 elements";
     return Shard{B.unwrap(), L.unwrap(), H.unwrap(), SB.unwrap(), ST.unwrap(), SH.unwrap()};
   }
 
   /**
    * \brief Per-channel K sum and V amax over this rank's shard.
    * \param k, v   `[B, L, H, 128]` shard views (same shape / dtype / strides class)
-   * \param k_sum  fp32 `[B, H, 128]`, sum over the shard's tokens
-   * \param v_amax fp32 `[B, H, 128]`, max |v| over the shard's tokens
+   * \param stats  fp32 `[R, 2, B, H, 128]`: R identical records of (K sum, V amax) over the shard's
+   *               tokens, the replicated all-gather payload
+   * \param own    fp32 `[2, B, H, 128]`, the same record once more (this rank's row of the gathered result)
    */
-  static void k_sum_v_amax(tvm::ffi::TensorView k, tvm::ffi::TensorView v, tvm::ffi::TensorView k_sum, tvm::ffi::TensorView v_amax) {
+  static void k_sum_v_amax(tvm::ffi::TensorView k, tvm::ffi::TensorView v, tvm::ffi::TensorView stats, tvm::ffi::TensorView own) {
     using namespace host;
-    SymbolicSize B{"batch"}, L{"local_sequence"}, H{"heads"};
+    SymbolicSize B{"batch"}, L{"local_sequence"}, H{"heads"}, R{"replicas"};
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
     const Shard ks = shard(k, "k", B, L, H, device);
     const Shard vs = shard(v, "v", B, L, H, device);
-    TensorMatcher({B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(k_sum).verify(v_amax);
+    TensorMatcher({R, 2, B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(stats);
+    TensorMatcher({2, B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(own);
+    const uint64_t half = static_cast<uint64_t>(ks.batch) * ks.num_heads * kHeadDim;
     const DLDevice dev = device.unwrap();
     const int64_t chunks = div_ceil(ks.local_sequence, static_cast<int64_t>(kStatsChunkTokens));
     const int64_t partial_elems = ks.batch * ks.num_heads * chunks * kHeadDim;
     auto k_partial = ffi::alloc_workspace_tensor(partial_elems * sizeof(float), dev);
     auto v_partial = ffi::alloc_workspace_tensor(partial_elems * sizeof(float), dev);
-    LaunchKernel(dim3(ks.num_heads, ks.batch, chunks), 2 * kHeadDim, dev).enable_pdl(kUsePDL)(
+    LaunchKernel(dim3(ks.num_heads, ks.batch, chunks), 16 * (kHeadDim / 8), dev).enable_pdl(kUsePDL)(
         KSumVAmaxPartialKernel<T, kUsePDL>,
         static_cast<const T*>(k.data_ptr()),
         static_cast<const T*>(v.data_ptr()),
@@ -572,10 +657,54 @@ struct Kernels {
         KSumVAmaxCombineKernel<kUsePDL>,
         static_cast<const float*>(k_partial.data_ptr()),
         static_cast<const float*>(v_partial.data_ptr()),
-        static_cast<float*>(k_sum.data_ptr()),
-        static_cast<float*>(v_amax.data_ptr()),
+        static_cast<float*>(stats.data_ptr()),
+        static_cast<float*>(own.data_ptr()),
         static_cast<uint32_t>(ks.num_heads),
-        static_cast<uint32_t>(chunks));
+        static_cast<uint32_t>(chunks),
+        static_cast<uint32_t>(R.unwrap()),
+        2 * half,
+        half);
+  }
+
+  /**
+   * \brief `k_mean` and `v_scale` from the gathered statistics, plus this rank's slice of `v_scale`.
+   * \param gathered      fp32 `[W, 2, B, H, 128]`, row r from rank r
+   * \param k_mean        `[B, H, 128]` in the activation dtype
+   * \param v_scale       fp32 `[B, H, 128]`
+   * \param v_scale_local fp32 `[B, h, 128]`, heads `[rank * h, (rank + 1) * h)`
+   * \param used_sequence live rows of the global sequence
+   */
+  static void finalize_stats(
+      tvm::ffi::TensorView gathered,
+      tvm::ffi::TensorView k_mean,
+      tvm::ffi::TensorView v_scale,
+      tvm::ffi::TensorView v_scale_local,
+      int64_t used_sequence,
+      int64_t rank) {
+    using namespace host;
+    SymbolicSize W{"world_size"}, B{"batch"}, H{"heads"}, h{"local_heads"};
+    SymbolicDevice device;
+    device.set_options<kDLCUDA>();
+    TensorMatcher({W, 2, B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(gathered);
+    TensorMatcher({B, H, kHeadDim}).template with_dtype<T>().template with_device<kDLCUDA>(device).verify(k_mean);
+    TensorMatcher({B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(v_scale);
+    TensorMatcher({B, h, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(v_scale_local);
+    CHECK_HOST(H.unwrap() % h.unwrap() == 0 && rank >= 0 && (rank + 1) * h.unwrap() <= H.unwrap())
+        << "local heads must tile the heads and rank must own a slice";
+    CHECK_HOST(used_sequence > 0) << "used_sequence must be positive";
+    const DLDevice dev = device.unwrap();
+    LaunchKernel(dim3(H.unwrap(), B.unwrap()), kHeadDim, dev)(
+        FinalizeStatsKernel<T>,
+        static_cast<const float*>(gathered.data_ptr()),
+        static_cast<T*>(k_mean.data_ptr()),
+        static_cast<float*>(v_scale.data_ptr()),
+        static_cast<float*>(v_scale_local.data_ptr()),
+        static_cast<uint32_t>(W.unwrap()),
+        static_cast<uint32_t>(H.unwrap()),
+        static_cast<uint32_t>(h.unwrap()),
+        static_cast<uint32_t>(rank),
+        static_cast<uint32_t>(used_sequence),
+        static_cast<uint64_t>(B.unwrap()) * H.unwrap() * kHeadDim);
   }
 
   /**
@@ -592,6 +721,7 @@ struct Kernels {
       tvm::ffi::TensorView k_mean,
       tvm::ffi::TensorView v_scale,
       tvm::ffi::TensorView out,
+      tvm::ffi::TensorView own_out,
       int64_t rank,
       int64_t world_size,
       int64_t used_sequence) {
@@ -612,8 +742,10 @@ struct Kernels {
         << "used_sequence must lie in (0, " << global_sequence << "], got " << used_sequence;
     const ChunkSpec spec = chunk_spec(qs.batch, qs.local_sequence, local_heads);
     TensorMatcher({world_size, spec.chunk_bytes}).template with_dtype<uint8_t>().template with_device<kDLCUDA>(device).verify(out);
+    TensorMatcher({spec.chunk_bytes}).template with_dtype<uint8_t>().template with_device<kDLCUDA>(device).verify(own_out);
     const DLDevice dev = device.unwrap();
     auto* payload = static_cast<uint8_t*>(out.data_ptr());
+    auto* own_payload = static_cast<uint8_t*>(own_out.data_ptr());
     const uint32_t global_offset = static_cast<uint32_t>(rank * qs.local_sequence);
 
     LaunchKernel(dim3(qs.local_sequence / kQGroup, qs.num_heads, qs.batch), kQGroup * (kHeadDim / 8), dev)
@@ -622,6 +754,8 @@ struct Kernels {
             static_cast<const T*>(q.data_ptr()),
             static_cast<const T*>(nullptr),
             payload,
+            own_payload,
+            static_cast<uint32_t>(rank),
             static_cast<uint32_t>(qs.local_sequence),
             global_offset,
             static_cast<uint32_t>(qs.num_heads),
@@ -641,6 +775,8 @@ struct Kernels {
             static_cast<const T*>(k.data_ptr()),
             static_cast<const T*>(k_mean.data_ptr()),
             payload,
+            own_payload,
+            static_cast<uint32_t>(rank),
             static_cast<uint32_t>(ks.local_sequence),
             global_offset,
             static_cast<uint32_t>(ks.num_heads),
@@ -662,6 +798,8 @@ struct Kernels {
             static_cast<const T*>(v.data_ptr()),
             static_cast<const float*>(v_scale.data_ptr()),
             payload,
+            own_payload,
+            static_cast<uint32_t>(rank),
             v_packs,
             static_cast<uint32_t>(vs.num_heads),
             static_cast<uint32_t>(local_heads),

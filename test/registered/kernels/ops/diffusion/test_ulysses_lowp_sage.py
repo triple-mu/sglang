@@ -242,3 +242,87 @@ def test_unpacked_operands_drive_dense_sage_attention():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@requires_sm120
+@pytest.mark.parametrize("world_size", [2, 4, 6, 8])
+def test_finalize_stats_kernel_matches_the_torch_reduction_bitwise(world_size):
+    from sglang.kernels.ops.diffusion import ulysses_lowp_finalize_stats_local
+
+    g = torch.Generator(device="cuda").manual_seed(world_size)
+    heads, local_heads, used = 24, 24 // world_size, 5000
+    gathered = (
+        torch.randn(world_size, 2, 1, heads, 128, generator=g, device="cuda") * 3
+    ).abs()
+    want_k, want_v = ulysses_lowp_finalize_stats(
+        gathered, world_size=world_size, used_sequence=used, dtype=torch.bfloat16
+    )
+    for rank in (0, world_size - 1):
+        k_mean, v_scale, v_local = ulysses_lowp_finalize_stats_local(
+            gathered,
+            world_size=world_size,
+            used_sequence=used,
+            rank=rank,
+            local_heads=local_heads,
+        )
+        assert torch.equal(k_mean, want_k)
+        assert torch.equal(v_scale, want_v)
+        assert torch.equal(
+            v_local, want_v[:, rank * local_heads : (rank + 1) * local_heads]
+        )
+
+
+@requires_sm120
+def test_stats_kernel_replicates_its_record_and_the_pack_lands_the_own_chunk():
+    q, k, v = _global_qkv(1, 2048, 8, layout="interleaved", used=2000, seed=5)
+    replicas = torch.empty(4, 2, 1, 8, 128, dtype=torch.float32, device="cuda")
+    own = torch.empty(2, 1, 8, 128, dtype=torch.float32, device="cuda")
+    record = ulysses_lowp_k_sum_v_amax(k, v, out=replicas, own=own)
+    plain = ulysses_lowp_k_sum_v_amax(k, v)
+    assert torch.equal(record, plain)
+    assert all(torch.equal(replicas[r], plain) for r in range(4))
+    assert torch.equal(own, plain)
+
+    world_size, rank = 4, 2
+    local = 2048 // world_size
+    spec = ulysses_lowp_payload_spec(
+        batch=1, local_sequence=local, num_heads=8, world_size=world_size
+    )
+    k_mean, v_scale = ulysses_lowp_finalize_stats(
+        plain.unsqueeze(0).expand(world_size, -1, -1, -1, -1).contiguous(),
+        world_size=world_size,
+        used_sequence=2000,
+        dtype=torch.bfloat16,
+    )
+    shard = slice(rank * local, (rank + 1) * local)
+    want = torch.zeros(spec.payload_shape, dtype=torch.uint8, device="cuda")
+    ulysses_lowp_quant_pack(
+        q[:, shard],
+        k[:, shard],
+        v[:, shard],
+        k_mean,
+        v_scale,
+        rank=rank,
+        world_size=world_size,
+        used_sequence=2000,
+        out=want,
+    )
+    got = torch.zeros(spec.payload_shape, dtype=torch.uint8, device="cuda")
+    own_chunk = torch.zeros(spec.chunk_bytes, dtype=torch.uint8, device="cuda")
+    ulysses_lowp_quant_pack(
+        q[:, shard],
+        k[:, shard],
+        v[:, shard],
+        k_mean,
+        v_scale,
+        rank=rank,
+        world_size=world_size,
+        used_sequence=2000,
+        out=got,
+        own_out=own_chunk,
+    )
+    assert torch.equal(own_chunk, want[rank])
+    assert torch.all(got[rank] == 0)  # the own row of `out` is left untouched
+    for peer in range(world_size):
+        if peer != rank:
+            assert torch.equal(got[peer], want[peer])

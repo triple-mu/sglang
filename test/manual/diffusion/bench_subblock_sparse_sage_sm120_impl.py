@@ -101,19 +101,25 @@ def main():
         "_quantize_local (W=1 kernels)", lambda: mod._quantize_local(q, k, v, used=USED)
     )
     cut = -(-USED // 64) * 64
-    route = timed(
-        "_dequantize_for_routing",
-        lambda: mod._dequantize_for_routing(
-            op.q[:, :, :USED], op.k[:, :, :USED], op.k_scale
+    gq, gk, sub_q, sub_k = impl.router.cell_geometry(USED, USED)
+    pooled = timed(
+        "subblock_pool_int8 (routing cells from INT8)",
+        lambda: mod.subblock_pool_int8(
+            op.q,
+            op.k,
+            op.k_scale,
+            used=USED,
+            sub_q=sub_q,
+            sub_k=sub_k,
+            cells_q=gq * impl.router.n_q,
+            cells_k=gk * impl.router.n_k,
+            q_factor=SCALE * mod.LOG2E,
         ),
     )
     plan = timed(
-        "router.route",
-        lambda: impl.router.route(
-            route[0].transpose(1, 2),
-            route[1].transpose(1, 2),
-            sparsity=0.75,
-            softmax_scale=SCALE,
+        "router.route_pooled",
+        lambda: impl.router.route_pooled(
+            pooled[0], pooled[1], batch=1, seq_q=USED, seq_k=USED, sparsity=0.75
         ),
     )
     num_blocks = cut // 64

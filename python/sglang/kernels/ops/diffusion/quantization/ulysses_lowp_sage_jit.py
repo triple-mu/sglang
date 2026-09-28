@@ -157,6 +157,7 @@ def _jit_module(dtype: torch.dtype, use_pdl: bool) -> Module:
             ("k_sum_v_amax", f"ulysses_lowp_sage::Kernels<{args}>::k_sum_v_amax"),
             ("quant_pack", f"ulysses_lowp_sage::Kernels<{args}>::quant_pack"),
             ("unpack_for_sage", f"ulysses_lowp_sage::Kernels<{args}>::unpack_for_sage"),
+            ("finalize_stats", f"ulysses_lowp_sage::Kernels<{args}>::finalize_stats"),
         ],
         # The Sage quantiser's rounding chain was pinned under fast math.
         extra_cuda_cflags=["--use_fast_math"],
@@ -167,15 +168,28 @@ def _module(dtype: torch.dtype) -> Module:
     return _jit_module(dtype, is_arch_support_pdl())
 
 
-def ulysses_lowp_k_sum_v_amax(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Per-channel K sum and V amax of this shard as one `[2, B, H, 128]` fp32 tensor.
+def ulysses_lowp_k_sum_v_amax(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    own: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-channel K sum and V amax of this shard as one `[2, B, H, 128]` fp32 record.
 
-    That tensor is the all-gather payload; it is identical in size on every rank.
+    `out` `[R, 2, B, H, 128]` receives R identical records (the replicated
+    all-gather payload) and `own` `[2, B, H, 128]` the record once more; both
+    default to one fresh record, which is returned.
     """
     batch, _, heads, head_dim = k.shape
-    stats = torch.empty(2, batch, heads, head_dim, dtype=torch.float32, device=k.device)
-    _module(k.dtype).k_sum_v_amax(k, v, stats[0], stats[1])
-    return stats
+    if out is None:
+        out = torch.empty(
+            1, 2, batch, heads, head_dim, dtype=torch.float32, device=k.device
+        )
+    if own is None:
+        own = out[0]
+    _module(k.dtype).k_sum_v_amax(k, v, out, own)
+    return out[0]
 
 
 def ulysses_lowp_finalize_stats(
@@ -189,13 +203,43 @@ def ulysses_lowp_finalize_stats(
 
     The K mean divides by the live row count (padding rows contribute exactly
     zero to the sum) and is rounded to the activation dtype, which is the
-    value the pack kernel subtracts. Reductions run in fixed rank order, so
-    every rank derives bit-identical results.
+    value the pack kernel subtracts. The sum runs in rank order 0..W-1 (not
+    `sum(dim=0)`, whose order depends on the shape and the GPU), so every
+    rank and the `finalize_stats` kernel derive bit-identical results.
     """
     g = gathered.view(world_size, 2, *gathered.shape[-3:])
-    k_mean = (g[:, 0].sum(dim=0) / used_sequence).to(dtype).contiguous()
+    k_sum = g[0, 0].clone()
+    for r in range(1, world_size):
+        k_sum += g[r, 0]
+    k_mean = (k_sum / used_sequence).to(dtype).contiguous()
     v_scale = (g[:, 1].amax(dim=0) / V_SCALE_MAX).contiguous()
     return k_mean, v_scale
+
+
+def ulysses_lowp_finalize_stats_local(
+    gathered: torch.Tensor,
+    *,
+    world_size: int,
+    used_sequence: int,
+    rank: int,
+    local_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`ulysses_lowp_finalize_stats` as one kernel, plus `v_scale` for this rank's heads.
+
+    Returns bf16 `k_mean [B, H, 128]`, fp32 `v_scale [B, H, 128]` and fp32
+    `v_scale_local [B, h, 128]`, the torch path's numbers bit for bit.
+    """
+    g = gathered.view(world_size, 2, *gathered.shape[-3:])
+    batch, heads, head_dim = g.shape[-3:]
+    k_mean = torch.empty(batch, heads, head_dim, dtype=torch.bfloat16, device=g.device)
+    v_scale = torch.empty(batch, heads, head_dim, dtype=torch.float32, device=g.device)
+    v_scale_local = torch.empty(
+        batch, local_heads, head_dim, dtype=torch.float32, device=g.device
+    )
+    _module(torch.bfloat16).finalize_stats(
+        g, k_mean, v_scale, v_scale_local, int(used_sequence), int(rank)
+    )
+    return k_mean, v_scale, v_scale_local
 
 
 def ulysses_lowp_quant_pack(
@@ -209,10 +253,26 @@ def ulysses_lowp_quant_pack(
     world_size: int,
     used_sequence: int,
     out: torch.Tensor,
+    own_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Quantise the shard and write the destination-major payload into `out`."""
+    """Quantise the shard and write the destination-major payload into `out`.
+
+    `own_out` `[chunk_bytes]` takes this rank's own chunk instead of `out[rank]`,
+    typically the rank's row of the exchange result so no self-copy is needed.
+    """
+    if own_out is None:
+        own_out = out[rank]
     _module(q.dtype).quant_pack(
-        q, k, v, k_mean, v_scale, out, int(rank), int(world_size), int(used_sequence)
+        q,
+        k,
+        v,
+        k_mean,
+        v_scale,
+        out,
+        own_out,
+        int(rank),
+        int(world_size),
+        int(used_sequence),
     )
     return out
 
@@ -257,6 +317,7 @@ __all__ = [
     "V_SCALE_MAX",
     "can_use_ulysses_lowp_sage",
     "ulysses_lowp_finalize_stats",
+    "ulysses_lowp_finalize_stats_local",
     "ulysses_lowp_k_sum_v_amax",
     "ulysses_lowp_payload_spec",
     "ulysses_lowp_quant_pack",

@@ -106,9 +106,13 @@ __device__ __forceinline__ void BarrierBody(uint64_t* local, PeerSignals peers, 
   }
 }
 
+// `abort_out` is host-mapped memory: the host reads the sticky abort slots after
+// the barrier without a device-to-host copy on the stream.
 static __global__ void BarrierKernel(uint64_t* local, PeerSignals peers, int world_size, int rank,
-                                     uint64_t* counter) {
+                                     uint64_t* counter, uint64_t* abort_out) {
   BarrierBody(local, peers, world_size, rank, AdvanceEpoch(counter));
+  const int peer = threadIdx.x;
+  if (peer < world_size) abort_out[peer] = AcquireSignal(local + world_size + peer);
 }
 
 // Rank r is the only writer of abort slot r in every peer's allocation.
@@ -127,11 +131,12 @@ inline cudaError_t FillPeerSignals(PeerSignals& peers, uint64_t* const* peer_sig
 }
 
 inline cudaError_t EnqueueBarrier(uint64_t* local, uint64_t* const* peer_signals, int world_size,
-                                  int rank, uint64_t* counter, cudaStream_t stream) {
+                                  int rank, uint64_t* counter, uint64_t* abort_out,
+                                  cudaStream_t stream) {
   PeerSignals peers{};
   if (const auto status = FillPeerSignals(peers, peer_signals, world_size); status != cudaSuccess)
     return status;
-  BarrierKernel<<<1, 32, 0, stream>>>(local, peers, world_size, rank, counter);
+  BarrierKernel<<<1, 32, 0, stream>>>(local, peers, world_size, rank, counter, abort_out);
   return cudaGetLastError();
 }
 
@@ -355,7 +360,8 @@ class Transport {
   cudaEvent_t phase_done = nullptr;
   cudaStream_t abort_stream = nullptr;
   cudaEvent_t abort_done = nullptr;
-  uint64_t* abort_snapshot = nullptr;
+  uint64_t* abort_snapshot = nullptr;         // host view of the mapped snapshot
+  uint64_t* abort_snapshot_device = nullptr;  // the barrier kernel writes through this
   std::vector<std::unique_ptr<Slot>> slots;
   bool connected = false;
   bool failed = false;
@@ -391,10 +397,13 @@ class Transport {
           "cudaStreamCreateWithPriority(abort)");
       CheckCuda(cudaEventCreateWithFlags(&abort_done, cudaEventDisableTiming),
                 "cudaEventCreateWithFlags(abort done)");
-      CheckCuda(
-          cudaMallocHost(reinterpret_cast<void**>(&abort_snapshot), world_size * sizeof(uint64_t)),
-          "cudaMallocHost(abort snapshot)");
+      CheckCuda(cudaHostAlloc(reinterpret_cast<void**>(&abort_snapshot),
+                              world_size * sizeof(uint64_t), cudaHostAllocMapped),
+                "cudaHostAlloc(abort snapshot)");
       std::memset(abort_snapshot, 0, world_size * sizeof(uint64_t));
+      CheckCuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&abort_snapshot_device),
+                                         abort_snapshot, 0),
+                "cudaHostGetDevicePointer(abort snapshot)");
 
       CheckCuda(
           cudaDeviceGetAttribute(&write_ordering, cudaDevAttrGPUDirectRDMAWritesOrdering, device),
@@ -526,6 +535,7 @@ class Transport {
     abort_stream = nullptr;
     if (abort_snapshot != nullptr) cudaFreeHost(abort_snapshot);
     abort_snapshot = nullptr;
+    abort_snapshot_device = nullptr;
     for (auto*& qp : qps) {
       if (qp != nullptr) ibv_destroy_qp(qp);
       qp = nullptr;
@@ -544,6 +554,17 @@ class Transport {
 
   bool TeardownSafe() const noexcept {
     return teardown_safe && !phase_inflight && !unsafe_release && OutstandingWrs() == 0;
+  }
+
+  // The closing barrier runs behind the host; give it the timeout to finish before a teardown vote.
+  bool SettleClosingBarrier() noexcept {
+    if (!phase_inflight) return true;
+    if (phase_done == nullptr ||
+        QueryEventUntil(phase_done, std::chrono::steady_clock::now() + timeout) != cudaSuccess) {
+      return false;
+    }
+    phase_inflight = false;
+    return true;
   }
 
   // The peer and direction ride in the completion so the shared CQ retires the
@@ -577,22 +598,23 @@ class Transport {
     return result;
   }
 
-  // Host-synchronous by design: the barrier kernel, the abort-snapshot readback
-  // and the event wait bound every phase, and cudaEventSynchronize blocks in
-  // the driver instead of flooding API traces with a query spin.
+  // The opening barrier is host-synchronous: the writes may only be posted once
+  // every rank has consumed its previous output, and cudaEventSynchronize
+  // blocks in the driver instead of flooding API traces with a query spin. The
+  // closing barrier only orders the stream: the consumers of the received data
+  // queue behind it, and its abort snapshot is read at the next opening (the
+  // abort slots are sticky), so the host runs ahead to the next launches.
   void RunBarrier(Slot* slot, cudaStream_t stream, bool opening) {
     phase_inflight = true;
     CheckCuda(EnqueueBarrier(slot->signals, slot->peer_signals.data(), world_size, rank,
-                             slot->epoch_device, stream),
+                             slot->epoch_device, abort_snapshot_device, stream),
               opening ? "enqueue opening barrier" : "enqueue closing barrier");
-    CheckCuda(cudaMemcpyAsync(abort_snapshot, slot->signals + world_size,
-                              world_size * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream),
-              "cudaMemcpyAsync(abort snapshot)");
     CheckCuda(cudaEventRecord(phase_done, stream), "cudaEventRecord(barrier)");
+    if (!opening) return;
     CheckCuda(cudaEventSynchronize(phase_done), "wait for barrier");
     phase_inflight = false;
     for (int peer = 0; peer < world_size; ++peer) {
-      CHECK_HOST(abort_snapshot[peer] != kAbortSignal)
+      CHECK_HOST(__atomic_load_n(&abort_snapshot[peer], __ATOMIC_ACQUIRE) != kAbortSignal)
           << "RDMA Ulysses peer " << peer << " aborted the exchange";
     }
   }
@@ -1156,7 +1178,9 @@ inline void connect_slot(int64_t handle, int64_t index, Array<int64_t> flat) {
  * slot's output buffer. Mode 2: [W, C] -> [W, C]; mode 1: [S_global, H_local, D]
  * -> [S_local, H, D].
  */
-inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView output) {
+/// `own_in_place != 0` says the producer already wrote this rank's own chunk (or own heads) into
+/// `output`, so the self-copy is skipped.
+inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView output, int64_t own_in_place) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
   transport->EnsureHealthy();
@@ -1207,7 +1231,7 @@ inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView
                              immediate);
       }
     }
-    SelfCopy(transport, slot, source, geometry, current);
+    if (own_in_place == 0) SelfCopy(transport, slot, source, geometry, current);
 
     // Closing is a success vote: only after every completion is verified and
     // GPUDirect writes are visible to the GPU.
@@ -1225,13 +1249,17 @@ inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView
 }
 
 inline int64_t teardown_safe(int64_t handle) {
-  return AsTransport(handle)->TeardownSafe() ? 1 : 0;
+  auto* transport = AsTransport(handle);
+  ScopedCudaDevice device_guard(transport->device);
+  transport->SettleClosingBarrier();
+  return transport->TeardownSafe() ? 1 : 0;
 }
 
 /*! \brief Close every slot's peer imports; every rank must finish this before any rank disposes. */
 inline void disconnect(int64_t handle) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
+  transport->SettleClosingBarrier();
   CHECK_HOST(transport->TeardownSafe())
       << "cannot disconnect after unbounded native GPU work; terminate the process";
   for (auto& slot : transport->slots) slot->Disconnect();
@@ -1240,6 +1268,7 @@ inline void disconnect(int64_t handle) {
 inline void dispose(int64_t handle) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
+  transport->SettleClosingBarrier();
   CHECK_HOST(transport->TeardownSafe())
       << "cannot dispose after unbounded native GPU work; terminate the process";
   CHECK_HOST(!transport->unsafe_release) << "transport has an unrecoverable teardown ledger";

@@ -7,7 +7,7 @@ on transformer modules in SGLang's modular pipeline architecture.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -70,6 +70,52 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
         if hasattr(transformer, name):
             delattr(transformer, name)
     return transformer
+
+
+@runtime_checkable
+class CacheDitMiddleBlockRunner(Protocol):
+    """A transformer that runs Cache-DiT's middle block range itself, e.g. as a fused chain."""
+
+    def run_cache_dit_middle_blocks(
+        self,
+        blocks: list[torch.nn.Module],
+        hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor | None: ...
+
+
+_middle_blocks_patched = False
+
+
+def _patch_cache_dit_middle_blocks():
+    """Hand CachedBlocks' middle range to the transformer when it implements the runner.
+
+    Cache-DiT computes the Fn blocks itself for its residual test and then calls
+    each middle block's eager forward one by one; a runner gets the whole range
+    and may return None to keep that loop. The input must stay untouched: the
+    residual Cache-DiT caches is the output minus that same tensor.
+    """
+    global _middle_blocks_patched
+    if _middle_blocks_patched:
+        return
+    from cache_dit.caching.cache_blocks.pattern_3_4_5 import (
+        CachedBlocks_Pattern_3_4_5,
+    )
+
+    original = CachedBlocks_Pattern_3_4_5.call_Mn_blocks
+
+    def call_Mn_blocks(self, hidden_states, *args, **kwargs):
+        if isinstance(self.transformer, CacheDitMiddleBlockRunner):
+            out = self.transformer.run_cache_dit_middle_blocks(
+                list(self._Mn_blocks()), hidden_states, *args, **kwargs
+            )
+            if out is not None:
+                return out, None, out - hidden_states
+        return original(self, hidden_states, *args, **kwargs)
+
+    CachedBlocks_Pattern_3_4_5.call_Mn_blocks = call_Mn_blocks
+    _middle_blocks_patched = True
 
 
 def _patch_cache_dit_similarity():
@@ -635,6 +681,7 @@ def enable_cache_on_transformer(
         _patch_cache_dit_similarity()
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
+    _patch_cache_dit_middle_blocks()
 
     # Custom path: pass a pre-built BlockAdapter, bypassing the registry.
     # Standard path: let enable_cache discover the registered adapter.

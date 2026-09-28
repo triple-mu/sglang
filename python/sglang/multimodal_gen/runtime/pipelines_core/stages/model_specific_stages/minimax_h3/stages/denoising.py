@@ -481,7 +481,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             if enable_override is None
             else enable_override
         )
-        generic_requested = generic_enabled and "quality" not in explicit_fields
+        # An explicit per-request opt-in wins over the quality guard, as the
+        # explicit kill switch does below.
+        generic_requested = generic_enabled and (
+            enable_override is True or "quality" not in explicit_fields
+        )
         if enable_override is False:
             # The per-request kill switch wins over quality="high".
             desired_mode = None

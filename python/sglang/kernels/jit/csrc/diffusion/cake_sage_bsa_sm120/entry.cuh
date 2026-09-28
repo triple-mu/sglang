@@ -132,7 +132,10 @@ inline auto encode_v(const void* base, int64_t batch, int64_t heads, int64_t seq
 }
 
 /// BF16 `[B, H, S, 128]` written as two 64-wide halves: 5D map `{64, S, H, B, 2}`, 128B swizzle.
-inline auto encode_o(const void* base, int64_t batch, int64_t heads, int64_t seq) -> CUtensorMap {
+/// The element strides are the tensor's own, so a token-major `[S, H, 128]` view is written in place.
+inline auto encode_o(
+    const void* base, int64_t batch, int64_t heads, int64_t seq, int64_t stride_b, int64_t stride_h, int64_t stride_s)
+    -> CUtensorMap {
   constexpr int64_t kElem = sizeof(bf16_t);
   const cuuint64_t dims[5] = {
       64,
@@ -141,9 +144,9 @@ inline auto encode_o(const void* base, int64_t batch, int64_t heads, int64_t seq
       static_cast<cuuint64_t>(batch),
       2};
   const cuuint64_t strides[4] = {
-      static_cast<cuuint64_t>(kHeadDim * kElem),
-      static_cast<cuuint64_t>(kHeadDim * kElem * seq),
-      static_cast<cuuint64_t>(kHeadDim * kElem * seq * heads),
+      static_cast<cuuint64_t>(stride_s * kElem),
+      static_cast<cuuint64_t>(stride_h * kElem),
+      static_cast<cuuint64_t>(stride_b * kElem),
       static_cast<cuuint64_t>(64 * kElem)};
   const cuuint32_t box[5] = {64, 64, 1, 1, 2};
   return encode(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, base, dims, strides, box, CU_TENSOR_MAP_SWIZZLE_128B, "O");
@@ -191,7 +194,9 @@ inline auto fits_int32(int64_t value) -> bool {
  * \param q            INT8 `[B, H, SQ_ALLOC, 128]`, contiguous
  * \param k            INT8 `[B, H, SK_ALLOC, 128]`, contiguous
  * \param v            FP8 E4M3 `[B, H, 128, SK_ALLOC]`, Sage 16-token permutation, contiguous
- * \param out          BF16 `[B, H, SQ_ALLOC, 128]`, contiguous; rows `>= seqlen_q` are left alone
+ * \param out          BF16 `[B, H, SQ_ALLOC, 128]`; the last dim is contiguous and the other strides are
+ *                     multiples of 8 elements, so a token-major `[S, H, 128]` view is written in place;
+ *                     rows `>= seqlen_q` are left alone
  * \param q_scale      FP32 `[B, H, ceil(seqlen_q / 128) * 4]`, one per 32-query group
  * \param k_scale      FP32 `[B, H, seqlen_k / 64]`, one per 64-key block
  * \param v_scale      FP32 `[B, H, 128]`, one per channel
@@ -228,14 +233,14 @@ inline auto run(
   const int64_t q_scale_len = div_ceil(seqlen_q, int64_t{128}) * kQScaleGroupsPerTile;
 
   SymbolicSize B{"batch"}, H{"heads"}, SQA{"seqlen_q_alloc"}, SKA{"seqlen_k_alloc"}, CAP{"q2k_capacity"},
-      WS{"workspace_bytes"};
+      WS{"workspace_bytes"}, OB{"out_stride_batch"}, OH{"out_stride_head"}, OS{"out_stride_seq"};
   SymbolicDevice device;
   device.set_options<kDLCUDA>();
 
   TensorMatcher({B, H, SQA, kHeadDim}).with_dtype<int8_t>().with_device<kDLCUDA>(device).verify(q);
   TensorMatcher({B, H, SKA, kHeadDim}).with_dtype<int8_t>().with_device<kDLCUDA>(device).verify(k);
   TensorMatcher({B, H, kHeadDim, SKA}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(v);
-  TensorMatcher({B, H, SQA, kHeadDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(out);
+  TensorMatcher({B, H, SQA, kHeadDim}).with_strides({OB, OH, OS, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(out);
   TensorMatcher({B, H, q_scale_len}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(q_scale);
   TensorMatcher({B, H, k_blocks}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(k_scale);
   TensorMatcher({B, H, kHeadDim}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(v_scale);
@@ -249,6 +254,10 @@ inline auto run(
   const int64_t seqlen_k_alloc = SKA.unwrap();
   const int64_t capacity = CAP.unwrap();
   CHECK_HOST(seqlen_q <= seqlen_q_alloc) << "seqlen_q " << seqlen_q << " exceeds the allocated " << seqlen_q_alloc;
+  // TMA global strides are 16-byte multiples; the head rows may interleave (token-major) but not overlap.
+  CHECK_HOST(OS.unwrap() % 8 == 0 && OH.unwrap() % 8 == 0 && OB.unwrap() % 8 == 0 && OH.unwrap() >= kHeadDim &&
+             OS.unwrap() >= kHeadDim)
+      << "out strides must be multiples of 8 elements with whole 128-wide rows";
   CHECK_HOST(seqlen_k <= seqlen_k_alloc) << "seqlen_k " << seqlen_k << " exceeds the allocated " << seqlen_k_alloc;
   CHECK_HOST(WS.unwrap() >= static_cast<int64_t>(kDescriptorWorkspaceBytes))
       << "workspace needs at least " << kDescriptorWorkspaceBytes << " bytes";
@@ -262,7 +271,7 @@ inline auto run(
       details::encode_qk(q.data_ptr(), batch, heads, seqlen_q_alloc, "Q"),
       details::encode_qk(k.data_ptr(), batch, heads, seqlen_k_alloc, "K"),
       details::encode_v(v.data_ptr(), batch, heads, seqlen_k_alloc),
-      details::encode_o(out.data_ptr(), batch, heads, seqlen_q_alloc)};
+      details::encode_o(out.data_ptr(), batch, heads, seqlen_q_alloc, OB.unwrap(), OH.unwrap(), OS.unwrap())};
   details::bind_descriptors(maps, workspace.data_ptr(), stream);
   auto* slots = static_cast<const CakeTensorMap*>(workspace.data_ptr());
 
