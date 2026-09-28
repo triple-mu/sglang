@@ -240,6 +240,15 @@ class SubBlockRouter:
         self.block_size_k = block_size_k
         self.budget_granularity = budget_granularity
 
+    def cell_geometry(self, seq_q: int, seq_k: int) -> tuple[int, int, int, int]:
+        """`(query blocks, key blocks, tokens per query cell, tokens per key cell)`."""
+        return (
+            -(-seq_q // BLOCK),
+            -(-seq_k // self.block_size_k),
+            BLOCK // self.n_q,
+            self.block_size_k // self.n_k,
+        )
+
     @torch.no_grad()
     def scores(
         self, q: torch.Tensor, k: torch.Tensor, softmax_scale: float
@@ -261,11 +270,8 @@ class SubBlockRouter:
         """
         b, s, h, d = q.shape
         sk = k.shape[1]
-        gq = -(-s // BLOCK)
-        gk = -(-sk // self.block_size_k)
+        gq, gk, sub_q, sub_k = self.cell_geometry(s, sk)
         nq, nk = self.n_q, self.n_k
-        sub_q = BLOCK // nq
-        sub_k = self.block_size_k // nk
 
         # Pooling handles the ragged tail on the *pooled* tensor: padding q/k up to
         # complete native blocks first would copy the whole 300+ MB activation.
@@ -276,28 +282,59 @@ class SubBlockRouter:
         pooled_k = torch.empty(b * h, gk * nk, d, device=k.device, dtype=torch.bfloat16)
         fused_pool(q, gq * nq, sub_q, pooled_q, scale=softmax_scale * LOG2E)
         fused_pool(k, gk * nk, sub_k, pooled_k)
+        return self._scores_from_pooled(pooled_q, pooled_k, batch=b, seq_q=s, seq_k=sk)
 
-        out = torch.empty(b * h, gq, gk, device=q.device, dtype=torch.float32)
+    def _scores_from_pooled(
+        self,
+        pooled_q: torch.Tensor,
+        pooled_k: torch.Tensor,
+        *,
+        batch: int,
+        seq_q: int,
+        seq_k: int,
+    ) -> torch.Tensor:
+        gq, gk, sub_q, sub_k = self.cell_geometry(seq_q, seq_k)
+        heads = pooled_q.shape[0] // batch
+        out = torch.empty(
+            batch * heads, gq, gk, device=pooled_q.device, dtype=torch.float32
+        )
         fused_scores(
             pooled_q,
             pooled_k,
             out,
-            n_k=nk,
-            n_valid=-(-sk // sub_k),
-            n_q=nq,
-            m_valid=-(-s // sub_q),
+            n_k=self.n_k,
+            n_valid=-(-seq_k // sub_k),
+            n_q=self.n_q,
+            m_valid=-(-seq_q // sub_q),
         )
-        return out.view(b, h, gq, gk)
+        return out.view(batch, heads, gq, gk)
 
     @torch.no_grad()
     def route(
         self, q: torch.Tensor, k: torch.Tensor, sparsity: float, softmax_scale: float
     ) -> RoutingPlan:
         """Select the top ``(1 - sparsity)`` fraction of key blocks per query block."""
-        b, s, h, d = q.shape
-        gk = -(-k.shape[1] // self.block_size_k)
-        scores = self.scores(q, k, softmax_scale)  # [B, H, Gq, Gk]
-        gq = scores.shape[2]
+        return self._plan(self.scores(q, k, softmax_scale), sparsity)
+
+    @torch.no_grad()
+    def route_pooled(
+        self,
+        pooled_q: torch.Tensor,
+        pooled_k: torch.Tensor,
+        *,
+        batch: int,
+        seq_q: int,
+        seq_k: int,
+        sparsity: float,
+    ) -> RoutingPlan:
+        """`route` from cells pooled the way `scores` pools them, Q already carrying `softmax_scale * log2 e`."""
+        scores = self._scores_from_pooled(
+            pooled_q, pooled_k, batch=batch, seq_q=seq_q, seq_k=seq_k
+        )
+        return self._plan(scores, sparsity)
+
+    def _plan(self, scores: torch.Tensor, sparsity: float) -> RoutingPlan:
+        b, h, gq, gk = scores.shape
         topk = _snap_up(math.ceil((1.0 - sparsity) * gk), gk, self.budget_granularity)
         # One pass over the score matrix instead of torch.topk's several. The
         # output order is unspecified. SM100/SM120 BF16 consume it directly;

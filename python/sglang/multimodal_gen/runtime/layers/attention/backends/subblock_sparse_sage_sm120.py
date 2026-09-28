@@ -39,6 +39,8 @@ import torch.distributed as dist
 from sglang.kernels.ops.diffusion import (
     sage_block_sparse_attn_sm120,
     sage_block_sparse_dense_block_index,
+    subblock_block_tables,
+    subblock_pool_int8,
     ulysses_lowp_finalize_stats,
     ulysses_lowp_k_sum_v_amax,
     ulysses_lowp_payload_spec,
@@ -55,6 +57,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
     SubBlockRouter,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.router import (
+    LOG2E,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
     SUBBLOCK_SPARSE_BLOCK_SIZE,
@@ -164,11 +169,14 @@ def cake_block_tables(
             (batch, heads, q_blocks), topk, dtype=torch.int32, device=index.device
         )
         return index.contiguous(), nums
-    mask = sparse_query_block_mask.to(device=index.device, dtype=torch.bool).view(-1)
+    mask = sparse_query_block_mask.to(device=index.device, dtype=torch.bool).reshape(-1)
     if mask.numel() != q_blocks:
         raise ValueError(
             f"sparse query-block mask has {mask.numel()} entries for {q_blocks} query blocks"
         )
+    if index.is_cuda:
+        return subblock_block_tables(index, mask, num_blocks)
+    # CPU callers (tests) build the same tables with torch ops.
     tables = (
         torch.arange(num_blocks, device=index.device, dtype=index.dtype)
         .view(1, 1, 1, num_blocks)
@@ -185,21 +193,6 @@ def cake_block_tables(
         .contiguous()
     )
     return tables, nums
-
-
-def _dequantize_for_routing(
-    q_int8: torch.Tensor, k_int8: torch.Tensor, k_scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """BF16 Q/K that rank key blocks like the originals.
-
-    Q's per-group scale and K's channel mean shift every key block of a query
-    row by the same factor or constant, so they cannot reorder the row; K's
-    per-tile scale can, so it is the one term applied.
-    """
-    seq_len = k_int8.shape[2]
-    per_token = k_scale.to(torch.bfloat16).repeat_interleave(BLOCK, dim=-1)
-    k_bf16 = k_int8.to(torch.bfloat16) * per_token[:, :, :seq_len].unsqueeze(-1)
-    return q_int8.to(torch.bfloat16), k_bf16
 
 
 class _SageOperands(msgspec.Struct, frozen=True):
@@ -506,14 +499,27 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         heads = op.q.shape[1]
         num_blocks = cut // BLOCK
         if self._step_enabled():
-            q_route, k_route = _dequantize_for_routing(
-                op.q[:, :, :used], op.k[:, :, :used], op.k_scale
+            # Q's per-group scale and K's channel mean shift every key block of a
+            # query row alike, so only K's per-tile scale enters the ranking.
+            gq, gk, sub_q, sub_k = self.router.cell_geometry(used, used)
+            pooled_q, pooled_k = subblock_pool_int8(
+                op.q,
+                op.k,
+                op.k_scale,
+                used=used,
+                sub_q=sub_q,
+                sub_k=sub_k,
+                cells_q=gq * self.router.n_q,
+                cells_k=gk * self.router.n_k,
+                q_factor=self.softmax_scale * LOG2E,
             )
-            plan = self.router.route(
-                q_route.transpose(1, 2),
-                k_route.transpose(1, 2),
+            plan = self.router.route_pooled(
+                pooled_q,
+                pooled_k,
+                batch=1,
+                seq_q=used,
+                seq_k=used,
                 sparsity=self.schedule.sparsity,
-                softmax_scale=self.softmax_scale,
             )
             index, nums = cake_block_tables(
                 plan.index, plan.topk, num_blocks, sparse_query_block_mask
