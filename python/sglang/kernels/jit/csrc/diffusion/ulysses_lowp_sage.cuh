@@ -245,9 +245,9 @@ __global__ void KSumVAmaxCombineKernel(
 }
 
 /// `k_mean = bf16(sum_r k_sum[r] / used)` and `v_scale = max_r v_amax[r] / 2.25` from the gathered
-/// `[W, 2, B, H, 128]` records; the sum runs in torch's reduction order (four round-robin
-/// accumulators, then combined in order) so it matches `sum(dim=0)` bit for bit. `v_scale_local`
-/// receives the heads this rank attends to.
+/// `[W, 2, B, H, 128]` records. The sum runs in rank order 0..W-1 in fp32, the order the torch
+/// path (`ulysses_lowp_finalize_stats`) uses too, so both derive the same bits on every rank.
+/// `v_scale_local` receives the heads this rank attends to.
 template <typename T>
 __global__ void FinalizeStatsKernel(
     const float* __restrict__ gathered,
@@ -265,13 +265,12 @@ __global__ void FinalizeStatsKernel(
   const uint32_t batch_id = blockIdx.y;
   const uint64_t out = (static_cast<uint64_t>(batch_id) * num_heads + head_id) * kHeadDim + d_id;
   const uint64_t stride = 2 * half;
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  float sum = 0.f;
   float m = 0.f;
   for (uint32_t r = 0; r < world_size; ++r) {
-    acc[r % 4] += gathered[r * stride + out];
+    sum += gathered[r * stride + out];
     m = fmaxf(m, gathered[r * stride + half + out]);
   }
-  const float sum = ((acc[0] + acc[1]) + acc[2]) + acc[3];
   k_mean[out] = details::from_float<T>(__fdiv_rn(sum, static_cast<float>(used_sequence)));
   const float scale = __fdiv_rn(m, kVScaleMax);
   v_scale[out] = scale;

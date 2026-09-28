@@ -203,11 +203,15 @@ def ulysses_lowp_finalize_stats(
 
     The K mean divides by the live row count (padding rows contribute exactly
     zero to the sum) and is rounded to the activation dtype, which is the
-    value the pack kernel subtracts. Reductions run in fixed rank order, so
-    every rank derives bit-identical results.
+    value the pack kernel subtracts. The sum runs in rank order 0..W-1 (not
+    `sum(dim=0)`, whose order depends on the shape and the GPU), so every
+    rank and the `finalize_stats` kernel derive bit-identical results.
     """
     g = gathered.view(world_size, 2, *gathered.shape[-3:])
-    k_mean = (g[:, 0].sum(dim=0) / used_sequence).to(dtype).contiguous()
+    k_sum = g[0, 0].clone()
+    for r in range(1, world_size):
+        k_sum += g[r, 0]
+    k_mean = (k_sum / used_sequence).to(dtype).contiguous()
     v_scale = (g[:, 1].amax(dim=0) / V_SCALE_MAX).contiguous()
     return k_mean, v_scale
 
@@ -223,7 +227,7 @@ def ulysses_lowp_finalize_stats_local(
     """`ulysses_lowp_finalize_stats` as one kernel, plus `v_scale` for this rank's heads.
 
     Returns bf16 `k_mean [B, H, 128]`, fp32 `v_scale [B, H, 128]` and fp32
-    `v_scale_local [B, h, 128]`; the numbers are the torch path's bit for bit.
+    `v_scale_local [B, h, 128]`, the torch path's numbers bit for bit.
     """
     g = gathered.view(world_size, 2, *gathered.shape[-3:])
     batch, heads, head_dim = g.shape[-3:]
