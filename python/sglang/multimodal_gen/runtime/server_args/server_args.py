@@ -1202,7 +1202,8 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend in ("laser_attn", "subblock_sparse_sage_sm120")
+            and self.attention_backend
+            in ("laser_attn", "subblock_sparse_sage_sm120", "veda_attn")
             and "text_encoder" not in self.component_attention_backends
         ):
             # These backends serve only the MiniMax-H3 transformer; SDPA is the
