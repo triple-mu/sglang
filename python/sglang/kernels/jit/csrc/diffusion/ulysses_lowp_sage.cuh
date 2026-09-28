@@ -151,9 +151,11 @@ SGL_DEVICE uint64_t section_offset(
 
 // ---------------------------------------------------------------------------
 // Statistics: per-channel K sum and V amax over the local shard.
-// Stage 1 reduces fixed 256-token chunks (grid z); stage 2 combines the chunk
-// partials in ascending chunk order, so the fp32 sum is bit-identical run to
-// run and identical on every rank once the partials are all-gathered.
+// Stage 1 reduces fixed 256-token chunks (grid z): 16 token lanes x 16 threads,
+// each thread loading 8 channels (16 bytes) of K and V per token, so a CTA
+// streams 16 rows per iteration; stage 2 combines the chunk partials in
+// ascending chunk order. The fp32 sum is bit-identical run to run and identical
+// on every rank once the partials are all-gathered.
 // ---------------------------------------------------------------------------
 template <typename T, bool kUsePDL>
 __global__ void KSumVAmaxPartialKernel(
@@ -170,42 +172,66 @@ __global__ void KSumVAmaxPartialKernel(
     int64_t v_stride_batch,
     int64_t v_stride_token,
     int64_t v_stride_head) {
-  constexpr uint32_t kTokenLanes = 2;
-  constexpr uint32_t kThreads = kTokenLanes * kHeadDim;
+  constexpr uint32_t kPack = 8;
+  constexpr uint32_t kPacksPerRow = kHeadDim / kPack;  // 16 threads cover one 128-channel row
+  constexpr uint32_t kTokenLanes = 16;
+  constexpr uint32_t kThreads = kTokenLanes * kPacksPerRow;
   const uint32_t thread_id = threadIdx.x;
-  const uint32_t d_id = thread_id % kHeadDim;
-  const uint32_t token_lane = thread_id / kHeadDim;
+  const uint32_t d_base = (thread_id % kPacksPerRow) * kPack;
+  const uint32_t token_lane = thread_id / kPacksPerRow;
   const uint32_t head_id = blockIdx.x;
   const uint32_t batch_id = blockIdx.y;
   const uint32_t chunk_id = blockIdx.z;
   const uint32_t token_begin = chunk_id * kStatsChunkTokens;
   const uint32_t token_end = min(token_begin + kStatsChunkTokens, num_tokens);
 
-  float local_sum = 0.0f;
-  float local_amax = 0.0f;
+  float local_sum[kPack];
+  float local_amax[kPack];
+#pragma unroll
+  for (uint32_t j = 0; j < kPack; ++j) {
+    local_sum[j] = 0.0f;
+    local_amax[j] = 0.0f;
+  }
   device::PDLWaitPrimary<kUsePDL>();
   for (uint32_t token_id = token_begin + token_lane; token_id < token_end; token_id += kTokenLanes) {
     const uint64_t k_offset = static_cast<uint64_t>(batch_id) * k_stride_batch +
                               static_cast<uint64_t>(token_id) * k_stride_token +
-                              static_cast<uint64_t>(head_id) * k_stride_head + d_id;
+                              static_cast<uint64_t>(head_id) * k_stride_head + d_base;
     const uint64_t v_offset = static_cast<uint64_t>(batch_id) * v_stride_batch +
                               static_cast<uint64_t>(token_id) * v_stride_token +
-                              static_cast<uint64_t>(head_id) * v_stride_head + d_id;
-    local_sum += details::to_float(k[k_offset]);
-    local_amax = fmaxf(local_amax, fabsf(details::to_float(v[v_offset])));
+                              static_cast<uint64_t>(head_id) * v_stride_head + d_base;
+    T k_val[kPack];
+    T v_val[kPack];
+    *reinterpret_cast<float4*>(&k_val[0]) = *reinterpret_cast<const float4*>(k + k_offset);
+    *reinterpret_cast<float4*>(&v_val[0]) = *reinterpret_cast<const float4*>(v + v_offset);
+#pragma unroll
+    for (uint32_t j = 0; j < kPack; ++j) {
+      local_sum[j] += details::to_float(k_val[j]);
+      local_amax[j] = fmaxf(local_amax[j], fabsf(details::to_float(v_val[j])));
+    }
   }
 
-  __shared__ float shared_sum[kThreads];
-  __shared__ float shared_amax[kThreads];
-  shared_sum[thread_id] = local_sum;
-  shared_amax[thread_id] = local_amax;
+  // Combine the 16 token lanes in lane order for every channel.
+  __shared__ float shared_sum[kTokenLanes][kHeadDim];
+  __shared__ float shared_amax[kTokenLanes][kHeadDim];
+#pragma unroll
+  for (uint32_t j = 0; j < kPack; ++j) {
+    shared_sum[token_lane][d_base + j] = local_sum[j];
+    shared_amax[token_lane][d_base + j] = local_amax[j];
+  }
   __syncthreads();
-
-  if (token_lane == 0) {
+  if (thread_id < kHeadDim) {
+    float s = 0.0f;
+    float m = 0.0f;
+#pragma unroll
+    for (uint32_t lane = 0; lane < kTokenLanes; ++lane) {
+      s += shared_sum[lane][thread_id];
+      m = fmaxf(m, shared_amax[lane][thread_id]);
+    }
     const uint64_t out =
-        (((static_cast<uint64_t>(batch_id) * num_heads + head_id) * num_chunks) + chunk_id) * kHeadDim + d_id;
-    k_partial[out] = shared_sum[d_id] + shared_sum[kHeadDim + d_id];
-    v_partial[out] = fmaxf(shared_amax[d_id], shared_amax[kHeadDim + d_id]);
+        (((static_cast<uint64_t>(batch_id) * num_heads + head_id) * num_chunks) + chunk_id) * kHeadDim + thread_id;
+    k_partial[out] = s;
+    v_partial[out] = m;
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -584,6 +610,9 @@ struct Kernels {
     CHECK_HOST(L.unwrap() % kShardAlignment == 0)
         << name << ": the local sequence must be a whole number of " << kShardAlignment << "-token blocks, got "
         << L.unwrap();
+    // Every kernel reads rows with 16-byte vector loads.
+    CHECK_HOST(SB.unwrap() % 8 == 0 && ST.unwrap() % 8 == 0 && SH.unwrap() % 8 == 0)
+        << name << ": strides must be multiples of 8 elements";
     return Shard{B.unwrap(), L.unwrap(), H.unwrap(), SB.unwrap(), ST.unwrap(), SH.unwrap()};
   }
 
@@ -609,7 +638,7 @@ struct Kernels {
     const int64_t partial_elems = ks.batch * ks.num_heads * chunks * kHeadDim;
     auto k_partial = ffi::alloc_workspace_tensor(partial_elems * sizeof(float), dev);
     auto v_partial = ffi::alloc_workspace_tensor(partial_elems * sizeof(float), dev);
-    LaunchKernel(dim3(ks.num_heads, ks.batch, chunks), 2 * kHeadDim, dev).enable_pdl(kUsePDL)(
+    LaunchKernel(dim3(ks.num_heads, ks.batch, chunks), 16 * (kHeadDim / 8), dev).enable_pdl(kUsePDL)(
         KSumVAmaxPartialKernel<T, kUsePDL>,
         static_cast<const T*>(k.data_ptr()),
         static_cast<const T*>(v.data_ptr()),

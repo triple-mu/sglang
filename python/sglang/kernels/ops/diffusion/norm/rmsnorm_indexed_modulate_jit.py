@@ -37,6 +37,11 @@ def _jit_module(hidden_size: int) -> Module:
         cuda_wrappers=[
             ("rmsnorm_indexed_scale_shift", f"{kernel}::run"),
             ("gate_residual_rmsnorm_indexed_scale_shift", f"{kernel}::run_gated"),
+            ("rmsnorm_indexed_scale_shift_fp8", f"{kernel}::run_fp8"),
+            (
+                "gate_residual_rmsnorm_indexed_scale_shift_fp8",
+                f"{kernel}::run_gated_fp8",
+            ),
         ],
     )
 
@@ -144,9 +149,53 @@ def gate_residual_rmsnorm_indexed_scale_shift_(
     return out, residual
 
 
+def rmsnorm_indexed_scale_shift_fp8(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plan A whose rows come out per-token fp8 quantised: ``(q [T, H] e4m3, s [T, 1] fp32)``.
+
+    The same ``amax / 448`` scheme the fp8 GEMM applies to a bf16 input, so a
+    per-token-scaled fp8 linear consumes the pair directly.
+    """
+    q = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device)
+    _jit_module(x.shape[1]).rmsnorm_indexed_scale_shift_fp8(
+        q, s, x, gamma, scale, shift, indices, eps
+    )
+    return q, s
+
+
+def gate_residual_rmsnorm_indexed_scale_shift_fp8_(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Plan B whose rows come out per-token fp8 quantised; returns ``((q, s), residual)``."""
+    q = torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
+    s = torch.empty((residual.shape[0], 1), dtype=torch.float32, device=residual.device)
+    _jit_module(residual.shape[1]).gate_residual_rmsnorm_indexed_scale_shift_fp8(
+        q, s, residual, update, gate, gamma, scale, shift, indices, eps
+    )
+    return (q, s), residual
+
+
 __all__ = [
     "can_use_gate_residual_rmsnorm_indexed_scale_shift",
     "can_use_rmsnorm_indexed_scale_shift",
     "gate_residual_rmsnorm_indexed_scale_shift_",
+    "gate_residual_rmsnorm_indexed_scale_shift_fp8_",
     "rmsnorm_indexed_scale_shift",
+    "rmsnorm_indexed_scale_shift_fp8",
 ]

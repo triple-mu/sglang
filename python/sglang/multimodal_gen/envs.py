@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     # Fused SwiGLU + per-token fp8 quantisation feeding fc2 in the fp8 MLP; 0
     # keeps the separate activation and quantisation kernels (same numerics)
     SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT: bool = True
+    SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT: bool = True
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -381,6 +382,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT", "true"
+    ),
+    # Kill switch: the fused adaLN norms emit per-token fp8 rows straight into
+    # qkv_proj / fc1 instead of bf16 rows the GEMM quantises again.
+    "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT", "true"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
