@@ -577,9 +577,12 @@ class Transport {
     return result;
   }
 
-  // Host-synchronous by design: the barrier kernel, the abort-snapshot readback
-  // and the event wait bound every phase, and cudaEventSynchronize blocks in
-  // the driver instead of flooding API traces with a query spin.
+  // The opening barrier is host-synchronous: the writes may only be posted once
+  // every rank has consumed its previous output, and cudaEventSynchronize
+  // blocks in the driver instead of flooding API traces with a query spin. The
+  // closing barrier only orders the stream: the consumers of the received data
+  // queue behind it, and its abort snapshot is read at the next opening (the
+  // abort slots are sticky), so the host runs ahead to the next launches.
   void RunBarrier(Slot* slot, cudaStream_t stream, bool opening) {
     phase_inflight = true;
     CheckCuda(EnqueueBarrier(slot->signals, slot->peer_signals.data(), world_size, rank,
@@ -589,6 +592,7 @@ class Transport {
                               world_size * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream),
               "cudaMemcpyAsync(abort snapshot)");
     CheckCuda(cudaEventRecord(phase_done, stream), "cudaEventRecord(barrier)");
+    if (!opening) return;
     CheckCuda(cudaEventSynchronize(phase_done), "wait for barrier");
     phase_inflight = false;
     for (int peer = 0; peer < world_size; ++peer) {
@@ -1156,7 +1160,9 @@ inline void connect_slot(int64_t handle, int64_t index, Array<int64_t> flat) {
  * slot's output buffer. Mode 2: [W, C] -> [W, C]; mode 1: [S_global, H_local, D]
  * -> [S_local, H, D].
  */
-inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView output) {
+/// `own_in_place != 0` says the producer already wrote this rank's own chunk (or own heads) into
+/// `output`, so the self-copy is skipped.
+inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView output, int64_t own_in_place) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
   transport->EnsureHealthy();
@@ -1207,7 +1213,7 @@ inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView
                              immediate);
       }
     }
-    SelfCopy(transport, slot, source, geometry, current);
+    if (own_in_place == 0) SelfCopy(transport, slot, source, geometry, current);
 
     // Closing is a success vote: only after every completion is verified and
     // GPUDirect writes are visible to the GPU.

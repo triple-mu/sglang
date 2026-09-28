@@ -53,6 +53,14 @@ def _exercise(
         got = transport.exchange_chunks(landing)
         if not torch.equal(got, want):
             failures.append(f"zero-copy chunk exchange C={chunk} differs")
+        if chunk != 4 * 1024 * 1024 + 128:
+            # the producer lands its own row in the result; the send row may be stale
+            landing.copy_(payload)
+            transport.own_chunk_buffer((world, chunk)).copy_(payload[rank])
+            landing[rank].zero_()
+            got = transport.exchange_chunks(landing, own_in_place=True)
+            if not torch.equal(got, want):
+                failures.append(f"own-in-place chunk exchange C={chunk} differs")
 
     for s_global, dtype in (
         (37888, torch.bfloat16),
@@ -91,8 +99,16 @@ def _exercise(
     got = transport.exchange_stats(stats)
     if not torch.equal(got, want):
         failures.append("exchange_stats differs from all_gather_into_tensor")
+    send, own = transport.stats_buffers(tuple(stats.shape), stats.dtype)
+    send.copy_(stats.unsqueeze(0).expand_as(send))
+    own.copy_(stats)
+    got = transport.exchange_stats(send, own_in_place=True)
+    if not torch.equal(got, want):
+        failures.append(
+            "own-in-place exchange_stats differs from all_gather_into_tensor"
+        )
 
-    expected = 6 + 6 + 1
+    expected = 6 + 2 + 6 + 2
     if transport.exchanges != expected:
         failures.append(f"exchange counter {transport.exchanges} != {expected}")
 
