@@ -106,9 +106,13 @@ __device__ __forceinline__ void BarrierBody(uint64_t* local, PeerSignals peers, 
   }
 }
 
+// `abort_out` is host-mapped memory: the host reads the sticky abort slots after
+// the barrier without a device-to-host copy on the stream.
 static __global__ void BarrierKernel(uint64_t* local, PeerSignals peers, int world_size, int rank,
-                                     uint64_t* counter) {
+                                     uint64_t* counter, uint64_t* abort_out) {
   BarrierBody(local, peers, world_size, rank, AdvanceEpoch(counter));
+  const int peer = threadIdx.x;
+  if (peer < world_size) abort_out[peer] = AcquireSignal(local + world_size + peer);
 }
 
 // Rank r is the only writer of abort slot r in every peer's allocation.
@@ -127,11 +131,12 @@ inline cudaError_t FillPeerSignals(PeerSignals& peers, uint64_t* const* peer_sig
 }
 
 inline cudaError_t EnqueueBarrier(uint64_t* local, uint64_t* const* peer_signals, int world_size,
-                                  int rank, uint64_t* counter, cudaStream_t stream) {
+                                  int rank, uint64_t* counter, uint64_t* abort_out,
+                                  cudaStream_t stream) {
   PeerSignals peers{};
   if (const auto status = FillPeerSignals(peers, peer_signals, world_size); status != cudaSuccess)
     return status;
-  BarrierKernel<<<1, 32, 0, stream>>>(local, peers, world_size, rank, counter);
+  BarrierKernel<<<1, 32, 0, stream>>>(local, peers, world_size, rank, counter, abort_out);
   return cudaGetLastError();
 }
 
@@ -355,7 +360,8 @@ class Transport {
   cudaEvent_t phase_done = nullptr;
   cudaStream_t abort_stream = nullptr;
   cudaEvent_t abort_done = nullptr;
-  uint64_t* abort_snapshot = nullptr;
+  uint64_t* abort_snapshot = nullptr;         // host view of the mapped snapshot
+  uint64_t* abort_snapshot_device = nullptr;  // the barrier kernel writes through this
   std::vector<std::unique_ptr<Slot>> slots;
   bool connected = false;
   bool failed = false;
@@ -391,10 +397,13 @@ class Transport {
           "cudaStreamCreateWithPriority(abort)");
       CheckCuda(cudaEventCreateWithFlags(&abort_done, cudaEventDisableTiming),
                 "cudaEventCreateWithFlags(abort done)");
-      CheckCuda(
-          cudaMallocHost(reinterpret_cast<void**>(&abort_snapshot), world_size * sizeof(uint64_t)),
-          "cudaMallocHost(abort snapshot)");
+      CheckCuda(cudaHostAlloc(reinterpret_cast<void**>(&abort_snapshot),
+                              world_size * sizeof(uint64_t), cudaHostAllocMapped),
+                "cudaHostAlloc(abort snapshot)");
       std::memset(abort_snapshot, 0, world_size * sizeof(uint64_t));
+      CheckCuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&abort_snapshot_device),
+                                         abort_snapshot, 0),
+                "cudaHostGetDevicePointer(abort snapshot)");
 
       CheckCuda(
           cudaDeviceGetAttribute(&write_ordering, cudaDevAttrGPUDirectRDMAWritesOrdering, device),
@@ -526,6 +535,7 @@ class Transport {
     abort_stream = nullptr;
     if (abort_snapshot != nullptr) cudaFreeHost(abort_snapshot);
     abort_snapshot = nullptr;
+    abort_snapshot_device = nullptr;
     for (auto*& qp : qps) {
       if (qp != nullptr) ibv_destroy_qp(qp);
       qp = nullptr;
@@ -597,17 +607,14 @@ class Transport {
   void RunBarrier(Slot* slot, cudaStream_t stream, bool opening) {
     phase_inflight = true;
     CheckCuda(EnqueueBarrier(slot->signals, slot->peer_signals.data(), world_size, rank,
-                             slot->epoch_device, stream),
+                             slot->epoch_device, abort_snapshot_device, stream),
               opening ? "enqueue opening barrier" : "enqueue closing barrier");
-    CheckCuda(cudaMemcpyAsync(abort_snapshot, slot->signals + world_size,
-                              world_size * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream),
-              "cudaMemcpyAsync(abort snapshot)");
     CheckCuda(cudaEventRecord(phase_done, stream), "cudaEventRecord(barrier)");
     if (!opening) return;
     CheckCuda(cudaEventSynchronize(phase_done), "wait for barrier");
     phase_inflight = false;
     for (int peer = 0; peer < world_size; ++peer) {
-      CHECK_HOST(abort_snapshot[peer] != kAbortSignal)
+      CHECK_HOST(__atomic_load_n(&abort_snapshot[peer], __ATOMIC_ACQUIRE) != kAbortSignal)
           << "RDMA Ulysses peer " << peer << " aborted the exchange";
     }
   }
