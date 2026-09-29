@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as m
 
 requires_cuda = pytest.mark.skipif(
@@ -87,8 +86,8 @@ def _kwargs(rows: int):
 
 @requires_cuda
 def test_fused_block_loop_is_bitwise_the_eager_loop(monkeypatch):
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
-    monkeypatch.setattr(envs, "SGLANG_CACHE_DIT_ENABLED", False)
+    monkeypatch.setenv("SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "true")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "false")
     monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
     rows, groups = 2048, 4
     blocks = [_block(seed) for seed in range(3)]
@@ -132,12 +131,12 @@ def test_fused_loop_stays_off_under_cache_dit_or_the_kill_switch(monkeypatch):
     x = torch.randn(256, HIDDEN, device="cuda").to(torch.bfloat16)
     indices = torch.zeros(256, dtype=torch.int64, device="cuda")
     monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", False)
+    monkeypatch.setenv("SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "false")
     assert not model._fused_adaln_ready(x, None, params, indices)
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
-    monkeypatch.setattr(envs, "SGLANG_CACHE_DIT_ENABLED", True)
+    monkeypatch.setenv("SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "true")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
     assert not model._fused_adaln_ready(x, None, params, indices)
-    monkeypatch.setattr(envs, "SGLANG_CACHE_DIT_ENABLED", False)
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "false")
     blocks[0].preserve_input_for_cache_dit = True
     assert not model._fused_adaln_ready(x, None, params, indices)
     blocks[0].preserve_input_for_cache_dit = False
@@ -182,8 +181,8 @@ def _eager_middle(blocks, params, x, indices, rows):
 
 @requires_cuda
 def test_cache_dit_middle_blocks_run_the_fused_chain_bitwise(monkeypatch):
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
-    monkeypatch.setattr(envs, "SGLANG_CACHE_DIT_ENABLED", True)
+    monkeypatch.setenv("SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "true")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
     monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
     rows, groups = 2048, 4
     blocks, params = _cache_dit_blocks(4, groups)
@@ -207,7 +206,7 @@ def test_cache_dit_middle_blocks_run_the_fused_chain_bitwise(monkeypatch):
 
 @requires_cuda
 def test_cache_dit_middle_blocks_decline_when_the_chain_cannot_run(monkeypatch):
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", False)
+    monkeypatch.setenv("SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "false")
     monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
     blocks, params = _cache_dit_blocks(2, 2)
     model = _model(blocks)
@@ -219,7 +218,7 @@ def test_cache_dit_middle_blocks_decline_when_the_chain_cannot_run(monkeypatch):
         )
         is None
     )
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
+    monkeypatch.setenv("SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "true")
     # per-block parameters handed in by position belong to the eager loop
     assert (
         model.run_cache_dit_middle_blocks(
@@ -242,8 +241,8 @@ def test_patched_cache_dit_middle_range_returns_hidden_and_residual(monkeypatch)
 
     from sglang.multimodal_gen.runtime.cache import cache_dit_integration
 
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", True)
-    monkeypatch.setattr(envs, "SGLANG_CACHE_DIT_ENABLED", True)
+    monkeypatch.setenv("SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN", "true")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
     monkeypatch.setattr(m, "_FUSED_ADALN_GATE", m.BitExactFusionGate("test"))
     cache_dit_integration._patch_cache_dit_middle_blocks()
     rows, groups = 1024, 3

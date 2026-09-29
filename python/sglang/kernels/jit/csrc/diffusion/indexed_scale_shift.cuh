@@ -33,8 +33,7 @@ constexpr int kVec = 8;  // 16 B of bf16 per load
 /// One lane of the eager modulation chain, every bf16 rounding boundary kept.
 SGL_DEVICE bf16_t modulate_lane(bf16_t x, bf16_t scale, bf16_t shift) {
   const bf16_t one_plus_scale = device::cast<bf16_t>(1.0f + device::cast<fp32_t>(scale));
-  const bf16_t product =
-      device::cast<bf16_t>(device::cast<fp32_t>(x) * device::cast<fp32_t>(one_plus_scale));
+  const bf16_t product = device::cast<bf16_t>(device::cast<fp32_t>(x) * device::cast<fp32_t>(one_plus_scale));
   return device::cast<bf16_t>(device::cast<fp32_t>(product) + device::cast<fp32_t>(shift));
 }
 
@@ -98,8 +97,12 @@ struct IndexedScaleShiftKernel {
    * \param scale   [groups, hidden] bf16, same stride as `shift`
    * \param indices [rows] int32 or int64 group per row
    */
-  static void run(tvm::ffi::TensorView out, tvm::ffi::TensorView x, tvm::ffi::TensorView shift,
-                  tvm::ffi::TensorView scale, tvm::ffi::TensorView indices) {
+  static void
+  run(tvm::ffi::TensorView out,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView indices) {
     using namespace host;
     SymbolicSize R{"rows"}, G{"groups"}, D{"hidden_size"}, GS{"group_stride"};
     SymbolicDType idx_type;
@@ -107,12 +110,7 @@ struct IndexedScaleShiftKernel {
     device.set_options<kDLCUDA>();
     TensorMatcher({R, D}).with_dtype<bf16_t>().with_device(device).verify(x);
     TensorMatcher({R, D}).with_dtype<OutT>().with_device(device).verify(out);
-    TensorMatcher({G, D})
-        .with_strides({GS, 1})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(shift)
-        .verify(scale);
+    TensorMatcher({G, D}).with_strides({GS, 1}).with_dtype<bf16_t>().with_device(device).verify(shift).verify(scale);
     TensorMatcher({R}).with_dtype<int32_t, int64_t>(idx_type).with_device(device).verify(indices);
 
     const int64_t rows = R.unwrap();
@@ -124,8 +122,11 @@ struct IndexedScaleShiftKernel {
     const auto* x_ptr = static_cast<const bf16_t*>(x.data_ptr());
     const auto* shift_ptr = static_cast<const bf16_t*>(shift.data_ptr());
     const auto* scale_ptr = static_cast<const bf16_t*>(scale.data_ptr());
-    for (const void* pointer : {static_cast<const void*>(out_ptr), static_cast<const void*>(x_ptr),
-                                static_cast<const void*>(shift_ptr), static_cast<const void*>(scale_ptr)}) {
+    for (const void* pointer :
+         {static_cast<const void*>(out_ptr),
+          static_cast<const void*>(x_ptr),
+          static_cast<const void*>(shift_ptr),
+          static_cast<const void*>(scale_ptr)}) {
       CHECK_HOST(reinterpret_cast<uintptr_t>(pointer) % kAlignment == 0)
           << "indexed_scale_shift requires 16-byte aligned tensors";
     }
@@ -135,18 +136,31 @@ struct IndexedScaleShiftKernel {
     }
 
     const int64_t row_vecs = hidden_size / kVec;
-    const auto col_blocks =
-        static_cast<uint32_t>(div_ceil(row_vecs, static_cast<int64_t>(kThreads * kVecsPerThread)));
+    const auto col_blocks = static_cast<uint32_t>(div_ceil(row_vecs, static_cast<int64_t>(kThreads * kVecsPerThread)));
     const auto row_blocks = static_cast<uint32_t>(std::min<int64_t>(rows, kMaxGridY));
     const auto launch = LaunchKernel(dim3(col_blocks, row_blocks), kThreads, device.unwrap());
     if (idx_type.is_type<int32_t>()) {
-      launch(indexed_scale_shift_kernel<OutT, kThreads, kVecsPerThread, int32_t>, out_ptr, x_ptr,
-             shift_ptr, scale_ptr, static_cast<const int32_t*>(indices.data_ptr()), rows, row_vecs,
-             GS.unwrap());
+      launch(
+          indexed_scale_shift_kernel<OutT, kThreads, kVecsPerThread, int32_t>,
+          out_ptr,
+          x_ptr,
+          shift_ptr,
+          scale_ptr,
+          static_cast<const int32_t*>(indices.data_ptr()),
+          rows,
+          row_vecs,
+          GS.unwrap());
     } else {
-      launch(indexed_scale_shift_kernel<OutT, kThreads, kVecsPerThread, int64_t>, out_ptr, x_ptr,
-             shift_ptr, scale_ptr, static_cast<const int64_t*>(indices.data_ptr()), rows, row_vecs,
-             GS.unwrap());
+      launch(
+          indexed_scale_shift_kernel<OutT, kThreads, kVecsPerThread, int64_t>,
+          out_ptr,
+          x_ptr,
+          shift_ptr,
+          scale_ptr,
+          static_cast<const int64_t*>(indices.data_ptr()),
+          rows,
+          row_vecs,
+          GS.unwrap());
     }
   }
 };
