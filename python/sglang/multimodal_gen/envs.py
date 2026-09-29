@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     # keeps the separate activation and quantisation kernels (same numerics)
     SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT: bool = True
     SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT: bool = True
+    SGLANG_DIFFUSION_MINIMAX_H3_FP8_GATHER: bool = True
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -387,6 +388,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qkv_proj / fc1 instead of bf16 rows the GEMM quantises again.
     "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT", "true"
+    ),
+    # Kill switch: the RDMA Ulysses gather carries the attention output as
+    # per-token fp8 rows that out_proj consumes directly.
+    "SGLANG_DIFFUSION_MINIMAX_H3_FP8_GATHER": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_FP8_GATHER", "true"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

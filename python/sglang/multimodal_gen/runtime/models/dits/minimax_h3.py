@@ -742,6 +742,10 @@ def _minimax_h3_attention_core_impl(
         ):
             # Quantised exchange: the shard is quantised before the all-to-all
             # and the heads come back attended. None means run the BF16 path.
+            fp8_gather = (
+                envs.SGLANG_DIFFUSION_MINIMAX_H3_FP8_GATHER
+                and _accepts_per_token_fp8_input(attention.out_proj)
+            )
             out = attention._attention_impl.forward_ulysses_lowp(
                 q,
                 k,
@@ -750,9 +754,12 @@ def _minimax_h3_attention_core_impl(
                 max_seqlen=max_seqlen,
                 ring_active=ring_active,
                 sparse_query_block_mask=subblock_sparse_query_block_mask,
+                fp8_output=fp8_gather,
             )
             if out is not None:
-                return attention._attention_impl.gather_output(out)
+                return attention._attention_impl.gather_output(
+                    out, per_token_fp8=fp8_gather
+                )
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
         if gate_compress is not None:
             gate_compress = _usp_input_all_to_all(gate_compress[None], head_dim=2)[0]
@@ -1263,6 +1270,10 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
+        # Per-token fp8 rows straight from the Ulysses gather.
+        if isinstance(out, tuple):
+            out, _ = self.out_proj(out)
+            return out
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
         return out

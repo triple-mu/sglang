@@ -91,6 +91,19 @@ def _exercise(
         if not torch.equal(got, want):
             failures.append(f"zero-copy gather_heads S={s_global} {dtype} differs")
 
+    rows = torch.randint(
+        0, 256, (37888, 912), generator=g, device="cuda", dtype=torch.int32
+    ).to(torch.uint8)
+    want = _usp_output_all_to_all(rows.view(37888, 1, 912)[None], head_dim=2)[0]
+    got = transport.gather_rows(rows)
+    if not torch.equal(got, want):
+        failures.append("gather_rows differs from NCCL")
+    landing = transport.gather_row_landing(37888, 912)
+    landing.copy_(rows)
+    got = transport.gather_rows(landing)
+    if not torch.equal(got, want):
+        failures.append("zero-copy gather_rows differs")
+
     stats = torch.randn(
         2, 1, HEADS, HEAD_DIM, generator=g, device="cuda", dtype=torch.float32
     )
@@ -108,7 +121,7 @@ def _exercise(
             "own-in-place exchange_stats differs from all_gather_into_tensor"
         )
 
-    expected = 6 + 2 + 6 + 2
+    expected = 6 + 2 + 6 + 2 + 2
     if transport.exchanges != expected:
         failures.append(f"exchange counter {transport.exchanges} != {expected}")
 
