@@ -866,6 +866,7 @@ _EXPORTS: dict[str, str] = {
     "subblock_pool_int8": "attention.subblock_route_int8_jit",
     "UlyssesLowpSpec": "quantization.ulysses_lowp_sage_jit",
     "can_use_ulysses_fp8_gather": "quantization.ulysses_fp8_gather_jit",
+    "can_use_ulysses_fp8_gather_group": "quantization.ulysses_fp8_gather_jit",
     "can_use_ulysses_lowp_sage": "quantization.ulysses_lowp_sage_jit",
     "ulysses_fp8_gather_quant": "quantization.ulysses_fp8_gather_jit",
     "ulysses_fp8_gather_requant": "quantization.ulysses_fp8_gather_jit",

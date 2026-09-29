@@ -430,6 +430,9 @@ def _per_token_fp8_blockers(linear: nn.Module) -> list[str]:
         blockers.append("block-quantised weights")
     if method.use_marlin:
         blockers.append("marlin")
+    # A calibrated static input scale must stay with the GEMM's own quantiser.
+    if linear.input_scale is not None:
+        blockers.append("static activation scale")
     if not method.cutlass_fp8_supported:
         blockers.append("no CUTLASS fp8 GEMM")
     weight_scale = linear.weight_scale

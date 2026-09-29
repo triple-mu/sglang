@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 _ROW_ALIGN = 16
 _WARP_ELEMS = 128
-_MAX_GROUP = 2048
+_MAX_GROUP = 4096
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
 
@@ -45,15 +45,19 @@ def _jit_module(dtype: torch.dtype) -> Module:
     )
 
 
+def can_use_ulysses_fp8_gather_group(group: int) -> bool:
+    """Whether a row of `group` columns fits the kernels: a multiple of 128 up to 4096."""
+    return 0 < group <= _MAX_GROUP and group % _WARP_ELEMS == 0
+
+
 def can_use_ulysses_fp8_gather(x: torch.Tensor) -> bool:
-    """`[S, G]` bf16/fp16 CUDA rows with G a multiple of 128 up to 2048."""
+    """`[S, G]` bf16/fp16 contiguous CUDA rows whose width fits the kernels."""
     return (
         x.is_cuda
         and x.dtype in _SUPPORTED_DTYPES
         and x.dim() == 2
         and x.is_contiguous()
-        and 0 < x.shape[1] <= _MAX_GROUP
-        and x.shape[1] % _WARP_ELEMS == 0
+        and can_use_ulysses_fp8_gather_group(x.shape[1])
     )
 
 
@@ -82,6 +86,7 @@ def ulysses_fp8_gather_requant(
 
 __all__ = [
     "can_use_ulysses_fp8_gather",
+    "can_use_ulysses_fp8_gather_group",
     "ulysses_fp8_gather_quant",
     "ulysses_fp8_gather_requant",
     "ulysses_fp8_gather_row_bytes",

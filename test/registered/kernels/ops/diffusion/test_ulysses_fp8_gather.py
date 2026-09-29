@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.diffusion import (
     can_use_ulysses_fp8_gather,
+    can_use_ulysses_fp8_gather_group,
     ulysses_fp8_gather_quant,
     ulysses_fp8_gather_requant,
     ulysses_fp8_gather_row_bytes,
@@ -86,3 +87,31 @@ def test_requant_rescales_every_source_to_the_token_maximum():
     x_all = torch.cat(sources, dim=1).float()
     tolerance = x_all.abs() * 0.125 + s * 2**-8
     assert (dequant - x_all).abs().le(tolerance).all()
+
+
+def test_group_limits_cover_every_ulysses_degree_of_h3():
+    # 56 heads x 128: degree 8 -> 896, 4 -> 1792, 2 -> 3584 columns per rank
+    assert all(can_use_ulysses_fp8_gather_group(g) for g in (896, 1792, 3584))
+    assert not can_use_ulysses_fp8_gather_group(7168)
+    assert not can_use_ulysses_fp8_gather_group(900)
+
+
+def test_wide_group_roundtrip():
+    group, world, rows = 3584, 2, 256
+    g = torch.Generator(device="cuda").manual_seed(5)
+    sources = [
+        (torch.randn(rows, group, generator=g, device="cuda") * (1 + r)).to(
+            torch.bfloat16
+        )
+        for r in range(world)
+    ]
+    row = ulysses_fp8_gather_row_bytes(group)
+    payload = torch.empty((rows, world, row), dtype=torch.uint8, device="cuda")
+    for r, x in enumerate(sources):
+        payload[:, r] = ulysses_fp8_gather_quant(
+            x, out=torch.empty((rows, row), dtype=torch.uint8, device="cuda")
+        )
+    q, s = ulysses_fp8_gather_requant(payload, group=group)
+    dequant = q.float() * s
+    x_all = torch.cat(sources, dim=1).float()
+    assert (dequant - x_all).abs().le(x_all.abs() * 0.125 + s * 2**-8).all()

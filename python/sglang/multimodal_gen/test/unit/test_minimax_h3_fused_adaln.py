@@ -262,3 +262,23 @@ def test_patched_cache_dit_middle_range_returns_hidden_and_residual(monkeypatch)
     assert encoder is None
     assert torch.equal(hidden, want)
     assert torch.equal(residual, want - x)
+
+
+def test_static_activation_scale_blocks_the_per_token_fp8_hand_over():
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+        Fp8Config,
+        Fp8LinearMethod,
+    )
+
+    method = Fp8LinearMethod(
+        Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static")
+    )
+    linear = SimpleNamespace(
+        quant_method=method,
+        input_scale=torch.ones((), device="cuda"),
+        weight_scale=torch.ones(8, device="cuda"),
+        weight=torch.empty(4, 8, device="cuda"),
+    )
+    assert "static activation scale" in m._per_token_fp8_blockers(linear)
+    linear.input_scale = None
+    assert "static activation scale" not in m._per_token_fp8_blockers(linear)
