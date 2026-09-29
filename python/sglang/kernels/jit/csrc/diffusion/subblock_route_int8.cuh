@@ -15,6 +15,7 @@
 #pragma once
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
@@ -76,7 +77,8 @@ __global__ void __launch_bounds__(kThreads) PoolInt8Kernel(
   }
   __shared__ float partial[kWarps][kHeadDim];
 #pragma unroll
-  for (uint32_t j = 0; j < 4; ++j) partial[warp][lane * 4 + j] = acc[j];
+  for (uint32_t j = 0; j < 4; ++j)
+    partial[warp][lane * 4 + j] = acc[j];
   __syncthreads();
   const uint32_t d = threadIdx.x;
   const float sum = ((partial[0][d] + partial[1][d]) + partial[2][d]) + partial[3][d];
@@ -139,7 +141,8 @@ struct Kernels {
         << "cell sizes must divide " << kScaleTile << ", got " << sub_q << " and " << sub_k;
     CHECK_HOST(used >= 1 && used <= S.unwrap()) << "used rows must lie in [1, " << S.unwrap() << "]";
     CHECK_HOST(CQ.unwrap() * sub_q >= used && CK.unwrap() * sub_k >= used) << "the cells must cover the used rows";
-    CHECK_HOST(div_ceil(used, static_cast<int64_t>(kScaleTile)) <= W.unwrap()) << "k_scale is narrower than the used rows";
+    CHECK_HOST(div_ceil(used, static_cast<int64_t>(kScaleTile)) <= W.unwrap())
+        << "k_scale is narrower than the used rows";
     const int64_t cells = CQ.unwrap() > CK.unwrap() ? CQ.unwrap() : CK.unwrap();
     LaunchKernel(dim3(static_cast<uint32_t>(cells), static_cast<uint32_t>(BH.unwrap()), 2), kThreads, device.unwrap())(
         PoolInt8Kernel,
@@ -164,7 +167,8 @@ struct Kernels {
    * \param tables [B, H, Gq, num_blocks] int32 output
    * \param nums [B, H, Gq] int32 output, key blocks each query block visits
    */
-  static void block_tables(tvm::ffi::TensorView index, tvm::ffi::TensorView mask, tvm::ffi::TensorView tables, tvm::ffi::TensorView nums) {
+  static void block_tables(
+      tvm::ffi::TensorView index, tvm::ffi::TensorView mask, tvm::ffi::TensorView tables, tvm::ffi::TensorView nums) {
     using namespace host;
     SymbolicSize B{"batch"}, H{"heads"}, G{"q_blocks"}, T{"topk"}, N{"num_blocks"};
     SymbolicDevice device;

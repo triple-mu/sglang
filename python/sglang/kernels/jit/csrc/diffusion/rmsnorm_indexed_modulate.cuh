@@ -46,9 +46,9 @@ constexpr int kWarps = kThreads / 32;
 constexpr float kFp8Max = 448.0f;
 
 struct RowParams {
-  void* out;   // bf16 [rows, hidden], or the fp8 rows when the kernel quantises
-  float* s;    // fp32 [rows] per-token scales (fp8 mode only)
-  void* x;  // Plan B: also the residual output (in place)
+  void* out;  // bf16 [rows, hidden], or the fp8 rows when the kernel quantises
+  float* s;   // fp32 [rows] per-token scales (fp8 mode only)
+  void* x;    // Plan B: also the residual output (in place)
   const void* update;
   const void* gate;
   const void* gamma;  // bf16 [hidden], the RMSNorm weight, unmerged
@@ -82,8 +82,7 @@ SGL_DEVICE uint32_t gate_residual_pair_bf16x2(uint32_t x2, uint32_t g2, uint32_t
 /// Per-token fp8 quantisation of the modulated row, the scheme the fp8 GEMM applies itself:
 /// scale = amax / 448, q = sat(x * rcp(scale)).
 template <int kHidden, bool kHasGate, bool kFp8Out, typename IdxT>
-__launch_bounds__(kThreads) __global__ void rmsnorm_indexed_modulate_kernel(
-    const RowParams __grid_constant__ params) {
+__launch_bounds__(kThreads) __global__ void rmsnorm_indexed_modulate_kernel(const RowParams __grid_constant__ params) {
   using namespace device;
   using Vec = AlignedVector<bf16_t, kVec>;
   static_assert(kHidden % kVec == 0);
@@ -119,7 +118,8 @@ __launch_bounds__(kThreads) __global__ void rmsnorm_indexed_modulate_kernel(
       const auto* u2 = reinterpret_cast<const uint32_t*>(update_vec.data());
       const auto* g2 = reinterpret_cast<const uint32_t*>(gate_vec.data());
 #pragma unroll
-      for (int p = 0; p < kVec / 2; ++p) x2[p] = gate_residual_pair_bf16x2(x2[p], g2[p], u2[p]);
+      for (int p = 0; p < kVec / 2; ++p)
+        x2[p] = gate_residual_pair_bf16x2(x2[p], g2[p], u2[p]);
       x_vec.store(x + row_offset, vec_id);
     }
 #pragma unroll
@@ -165,11 +165,10 @@ __launch_bounds__(kThreads) __global__ void rmsnorm_indexed_modulate_kernel(
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
       // aten: one bf16 round of gamma * (rstd * x); then the eager modulate chain.
-      const bf16_t normed = cast<bf16_t>(
-          __fmul_rn(cast<fp32_t>(gamma_vec[i]), __fmul_rn(rstd, cast<fp32_t>(x_regs[k][i]))));
+      const bf16_t normed =
+          cast<bf16_t>(__fmul_rn(cast<fp32_t>(gamma_vec[i]), __fmul_rn(rstd, cast<fp32_t>(x_regs[k][i]))));
       const bf16_t one_plus_scale = cast<bf16_t>(__fadd_rn(1.0f, cast<fp32_t>(scale_vec[i])));
-      const bf16_t product =
-          cast<bf16_t>(__fmul_rn(cast<fp32_t>(normed), cast<fp32_t>(one_plus_scale)));
+      const bf16_t product = cast<bf16_t>(__fmul_rn(cast<fp32_t>(normed), cast<fp32_t>(one_plus_scale)));
       out_vec[i] = cast<bf16_t>(__fadd_rn(cast<fp32_t>(product), cast<fp32_t>(shift_vec[i])));
       if constexpr (kFp8Out) amax = fmaxf(amax, fabsf(cast<fp32_t>(out_vec[i])));
     }
@@ -229,8 +228,8 @@ struct RMSNormIndexedModulateKernel {
   }
 
   /// The fp8 outputs of `run_fp8` / `run_gated_fp8`: q [rows, kHidden] e4m3, s [rows, 1] fp32.
-  static void verify_fp8_outputs(tvm::ffi::TensorView q, tvm::ffi::TensorView s, host::SymbolicSize& R,
-                                 host::SymbolicDevice& device) {
+  static void verify_fp8_outputs(
+      tvm::ffi::TensorView q, tvm::ffi::TensorView s, host::SymbolicSize& R, host::SymbolicDevice& device) {
     using namespace host;
     TensorMatcher({R, kHidden}).with_dtype<fp8_e4m3_t>().with_device(device).verify(q);
     TensorMatcher({R, 1}).with_dtype<fp32_t>().with_device(device).verify(s);
@@ -245,9 +244,14 @@ struct RMSNormIndexedModulateKernel {
    * \param shift   bf16 [groups, kHidden], same stride as `scale`
    * \param indices int32/int64 [rows] group per row
    */
-  static void run(tvm::ffi::TensorView out, tvm::ffi::TensorView x, tvm::ffi::TensorView gamma,
-                  tvm::ffi::TensorView scale, tvm::ffi::TensorView shift,
-                  tvm::ffi::TensorView indices, double eps) {
+  static void
+  run(tvm::ffi::TensorView out,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView gamma,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView indices,
+      double eps) {
     run_impl<false>(out, nullptr, x, gamma, scale, shift, indices, eps);
   }
 
@@ -256,16 +260,28 @@ struct RMSNormIndexedModulateKernel {
    * \param q bf16-free: fp8 e4m3 [rows, kHidden]
    * \param s fp32 [rows, 1] per-token scales (amax / 448)
    */
-  static void run_fp8(tvm::ffi::TensorView q, tvm::ffi::TensorView s, tvm::ffi::TensorView x,
-                      tvm::ffi::TensorView gamma, tvm::ffi::TensorView scale, tvm::ffi::TensorView shift,
-                      tvm::ffi::TensorView indices, double eps) {
+  static void run_fp8(
+      tvm::ffi::TensorView q,
+      tvm::ffi::TensorView s,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView gamma,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView indices,
+      double eps) {
     run_impl<true>(q, &s, x, gamma, scale, shift, indices, eps);
   }
 
   template <bool kFp8Out>
-  static void run_impl(tvm::ffi::TensorView out, tvm::ffi::TensorView* s, tvm::ffi::TensorView x,
-                       tvm::ffi::TensorView gamma, tvm::ffi::TensorView scale, tvm::ffi::TensorView shift,
-                       tvm::ffi::TensorView indices, double eps) {
+  static void run_impl(
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView* s,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView gamma,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView indices,
+      double eps) {
     using namespace host;
     SymbolicSize R{"rows"}, G{"groups"}, GS{"group_stride"};
     SymbolicDType idx_type;
@@ -312,26 +328,46 @@ struct RMSNormIndexedModulateKernel {
    * \param update   bf16 [rows, kHidden]
    * \param gate     bf16 [groups, kHidden], same stride as `scale`
    */
-  static void run_gated(tvm::ffi::TensorView out, tvm::ffi::TensorView residual,
-                        tvm::ffi::TensorView update, tvm::ffi::TensorView gate,
-                        tvm::ffi::TensorView gamma, tvm::ffi::TensorView scale,
-                        tvm::ffi::TensorView shift, tvm::ffi::TensorView indices, double eps) {
+  static void run_gated(
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView residual,
+      tvm::ffi::TensorView update,
+      tvm::ffi::TensorView gate,
+      tvm::ffi::TensorView gamma,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView indices,
+      double eps) {
     run_gated_impl<false>(out, nullptr, residual, update, gate, gamma, scale, shift, indices, eps);
   }
 
   /// Plan B with the modulated rows quantised per token; see `run_fp8`.
-  static void run_gated_fp8(tvm::ffi::TensorView q, tvm::ffi::TensorView s, tvm::ffi::TensorView residual,
-                            tvm::ffi::TensorView update, tvm::ffi::TensorView gate,
-                            tvm::ffi::TensorView gamma, tvm::ffi::TensorView scale,
-                            tvm::ffi::TensorView shift, tvm::ffi::TensorView indices, double eps) {
+  static void run_gated_fp8(
+      tvm::ffi::TensorView q,
+      tvm::ffi::TensorView s,
+      tvm::ffi::TensorView residual,
+      tvm::ffi::TensorView update,
+      tvm::ffi::TensorView gate,
+      tvm::ffi::TensorView gamma,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView indices,
+      double eps) {
     run_gated_impl<true>(q, &s, residual, update, gate, gamma, scale, shift, indices, eps);
   }
 
   template <bool kFp8Out>
-  static void run_gated_impl(tvm::ffi::TensorView out, tvm::ffi::TensorView* s, tvm::ffi::TensorView residual,
-                             tvm::ffi::TensorView update, tvm::ffi::TensorView gate,
-                             tvm::ffi::TensorView gamma, tvm::ffi::TensorView scale,
-                             tvm::ffi::TensorView shift, tvm::ffi::TensorView indices, double eps) {
+  static void run_gated_impl(
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView* s,
+      tvm::ffi::TensorView residual,
+      tvm::ffi::TensorView update,
+      tvm::ffi::TensorView gate,
+      tvm::ffi::TensorView gamma,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView indices,
+      double eps) {
     using namespace host;
     SymbolicSize R{"rows"}, G{"groups"}, GS{"group_stride"};
     SymbolicDType idx_type;
@@ -355,8 +391,14 @@ struct RMSNormIndexedModulateKernel {
     const int64_t rows = R.unwrap();
     if (rows == 0) return;
     CHECK_HOST(GS.unwrap() % kVec == 0) << "modulation row stride must keep 8-byte alignment";
-    verify_alignment({out.data_ptr(), residual.data_ptr(), update.data_ptr(), gate.data_ptr(),
-                      gamma.data_ptr(), scale.data_ptr(), shift.data_ptr()});
+    verify_alignment(
+        {out.data_ptr(),
+         residual.data_ptr(),
+         update.data_ptr(),
+         gate.data_ptr(),
+         gamma.data_ptr(),
+         scale.data_ptr(),
+         shift.data_ptr()});
     CHECK_HOST(out.data_ptr() != residual.data_ptr() && out.data_ptr() != update.data_ptr())
         << "out must not alias residual or update";
     CHECK_HOST(residual.data_ptr() != update.data_ptr()) << "residual must not alias update";
