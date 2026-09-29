@@ -8,17 +8,16 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda.h>
-#include <cudaTypedefs.h>
-#include <cuda_runtime.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include "vendor/cake_sage_block_sparse_attention_939d22c4b83f8f4c938f_kernel.cu"
-
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cuda.h>
+#include <cudaTypedefs.h>
+#include <cuda_runtime.h>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -97,7 +96,8 @@ inline auto encode(
       swizzle,
       CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  CHECK_HOST(res == CUDA_SUCCESS) << "cuTensorMapEncodeTiled(" << what << ") failed: CUresult=" << static_cast<int>(res);
+  CHECK_HOST(res == CUDA_SUCCESS) << "cuTensorMapEncodeTiled(" << what
+                                  << ") failed: CUresult=" << static_cast<int>(res);
   return map;
 }
 
@@ -138,11 +138,7 @@ inline auto encode_o(
     -> CUtensorMap {
   constexpr int64_t kElem = sizeof(bf16_t);
   const cuuint64_t dims[5] = {
-      64,
-      static_cast<cuuint64_t>(seq),
-      static_cast<cuuint64_t>(heads),
-      static_cast<cuuint64_t>(batch),
-      2};
+      64, static_cast<cuuint64_t>(seq), static_cast<cuuint64_t>(heads), static_cast<cuuint64_t>(batch), 2};
   const cuuint64_t strides[4] = {
       static_cast<cuuint64_t>(stride_s * kElem),
       static_cast<cuuint64_t>(stride_h * kElem),
@@ -207,8 +203,8 @@ inline auto fits_int32(int64_t value) -> bool {
  * \param seqlen_k     live key rows, a multiple of 64, `<= SK_ALLOC`
  * \param softmax_scale finite, positive
  */
-inline auto run(
-    tvm::ffi::TensorView q,
+inline auto
+run(tvm::ffi::TensorView q,
     tvm::ffi::TensorView k,
     tvm::ffi::TensorView v,
     tvm::ffi::TensorView out,
@@ -240,7 +236,11 @@ inline auto run(
   TensorMatcher({B, H, SQA, kHeadDim}).with_dtype<int8_t>().with_device<kDLCUDA>(device).verify(q);
   TensorMatcher({B, H, SKA, kHeadDim}).with_dtype<int8_t>().with_device<kDLCUDA>(device).verify(k);
   TensorMatcher({B, H, kHeadDim, SKA}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(v);
-  TensorMatcher({B, H, SQA, kHeadDim}).with_strides({OB, OH, OS, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(out);
+  TensorMatcher({B, H, SQA, kHeadDim})
+      .with_strides({OB, OH, OS, 1})
+      .with_dtype<bf16_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(out);
   TensorMatcher({B, H, q_scale_len}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(q_scale);
   TensorMatcher({B, H, k_blocks}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(k_scale);
   TensorMatcher({B, H, kHeadDim}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(v_scale);
@@ -255,8 +255,9 @@ inline auto run(
   const int64_t capacity = CAP.unwrap();
   CHECK_HOST(seqlen_q <= seqlen_q_alloc) << "seqlen_q " << seqlen_q << " exceeds the allocated " << seqlen_q_alloc;
   // TMA global strides are 16-byte multiples; the head rows may interleave (token-major) but not overlap.
-  CHECK_HOST(OS.unwrap() % 8 == 0 && OH.unwrap() % 8 == 0 && OB.unwrap() % 8 == 0 && OH.unwrap() >= kHeadDim &&
-             OS.unwrap() >= kHeadDim)
+  CHECK_HOST(
+      OS.unwrap() % 8 == 0 && OH.unwrap() % 8 == 0 && OB.unwrap() % 8 == 0 && OH.unwrap() >= kHeadDim &&
+      OS.unwrap() >= kHeadDim)
       << "out strides must be multiples of 8 elements with whole 128-wide rows";
   CHECK_HOST(seqlen_k <= seqlen_k_alloc) << "seqlen_k " << seqlen_k << " exceeds the allocated " << seqlen_k_alloc;
   CHECK_HOST(WS.unwrap() >= static_cast<int64_t>(kDescriptorWorkspaceBytes))
@@ -279,8 +280,11 @@ inline auto run(
   // `block_sparse_num` is replaced per row by `q2k_block_nums` under HAS_BLOCK_NUMS 1;
   // both take the conservative values the generated binding passes.
   auto* index = static_cast<int*>(q2k_block_index.data_ptr());
-  LaunchKernel(dim3(static_cast<uint32_t>(q_blocks), static_cast<uint32_t>(heads), static_cast<uint32_t>(batch)),
-               kThreads, dev, kDynamicSmemBytes)(
+  LaunchKernel(
+      dim3(static_cast<uint32_t>(q_blocks), static_cast<uint32_t>(heads), static_cast<uint32_t>(batch)),
+      kThreads,
+      dev,
+      kDynamicSmemBytes)(
       kernel_cake_sage_block_sparse_attention_939d22c4b83f8f4c938f,
       slots + 0,
       slots + 1,

@@ -37,18 +37,18 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.diffusion import (
+    can_use_ulysses_fp8_gather_group,
     sage_block_sparse_attn_sm120,
     sage_block_sparse_dense_block_index,
     subblock_block_tables,
     subblock_pool_int8,
+    ulysses_fp8_gather_quant,
+    ulysses_fp8_gather_requant,
+    ulysses_fp8_gather_row_bytes,
     ulysses_lowp_finalize_stats,
     ulysses_lowp_finalize_stats_local,
     ulysses_lowp_k_sum_v_amax,
     ulysses_lowp_payload_spec,
-    can_use_ulysses_fp8_gather_group,
-    ulysses_fp8_gather_quant,
-    ulysses_fp8_gather_requant,
-    ulysses_fp8_gather_row_bytes,
     ulysses_lowp_quant_pack,
     ulysses_lowp_scale_widths,
     ulysses_lowp_unpack_for_sage,

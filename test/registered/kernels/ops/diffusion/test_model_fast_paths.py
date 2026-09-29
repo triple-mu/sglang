@@ -1982,6 +1982,8 @@ def test_minimax_h3_revert_tensor_fast_path_is_bit_exact(ndim):
     assert fast.is_contiguous()
     assert torch.equal(fast, eager)
     assert fast.min().item() >= 0.0 and fast.max().item() <= 1.0
+
+
 requires_nvidia_jit = pytest.mark.skipif(
     not is_cuda(), reason="the Qwen-Image 2.1 JIT CUDA kernels are NVIDIA-only"
 )

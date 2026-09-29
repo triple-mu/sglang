@@ -19,19 +19,18 @@
 // streams removed; the failure protocol (sticky abort slots, bounded quiesce,
 // leak-and-poison teardown) is kept intact.
 
+#include <sgl_kernel/ffi.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
+
 #include <arpa/inet.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
-#include <sgl_kernel/ffi.h>
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/utils.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/container/tuple.h>
 #include <tvm/ffi/string.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -40,11 +39,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cuda.h>
+#include <cuda_runtime.h>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace sglang::rdma_ulysses {
@@ -92,8 +94,8 @@ __device__ __forceinline__ uint64_t AdvanceEpoch(uint64_t* counter) {
 // One lane per peer: publish this rank's epoch into the peer's slot, then spin
 // until every peer's epoch has landed locally. Slots [W, 2W) are the sticky
 // abort half; any lane seeing one terminates the barrier for the whole warp.
-__device__ __forceinline__ void BarrierBody(uint64_t* local, PeerSignals peers, int world_size,
-                                            int rank, uint64_t epoch) {
+__device__ __forceinline__ void
+BarrierBody(uint64_t* local, PeerSignals peers, int world_size, int rank, uint64_t epoch) {
   const int peer = threadIdx.x;
   bool aborted = peer < world_size && AcquireSignal(local + world_size + peer) == kAbortSignal;
   if (__any_sync(0xffffffffu, aborted)) return;
@@ -108,8 +110,8 @@ __device__ __forceinline__ void BarrierBody(uint64_t* local, PeerSignals peers, 
 
 // `abort_out` is host-mapped memory: the host reads the sticky abort slots after
 // the barrier without a device-to-host copy on the stream.
-static __global__ void BarrierKernel(uint64_t* local, PeerSignals peers, int world_size, int rank,
-                                     uint64_t* counter, uint64_t* abort_out) {
+static __global__ void
+BarrierKernel(uint64_t* local, PeerSignals peers, int world_size, int rank, uint64_t* counter, uint64_t* abort_out) {
   BarrierBody(local, peers, world_size, rank, AdvanceEpoch(counter));
   const int peer = threadIdx.x;
   if (peer < world_size) abort_out[peer] = AcquireSignal(local + world_size + peer);
@@ -121,8 +123,7 @@ static __global__ void PublishAbortKernel(PeerSignals peers, int world_size, int
   if (peer < world_size) PublishSignal(peers.values[peer] + world_size + rank, kAbortSignal);
 }
 
-inline cudaError_t FillPeerSignals(PeerSignals& peers, uint64_t* const* peer_signals,
-                                   int world_size) {
+inline cudaError_t FillPeerSignals(PeerSignals& peers, uint64_t* const* peer_signals, int world_size) {
   for (int peer = 0; peer < world_size; ++peer) {
     if (peer_signals[peer] == nullptr) return cudaErrorInvalidDevicePointer;
     peers.values[peer] = peer_signals[peer];
@@ -130,21 +131,23 @@ inline cudaError_t FillPeerSignals(PeerSignals& peers, uint64_t* const* peer_sig
   return cudaSuccess;
 }
 
-inline cudaError_t EnqueueBarrier(uint64_t* local, uint64_t* const* peer_signals, int world_size,
-                                  int rank, uint64_t* counter, uint64_t* abort_out,
-                                  cudaStream_t stream) {
+inline cudaError_t EnqueueBarrier(
+    uint64_t* local,
+    uint64_t* const* peer_signals,
+    int world_size,
+    int rank,
+    uint64_t* counter,
+    uint64_t* abort_out,
+    cudaStream_t stream) {
   PeerSignals peers{};
-  if (const auto status = FillPeerSignals(peers, peer_signals, world_size); status != cudaSuccess)
-    return status;
+  if (const auto status = FillPeerSignals(peers, peer_signals, world_size); status != cudaSuccess) return status;
   BarrierKernel<<<1, 32, 0, stream>>>(local, peers, world_size, rank, counter, abort_out);
   return cudaGetLastError();
 }
 
-inline cudaError_t EnqueueAbort(uint64_t* const* peer_signals, int world_size, int rank,
-                                cudaStream_t stream) {
+inline cudaError_t EnqueueAbort(uint64_t* const* peer_signals, int world_size, int rank, cudaStream_t stream) {
   PeerSignals peers{};
-  if (const auto status = FillPeerSignals(peers, peer_signals, world_size); status != cudaSuccess)
-    return status;
+  if (const auto status = FillPeerSignals(peers, peer_signals, world_size); status != cudaSuccess) return status;
   PublishAbortKernel<<<1, 32, 0, stream>>>(peers, world_size, rank);
   return cudaGetLastError();
 }
@@ -169,7 +172,8 @@ template <typename T>
 Array<int64_t> Encode(const T& value) {
   const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
   Array<int64_t> result;
-  for (size_t i = 0; i < sizeof(T); ++i) result.push_back(bytes[i]);
+  for (size_t i = 0; i < sizeof(T); ++i)
+    result.push_back(bytes[i]);
   return result;
 }
 
@@ -196,8 +200,7 @@ inline void CheckVerbs(int status, const char* operation) {
   CHECK_HOST(status == 0) << operation << ": " << std::strerror(status > 0 ? status : errno);
 }
 
-inline cudaError_t QueryEventUntil(cudaEvent_t event,
-                                   std::chrono::steady_clock::time_point deadline) noexcept {
+inline cudaError_t QueryEventUntil(cudaEvent_t event, std::chrono::steady_clock::time_point deadline) noexcept {
   while (true) {
     const cudaError_t status = cudaEventQuery(event);
     if (status != cudaErrorNotReady) return status;
@@ -216,7 +219,9 @@ class ScopedCudaDevice {
   ~ScopedCudaDevice() noexcept {
     if (active_ && previous_ != target_) cudaSetDevice(previous_);
   }
-  bool active() const { return active_; }
+  bool active() const {
+    return active_;
+  }
 
  private:
   int previous_ = 0;
@@ -230,8 +235,8 @@ class ScopedCudaDevice {
 inline ibv_mr* RegisterGpuMr(ibv_pd* pd, void* pointer, size_t bytes, int access) {
   CHECK_HOST(pointer != nullptr) << "cannot register a null GPU pointer";
   unsigned int sync_memops = 1;
-  const CUresult sync_status = cuPointerSetAttribute(&sync_memops, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
-                                                     reinterpret_cast<CUdeviceptr>(pointer));
+  const CUresult sync_status =
+      cuPointerSetAttribute(&sync_memops, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, reinterpret_cast<CUdeviceptr>(pointer));
   int direct_errno = 0;
   if (sync_status == CUDA_SUCCESS) {
     if (auto* mr = ibv_reg_mr(pd, pointer, bytes, access)) return mr;
@@ -246,9 +251,8 @@ inline ibv_mr* RegisterGpuMr(ibv_pd* pd, void* pointer, size_t bytes, int access
   const size_t remainder = span % page_size;
   const size_t export_bytes = span + (remainder == 0 ? 0 : page_size - remainder);
   int fd = -1;
-  const CUresult export_status =
-      cuMemGetHandleForAddressRange(&fd, static_cast<CUdeviceptr>(address - offset), export_bytes,
-                                    CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+  const CUresult export_status = cuMemGetHandleForAddressRange(
+      &fd, static_cast<CUdeviceptr>(address - offset), export_bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
   CHECK_HOST(export_status == CUDA_SUCCESS)
       << "direct GPU MR registration failed"
       << (direct_errno == 0 ? "" : std::string(": ") + std::strerror(direct_errno))
@@ -300,8 +304,7 @@ struct Geometry {
   int64_t payload = 0;  // rows * width, what one peer sends to one peer
   int64_t total = 0;    // world_size * payload, the operand
   bool operator==(const Geometry& other) const {
-    return mode == other.mode && rows == other.rows && width == other.width &&
-           pitch == other.pitch;
+    return mode == other.mode && rows == other.rows && width == other.width && pitch == other.pitch;
   }
 };
 
@@ -369,8 +372,8 @@ class Transport {
   bool teardown_safe = true;
   bool unsafe_release = false;
 
-  Transport(int rank_arg, int world_size_arg, int device_arg, std::string nic_name_arg,
-            int gid_index_arg, int64_t timeout_ms)
+  Transport(
+      int rank_arg, int world_size_arg, int device_arg, std::string nic_name_arg, int gid_index_arg, int64_t timeout_ms)
       : rank(rank_arg),
         world_size(world_size_arg),
         device(device_arg),
@@ -386,36 +389,33 @@ class Transport {
       CHECK_HOST(timeout_ms > 0) << "timeout must be positive";
 
       ScopedCudaDevice device_guard(device);
-      CheckCuda(cudaEventCreateWithFlags(&phase_done, cudaEventDisableTiming),
-                "cudaEventCreateWithFlags(phase)");
+      CheckCuda(cudaEventCreateWithFlags(&phase_done, cudaEventDisableTiming), "cudaEventCreateWithFlags(phase)");
       int least_priority = 0;
       int greatest_priority = 0;
-      CheckCuda(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority),
-                "cudaDeviceGetStreamPriorityRange");
+      CheckCuda(
+          cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority), "cudaDeviceGetStreamPriorityRange");
       CheckCuda(
           cudaStreamCreateWithPriority(&abort_stream, cudaStreamNonBlocking, greatest_priority),
           "cudaStreamCreateWithPriority(abort)");
-      CheckCuda(cudaEventCreateWithFlags(&abort_done, cudaEventDisableTiming),
-                "cudaEventCreateWithFlags(abort done)");
-      CheckCuda(cudaHostAlloc(reinterpret_cast<void**>(&abort_snapshot),
-                              world_size * sizeof(uint64_t), cudaHostAllocMapped),
-                "cudaHostAlloc(abort snapshot)");
+      CheckCuda(cudaEventCreateWithFlags(&abort_done, cudaEventDisableTiming), "cudaEventCreateWithFlags(abort done)");
+      CheckCuda(
+          cudaHostAlloc(reinterpret_cast<void**>(&abort_snapshot), world_size * sizeof(uint64_t), cudaHostAllocMapped),
+          "cudaHostAlloc(abort snapshot)");
       std::memset(abort_snapshot, 0, world_size * sizeof(uint64_t));
-      CheckCuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&abort_snapshot_device),
-                                         abort_snapshot, 0),
-                "cudaHostGetDevicePointer(abort snapshot)");
+      CheckCuda(
+          cudaHostGetDevicePointer(reinterpret_cast<void**>(&abort_snapshot_device), abort_snapshot, 0),
+          "cudaHostGetDevicePointer(abort snapshot)");
 
       CheckCuda(
           cudaDeviceGetAttribute(&write_ordering, cudaDevAttrGPUDirectRDMAWritesOrdering, device),
           "cudaDeviceGetAttribute(GPUDirectRDMAWritesOrdering)");
       if (write_ordering < cudaGPUDirectRDMAWritesOrderingOwner) {
         int flush_options = 0;
-        CheckCuda(cudaDeviceGetAttribute(&flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions,
-                                         device),
-                  "cudaDeviceGetAttribute(GPUDirectRDMAFlushWritesOptions)");
+        CheckCuda(
+            cudaDeviceGetAttribute(&flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device),
+            "cudaDeviceGetAttribute(GPUDirectRDMAFlushWritesOptions)");
         CHECK_HOST(flush_options & cudaFlushGPUDirectRDMAWritesOptionHost)
-            << "device " << device
-            << " orders GPUDirect RDMA writes neither by itself nor through a host flush";
+            << "device " << device << " orders GPUDirect RDMA writes neither by itself nor through a host flush";
       }
 
       int count = 0;
@@ -430,8 +430,7 @@ class Transport {
         }
       }
       ibv_free_device_list(list);
-      CHECK_HOST(context != nullptr) << "cannot open " << nic_name
-                                     << " with DEVX: " << std::strerror(errno);
+      CHECK_HOST(context != nullptr) << "cannot open " << nic_name << " with DEVX: " << std::strerror(errno);
       pd = ibv_alloc_pd(context);
       CHECK_HOST(pd != nullptr) << "ibv_alloc_pd failed: " << std::strerror(errno);
       cq = ibv_create_cq(context, 256, nullptr, nullptr, 0);
@@ -465,8 +464,7 @@ class Transport {
         qps[peer] = qp;
         qpxs[peer] = ibv_qp_to_qp_ex(qp);
         mlx5_qpxs[peer] = mlx5dv_qp_ex_from_ibv_qp_ex(qpxs[peer]);
-        CHECK_HOST(qpxs[peer] != nullptr && mlx5_qpxs[peer] != nullptr)
-            << "cannot create extended mlx5 QP";
+        CHECK_HOST(qpxs[peer] != nullptr && mlx5_qpxs[peer] != nullptr) << "cannot create extended mlx5 QP";
         local.qpn[peer] = qp->qp_num;
         local.psn[peer] = 0x120000 + rank * 0x1000 + peer * 0x10;
       }
@@ -476,7 +474,9 @@ class Transport {
     }
   }
 
-  ~Transport() { Release(); }
+  ~Transport() {
+    Release();
+  }
 
   void ValidatePlannedGid(ibv_port_attr* port_out, ibv_gid* gid_out) const {
     CHECK_HOST(context != nullptr) << "no open verbs context";
@@ -485,28 +485,28 @@ class Transport {
     CHECK_HOST(port.state == IBV_PORT_ACTIVE) << nic_name << " port 1 is not active";
     CHECK_HOST(port.link_layer == IBV_LINK_LAYER_ETHERNET) << nic_name << " port 1 is not RoCE";
     CHECK_HOST(gid_index < port.gid_tbl_len)
-        << "GID index " << gid_index << " is outside " << nic_name << " port 1 table length "
-        << port.gid_tbl_len;
+        << "GID index " << gid_index << " is outside " << nic_name << " port 1 table length " << port.gid_tbl_len;
     ibv_gid_entry entry{};
     CheckVerbs(ibv_query_gid_ex(context, kPort, gid_index, &entry, 0), "ibv_query_gid_ex");
     CHECK_HOST(entry.gid_type == IBV_GID_TYPE_ROCE_V2) << "GID " << gid_index << " is not RoCE v2";
     CHECK_HOST(entry.ndev_ifindex != 0) << "GID " << gid_index << " has no netdev";
     const auto* raw = entry.gid.raw;
-    const bool ipv4_mapped = std::all_of(raw, raw + 10, [](uint8_t b) { return b == 0; }) &&
-                             raw[10] == 0xff && raw[11] == 0xff;
+    const bool ipv4_mapped =
+        std::all_of(raw, raw + 10, [](uint8_t b) { return b == 0; }) && raw[10] == 0xff && raw[11] == 0xff;
     const bool ipv4_nonzero = std::any_of(raw + 12, raw + 16, [](uint8_t b) { return b != 0; });
-    CHECK_HOST(ipv4_mapped && ipv4_nonzero) << "GID " << gid_index
-                                            << " is not a non-zero IPv4-mapped address";
+    CHECK_HOST(ipv4_mapped && ipv4_nonzero) << "GID " << gid_index << " is not a non-zero IPv4-mapped address";
     if (port_out != nullptr) *port_out = port;
     if (gid_out != nullptr) std::memcpy(gid_out, &entry.gid, sizeof(entry.gid));
   }
 
   void LeakAndPoison(const char* reason) noexcept {
-    std::fprintf(stderr,
-                 "RDMA Ulysses: %s; verbs and CUDA resources are intentionally leaked. Call "
-                 "shutdown() on every rank before dropping the communicator.\n",
-                 reason);
-    for (auto& slot : slots) slot.release();
+    std::fprintf(
+        stderr,
+        "RDMA Ulysses: %s; verbs and CUDA resources are intentionally leaked. Call "
+        "shutdown() on every rank before dropping the communicator.\n",
+        reason);
+    for (auto& slot : slots)
+      slot.release();
     slots.clear();
   }
 
@@ -522,7 +522,8 @@ class Transport {
     }
     if (unsafe_release) return LeakAndPoison("an earlier teardown lost its retry ledger");
     try {
-      for (auto& slot : slots) slot->Release();
+      for (auto& slot : slots)
+        slot->Release();
     } catch (...) {
       return LeakAndPoison("slot teardown failed");
     }
@@ -574,8 +575,7 @@ class Transport {
     constexpr uint64_t kReceiveBit = 0x10;
     constexpr unsigned kMetadataBits = 8;
     CHECK_HOST(next_wr_id < (uint64_t{1} << (64 - kMetadataBits))) << "WR id space exhausted";
-    return (next_wr_id++ << kMetadataBits) | (receive ? kReceiveBit : 0) |
-           static_cast<uint64_t>(peer);
+    return (next_wr_id++ << kMetadataBits) | (receive ? kReceiveBit : 0) | static_cast<uint64_t>(peer);
   }
 
   bool RetireCompletion(const ibv_wc& completion) noexcept {
@@ -583,8 +583,7 @@ class Transport {
     constexpr uint64_t kReceiveBit = 0x10;
     const int peer = static_cast<int>(completion.wr_id & kPeerMask);
     if (peer < 0 || peer >= world_size) return false;
-    auto& outstanding = (completion.wr_id & kReceiveBit) != 0 ? outstanding_recv_wrs[peer]
-                                                              : outstanding_send_wrs[peer];
+    auto& outstanding = (completion.wr_id & kReceiveBit) != 0 ? outstanding_recv_wrs[peer] : outstanding_send_wrs[peer];
     if (outstanding == 0) return false;
     --outstanding;
     return true;
@@ -606,9 +605,16 @@ class Transport {
   // abort slots are sticky), so the host runs ahead to the next launches.
   void RunBarrier(Slot* slot, cudaStream_t stream, bool opening) {
     phase_inflight = true;
-    CheckCuda(EnqueueBarrier(slot->signals, slot->peer_signals.data(), world_size, rank,
-                             slot->epoch_device, abort_snapshot_device, stream),
-              opening ? "enqueue opening barrier" : "enqueue closing barrier");
+    CheckCuda(
+        EnqueueBarrier(
+            slot->signals,
+            slot->peer_signals.data(),
+            world_size,
+            rank,
+            slot->epoch_device,
+            abort_snapshot_device,
+            stream),
+        opening ? "enqueue opening barrier" : "enqueue closing barrier");
     CheckCuda(cudaEventRecord(phase_done, stream), "cudaEventRecord(barrier)");
     if (!opening) return;
     CheckCuda(cudaEventSynchronize(phase_done), "wait for barrier");
@@ -621,16 +627,14 @@ class Transport {
 
   bool TryPublishAbort(Slot* slot) noexcept {
     if (slot == nullptr || abort_stream == nullptr || abort_done == nullptr) return false;
-    if (EnqueueAbort(slot->peer_signals.data(), world_size, rank, abort_stream) != cudaSuccess)
-      return false;
+    if (EnqueueAbort(slot->peer_signals.data(), world_size, rank, abort_stream) != cudaSuccess) return false;
     if (cudaEventRecord(abort_done, abort_stream) != cudaSuccess) return false;
     return QueryEventUntil(abort_done, std::chrono::steady_clock::now() + timeout) == cudaSuccess;
   }
 
   bool TryDrain(cudaStream_t current) noexcept {
     if (phase_done == nullptr || cudaEventRecord(phase_done, current) != cudaSuccess) return false;
-    if (QueryEventUntil(phase_done, std::chrono::steady_clock::now() + timeout) != cudaSuccess)
-      return false;
+    if (QueryEventUntil(phase_done, std::chrono::steady_clock::now() + timeout) != cudaSuccess) return false;
     phase_inflight = false;
     return true;
   }
@@ -669,8 +673,7 @@ class Transport {
       }
       for (int index = 0; index < count; ++index) {
         if (!RetireCompletion(entries[index])) safe = false;
-        if (entries[index].status != IBV_WC_SUCCESS &&
-            entries[index].status != IBV_WC_WR_FLUSH_ERR) {
+        if (entries[index].status != IBV_WC_SUCCESS && entries[index].status != IBV_WC_WR_FLUSH_ERR) {
           safe = false;
         }
       }
@@ -714,23 +717,22 @@ class Transport {
       if (count < 0) teardown_safe = false;
       CHECK_HOST(count >= 0) << "ibv_poll_cq failed";
       bool ledger_ok = true;
-      for (int i = 0; i < count; ++i) ledger_ok = RetireCompletion(entries[i]) && ledger_ok;
+      for (int i = 0; i < count; ++i)
+        ledger_ok = RetireCompletion(entries[i]) && ledger_ok;
       if (!ledger_ok) teardown_safe = false;
       CHECK_HOST(ledger_ok) << "mlx5 completion does not match an outstanding WR";
       for (int i = 0; i < count; ++i) {
         const auto& entry = entries[i];
         if (entry.status != IBV_WC_SUCCESS) teardown_safe = false;
         CHECK_HOST(entry.status == IBV_WC_SUCCESS)
-            << "mlx5 completion failed: " << ibv_wc_status_str(entry.status)
-            << " vendor_err=" << entry.vendor_err;
+            << "mlx5 completion failed: " << ibv_wc_status_str(entry.status) << " vendor_err=" << entry.vendor_err;
         if (expected_receives == 0) {
           ++sends;
         } else if (entry.opcode == IBV_WC_RDMA_WRITE) {
           ++sends;
         } else if (entry.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
           CHECK_HOST(entry.wc_flags & IBV_WC_WITH_IMM) << "receive completion without immediate";
-          CHECK_HOST(ntohl(entry.imm_data) == immediate)
-              << "receive completion belongs to another exchange";
+          CHECK_HOST(ntohl(entry.imm_data) == immediate) << "receive completion belongs to another exchange";
           ++receives;
         } else {
           CHECK_HOST(false) << "unexpected mlx5 completion opcode " << entry.opcode;
@@ -739,8 +741,7 @@ class Transport {
       CHECK_HOST(sends <= expected_sends) << "too many mlx5 send completions";
       CHECK_HOST(receives <= expected_receives) << "too many mlx5 receive completions";
       if (count == 0 && ++empty_polls == 1024) {
-        CHECK_HOST(std::chrono::steady_clock::now() < deadline)
-            << "timed out waiting for mlx5 completions";
+        CHECK_HOST(std::chrono::steady_clock::now() < deadline) << "timed out waiting for mlx5 completions";
         empty_polls = 0;
       }
     }
@@ -759,8 +760,15 @@ class Transport {
   // An interleaved layout: `rows` runs of `width` bytes, `skip` bytes apart,
   // starting at `address`. The MKey keeps its rkey across reconfiguration, so
   // a rebind is one local UMR post and needs no collective.
-  void ConfigureMkey(int peer, mlx5dv_mkey* mkey, uint32_t access, uint64_t address, uint32_t width,
-                     uint32_t skip, uint32_t rows, uint32_t lkey) {
+  void ConfigureMkey(
+      int peer,
+      mlx5dv_mkey* mkey,
+      uint32_t access,
+      uint64_t address,
+      uint32_t width,
+      uint32_t skip,
+      uint32_t rows,
+      uint32_t lkey) {
     mlx5dv_mkey_conf_attr config{};
     mlx5dv_mr_interleaved layout{};
     layout.addr = address;
@@ -778,8 +786,14 @@ class Transport {
     CHECK_HOST(status == 0) << "configure interleaved MKey failed: " << std::strerror(status);
   }
 
-  void PostWrite(int peer, uint32_t local_key, uint64_t local_address, uint32_t bytes,
-                 uint32_t remote_key, uint64_t remote_address, uint32_t immediate) {
+  void PostWrite(
+      int peer,
+      uint32_t local_key,
+      uint64_t local_address,
+      uint32_t bytes,
+      uint32_t remote_key,
+      uint64_t remote_address,
+      uint32_t immediate) {
     auto* qp = qpxs[peer];
     ibv_wr_start(qp);
     qp->wr_id = NewWrId(peer, false);
@@ -803,8 +817,7 @@ class Transport {
   void Connect(const Array<int64_t>& flat) {
     EnsureHealthy();
     CHECK_HOST(!connected) << "RDMA Ulysses transport is already connected";
-    CHECK_HOST(flat.size() == static_cast<size_t>(world_size) * sizeof(GroupWire))
-        << "invalid group metadata length";
+    CHECK_HOST(flat.size() == static_cast<size_t>(world_size) * sizeof(GroupWire)) << "invalid group metadata length";
     for (int peer = 0; peer < world_size; ++peer) {
       peers[peer] = DecodeAt<GroupWire>(flat, peer * sizeof(GroupWire));
     }
@@ -825,8 +838,7 @@ class Transport {
         attr.port_num = kPort;
         attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
         CheckVerbs(
-            ibv_modify_qp(qp, &attr,
-                          IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS),
+            ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS),
             "QP RESET->INIT");
         attr = {};
         attr.qp_state = IBV_QPS_RTR;
@@ -841,9 +853,11 @@ class Transport {
         attr.ah_attr.grh.sgid_index = gid_index;
         attr.ah_attr.grh.hop_limit = 64;
         CheckVerbs(
-            ibv_modify_qp(qp, &attr,
-                          IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                              IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER),
+            ibv_modify_qp(
+                qp,
+                &attr,
+                IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                    IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER),
             "QP INIT->RTR");
         attr = {};
         attr.qp_state = IBV_QPS_RTS;
@@ -852,10 +866,13 @@ class Transport {
         attr.rnr_retry = 7;
         attr.sq_psn = local.psn[peer];
         attr.max_rd_atomic = 1;
-        CheckVerbs(ibv_modify_qp(qp, &attr,
-                                 IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                                     IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC),
-                   "QP RTR->RTS");
+        CheckVerbs(
+            ibv_modify_qp(
+                qp,
+                &attr,
+                IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                    IBV_QP_MAX_QP_RD_ATOMIC),
+            "QP RTR->RTS");
       }
     });
     connected = true;
@@ -903,8 +920,8 @@ inline void Slot::Release() {
     if (status == 0) output_mr = nullptr;
     CheckVerbs(status, "ibv_dereg_mr(output)");
   }
-  for (void** pointer : {&landing, &output, reinterpret_cast<void**>(&epoch_device),
-                         reinterpret_cast<void**>(&signals)}) {
+  for (void** pointer :
+       {&landing, &output, reinterpret_cast<void**>(&epoch_device), reinterpret_cast<void**>(&signals)}) {
     if (*pointer == nullptr) continue;
     const cudaError_t status = cudaFree(*pointer);
     if (status == cudaSuccess) *pointer = nullptr;
@@ -923,10 +940,11 @@ inline Slot::~Slot() {
       safe = false;
     }
   }
-  std::fprintf(stderr,
-               "RDMA Ulysses: refusing unsafe slot teardown for output %p; native resources are "
-               "intentionally leaked\n",
-               output);
+  std::fprintf(
+      stderr,
+      "RDMA Ulysses: refusing unsafe slot teardown for output %p; native resources are "
+      "intentionally leaked\n",
+      output);
   if (transport != nullptr) transport->unsafe_release = true;
 }
 
@@ -956,8 +974,7 @@ inline Geometry DescribeGeometry(int mode, TensorView input, TensorView output, 
       << "RDMA Ulysses moves 1-, 2- and 4-byte elements, got " << element << " bytes";
   if (mode == kModeChunks) {
     CHECK_HOST(input.ndim() == 2 && output.ndim() == 2) << "chunk operands must be [world_size, C]";
-    CHECK_HOST(input.size(0) == world_size && output.size(0) == world_size)
-        << "chunk operands need one chunk per peer";
+    CHECK_HOST(input.size(0) == world_size && output.size(0) == world_size) << "chunk operands need one chunk per peer";
     CHECK_HOST(input.size(1) == output.size(1) && input.size(1) > 0) << "chunk length mismatch";
     geometry.rows = 1;
     geometry.width = input.size(1) * element;
@@ -969,20 +986,19 @@ inline Geometry DescribeGeometry(int mode, TensorView input, TensorView output, 
     const int64_t s_global = input.size(0), h_local = input.size(1), dim = input.size(2);
     CHECK_HOST(s_global > 0 && s_global % world_size == 0)
         << "gather sequence " << s_global << " must split evenly over " << world_size;
-    CHECK_HOST(output.size(0) == s_global / world_size && output.size(1) == h_local * world_size &&
-               output.size(2) == dim)
+    CHECK_HOST(
+        output.size(0) == s_global / world_size && output.size(1) == h_local * world_size && output.size(2) == dim)
         << "gather output shape does not match its input";
     geometry.rows = s_global / world_size;
     geometry.width = h_local * dim * element;
     geometry.pitch = geometry.width * world_size;
     CHECK_HOST(geometry.pitch <= kMaxInterleavedStride)
-        << "H * D * element_size must stay within " << kMaxInterleavedStride
-        << " bytes for the interleaved MKey, got " << geometry.pitch;
+        << "H * D * element_size must stay within " << kMaxInterleavedStride << " bytes for the interleaved MKey, got "
+        << geometry.pitch;
   }
   geometry.payload = geometry.rows * geometry.width;
   geometry.total = geometry.payload * world_size;
-  CHECK_HOST(geometry.payload > 0 && geometry.payload <= UINT32_MAX)
-      << "per-peer payload exceeds the mlx5 WR limit";
+  CHECK_HOST(geometry.payload > 0 && geometry.payload <= UINT32_MAX) << "per-peer payload exceeds the mlx5 WR limit";
   return geometry;
 }
 
@@ -995,10 +1011,15 @@ inline void ConfigureDestinationMkeys(Transport* transport, Slot* slot, const Ge
     if (peer == transport->rank) continue;
     CHECK_HOST(slot->destination_mkeys[peer] != nullptr) << "missing destination MKey";
     const uint64_t address = reinterpret_cast<uint64_t>(slot->output) + uint64_t(peer) * geometry.width;
-    transport->ConfigureMkey(peer, slot->destination_mkeys[peer], access, address,
-                             static_cast<uint32_t>(geometry.width),
-                             static_cast<uint32_t>(geometry.pitch - geometry.width),
-                             static_cast<uint32_t>(geometry.rows), slot->output_mr->lkey);
+    transport->ConfigureMkey(
+        peer,
+        slot->destination_mkeys[peer],
+        access,
+        address,
+        static_cast<uint32_t>(geometry.width),
+        static_cast<uint32_t>(geometry.pitch - geometry.width),
+        static_cast<uint32_t>(geometry.rows),
+        slot->output_mr->lkey);
     ++configured;
   }
   transport->Poll(configured);
@@ -1022,29 +1043,40 @@ inline const void* BindInput(Slot* slot, TensorView input, int64_t bytes, cudaSt
   const auto* source_begin = static_cast<const char*>(input.data_ptr());
   CHECK_HOST(source_begin + bytes <= landing_begin || source_begin >= landing_begin + slot->capacity)
       << "input overlaps the landing buffer without being it";
-  CheckCuda(cudaMemcpyAsync(slot->landing, input.data_ptr(), static_cast<size_t>(bytes),
-                            cudaMemcpyDeviceToDevice, current),
-            "cudaMemcpyAsync(landing)");
+  CheckCuda(
+      cudaMemcpyAsync(slot->landing, input.data_ptr(), static_cast<size_t>(bytes), cudaMemcpyDeviceToDevice, current),
+      "cudaMemcpyAsync(landing)");
   return slot->landing;
 }
 
 // This rank's own chunk never touches the NIC.
-inline void SelfCopy(Transport* transport, Slot* slot, const void* source, const Geometry& geometry,
-                     cudaStream_t current) {
+inline void
+SelfCopy(Transport* transport, Slot* slot, const void* source, const Geometry& geometry, cudaStream_t current) {
   const auto* src = static_cast<const uint8_t*>(source);
   auto* dst = static_cast<uint8_t*>(slot->output);
   const int64_t rank = transport->rank;
   if (geometry.mode == kModeChunks) {
-    CheckCuda(cudaMemcpyAsync(dst + rank * geometry.width, src + rank * geometry.width,
-                              static_cast<size_t>(geometry.width), cudaMemcpyDeviceToDevice, current),
-              "cudaMemcpyAsync(own chunk)");
+    CheckCuda(
+        cudaMemcpyAsync(
+            dst + rank * geometry.width,
+            src + rank * geometry.width,
+            static_cast<size_t>(geometry.width),
+            cudaMemcpyDeviceToDevice,
+            current),
+        "cudaMemcpyAsync(own chunk)");
     return;
   }
-  CheckCuda(cudaMemcpy2DAsync(dst + rank * geometry.width, static_cast<size_t>(geometry.pitch),
-                              src + rank * geometry.payload, static_cast<size_t>(geometry.width),
-                              static_cast<size_t>(geometry.width), static_cast<size_t>(geometry.rows),
-                              cudaMemcpyDeviceToDevice, current),
-            "cudaMemcpy2DAsync(own heads)");
+  CheckCuda(
+      cudaMemcpy2DAsync(
+          dst + rank * geometry.width,
+          static_cast<size_t>(geometry.pitch),
+          src + rank * geometry.payload,
+          static_cast<size_t>(geometry.width),
+          static_cast<size_t>(geometry.width),
+          static_cast<size_t>(geometry.rows),
+          cudaMemcpyDeviceToDevice,
+          current),
+      "cudaMemcpy2DAsync(own heads)");
 }
 
 // ---------------------------------------------------------------- exports --
@@ -1053,13 +1085,16 @@ inline void SelfCopy(Transport* transport, Slot* slot, const void* source, const
  * \brief Open the NIC and create one RC queue pair per peer.
  * \return (handle, this rank's GroupWire bytes to all-gather and feed to connect()).
  */
-inline Tuple<int64_t, Array<int64_t>> init(int64_t rank, int64_t world_size, int64_t device,
-                                           String nic_name, int64_t gid_index, int64_t timeout_ms) {
-  auto* transport = new Transport(static_cast<int>(rank), static_cast<int>(world_size),
-                                  static_cast<int>(device), std::string(nic_name),
-                                  static_cast<int>(gid_index), timeout_ms);
-  return Tuple<int64_t, Array<int64_t>>(reinterpret_cast<int64_t>(transport),
-                                        Encode(transport->local));
+inline Tuple<int64_t, Array<int64_t>>
+init(int64_t rank, int64_t world_size, int64_t device, String nic_name, int64_t gid_index, int64_t timeout_ms) {
+  auto* transport = new Transport(
+      static_cast<int>(rank),
+      static_cast<int>(world_size),
+      static_cast<int>(device),
+      std::string(nic_name),
+      static_cast<int>(gid_index),
+      timeout_ms);
+  return Tuple<int64_t, Array<int64_t>>(reinterpret_cast<int64_t>(transport), Encode(transport->local));
 }
 
 inline void connect(int64_t handle, Array<int64_t> flat) {
@@ -1075,8 +1110,8 @@ inline void connect(int64_t handle, Array<int64_t> flat) {
  * Both tensors are uint8 views of transport-owned cudaMalloc memory; callers view
  * a prefix per operand. They stay valid until dispose().
  */
-inline Tuple<int64_t, Tensor, Tensor, Array<int64_t>> register_slot(int64_t handle, int64_t mode,
-                                                                     int64_t capacity_bytes) {
+inline Tuple<int64_t, Tensor, Tensor, Array<int64_t>>
+register_slot(int64_t handle, int64_t mode, int64_t capacity_bytes) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
   transport->EnsureHealthy();
@@ -1094,17 +1129,18 @@ inline Tuple<int64_t, Tensor, Tensor, Array<int64_t>> register_slot(int64_t hand
   const size_t signal_bytes = 2 * transport->world_size * sizeof(uint64_t);
   CheckCuda(cudaMalloc(reinterpret_cast<void**>(&slot->signals), signal_bytes), "cudaMalloc(signals)");
   CheckCuda(cudaMemset(slot->signals, 0, signal_bytes), "cudaMemset(signals)");
-  CheckCuda(cudaMalloc(reinterpret_cast<void**>(&slot->epoch_device), sizeof(uint64_t)),
-            "cudaMalloc(epoch)");
+  CheckCuda(cudaMalloc(reinterpret_cast<void**>(&slot->epoch_device), sizeof(uint64_t)), "cudaMalloc(epoch)");
   CheckCuda(cudaMemset(slot->epoch_device, 0, sizeof(uint64_t)), "cudaMemset(epoch)");
   slot->peer_signals[transport->rank] = slot->signals;
 
   transport->RetireOnFailure([&] {
-    slot->output_mr = RegisterGpuMr(transport->pd, slot->output, static_cast<size_t>(capacity_bytes),
-                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                        IBV_ACCESS_REMOTE_READ);
-    slot->landing_mr = RegisterGpuMr(transport->pd, slot->landing,
-                                     static_cast<size_t>(capacity_bytes), IBV_ACCESS_LOCAL_WRITE);
+    slot->output_mr = RegisterGpuMr(
+        transport->pd,
+        slot->output,
+        static_cast<size_t>(capacity_bytes),
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    slot->landing_mr =
+        RegisterGpuMr(transport->pd, slot->landing, static_cast<size_t>(capacity_bytes), IBV_ACCESS_LOCAL_WRITE);
     if (mode == kModeGather) {
       for (int peer = 0; peer < transport->world_size; ++peer) {
         if (peer != transport->rank) slot->destination_mkeys[peer] = transport->CreateMkey();
@@ -1149,9 +1185,10 @@ inline void connect_slot(int64_t handle, int64_t index, Array<int64_t> flat) {
       if (peer == transport->rank) continue;
       // The epoch barrier is a GPU kernel writing peer memory, so every rank
       // pair needs CUDA peer access even though the payload rides the NIC.
-      CheckCuda(cudaIpcOpenMemHandle(reinterpret_cast<void**>(&signals[peer]),
-                                     peers[peer].signal_ipc, cudaIpcMemLazyEnablePeerAccess),
-                "cudaIpcOpenMemHandle(signals)");
+      CheckCuda(
+          cudaIpcOpenMemHandle(
+              reinterpret_cast<void**>(&signals[peer]), peers[peer].signal_ipc, cudaIpcMemLazyEnablePeerAccess),
+          "cudaIpcOpenMemHandle(signals)");
     }
   } catch (...) {
     const std::exception_ptr original = std::current_exception();
@@ -1218,17 +1255,20 @@ inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView
       if (geometry.mode == kModeChunks) {
         CHECK_HOST(slot->peers[peer].address != 0 && slot->peers[peer].rkey != 0)
             << "peer " << peer << " has no registered output";
-        transport->PostWrite(peer, slot->landing_mr->lkey, local_address, payload,
-                             slot->peers[peer].rkey,
-                             slot->peers[peer].address + uint64_t(transport->rank) * geometry.payload,
-                             immediate);
+        transport->PostWrite(
+            peer,
+            slot->landing_mr->lkey,
+            local_address,
+            payload,
+            slot->peers[peer].rkey,
+            slot->peers[peer].address + uint64_t(transport->rank) * geometry.payload,
+            immediate);
       } else {
         // The interleaved destination MKey is addressed from zero; the peer
         // configured it over its own output at our head offset.
         const uint32_t remote_key = slot->peers[peer].destination_rkey[transport->rank];
         CHECK_HOST(remote_key != 0) << "peer " << peer << " has no destination MKey for us";
-        transport->PostWrite(peer, slot->landing_mr->lkey, local_address, payload, remote_key, 0,
-                             immediate);
+        transport->PostWrite(peer, slot->landing_mr->lkey, local_address, payload, remote_key, 0, immediate);
       }
     }
     if (own_in_place == 0) SelfCopy(transport, slot, source, geometry, current);
@@ -1237,9 +1277,10 @@ inline void exchange(int64_t handle, int64_t index, TensorView input, TensorView
     // GPUDirect writes are visible to the GPU.
     transport->Poll(expected, expected, immediate);
     if (transport->write_ordering < cudaGPUDirectRDMAWritesOrderingOwner) {
-      CheckCuda(cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
-                                                   cudaFlushGPUDirectRDMAWritesToOwner),
-                "cudaDeviceFlushGPUDirectRDMAWrites");
+      CheckCuda(
+          cudaDeviceFlushGPUDirectRDMAWrites(
+              cudaFlushGPUDirectRDMAWritesTargetCurrentDevice, cudaFlushGPUDirectRDMAWritesToOwner),
+          "cudaDeviceFlushGPUDirectRDMAWrites");
     }
     transport->RunBarrier(slot, current, false);
   } catch (...) {
@@ -1260,22 +1301,22 @@ inline void disconnect(int64_t handle) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
   transport->SettleClosingBarrier();
-  CHECK_HOST(transport->TeardownSafe())
-      << "cannot disconnect after unbounded native GPU work; terminate the process";
-  for (auto& slot : transport->slots) slot->Disconnect();
+  CHECK_HOST(transport->TeardownSafe()) << "cannot disconnect after unbounded native GPU work; terminate the process";
+  for (auto& slot : transport->slots)
+    slot->Disconnect();
 }
 
 inline void dispose(int64_t handle) {
   auto* transport = AsTransport(handle);
   ScopedCudaDevice device_guard(transport->device);
   transport->SettleClosingBarrier();
-  CHECK_HOST(transport->TeardownSafe())
-      << "cannot dispose after unbounded native GPU work; terminate the process";
+  CHECK_HOST(transport->TeardownSafe()) << "cannot dispose after unbounded native GPU work; terminate the process";
   CHECK_HOST(!transport->unsafe_release) << "transport has an unrecoverable teardown ledger";
   for (const auto& slot : transport->slots) {
     CHECK_HOST(slot->imports_closed) << "disconnect every rank before disposing the transport";
   }
-  for (auto& slot : transport->slots) slot->Release();
+  for (auto& slot : transport->slots)
+    slot->Release();
   transport->slots.clear();
   CHECK_HOST(!transport->unsafe_release) << "teardown lost a native resource ledger";
   delete transport;

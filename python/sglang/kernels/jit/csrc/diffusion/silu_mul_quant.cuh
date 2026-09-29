@@ -58,8 +58,7 @@ SGL_DEVICE uint32_t round_bf16x2_rn(float lo, float hi) {
 /// Both bf16 rounds of the eager `silu(gate) * up` for two adjacent elements.
 SGL_DEVICE uint32_t silu_mul_act_pair(uint32_t gate2, uint32_t up2) {
   const auto [g0, g1] = widen_bf16x2(gate2);
-  const uint32_t silu2 =
-      round_bf16x2_rn(__fmul_rn(sigmoid_replica(g0), g0), __fmul_rn(sigmoid_replica(g1), g1));
+  const uint32_t silu2 = round_bf16x2_rn(__fmul_rn(sigmoid_replica(g0), g0), __fmul_rn(sigmoid_replica(g1), g1));
   const auto [s0, s1] = widen_bf16x2(silu2);
   const auto [u0, u1] = widen_bf16x2(up2);
   return round_bf16x2_rn(__fmul_rn(s0, u0), __fmul_rn(s1, u1));
@@ -76,8 +75,11 @@ SGL_DEVICE float quant_payload(float act, float scale_inv) {
  */
 template <int kVecsPerThread>
 __global__ __launch_bounds__(kThreads) void silu_mul_quant_kernel(
-    fp8_e4m3_t* __restrict__ q, float* __restrict__ s, const bf16_t* __restrict__ x,
-    uint32_t hidden, int64_t x_row_stride) {
+    fp8_e4m3_t* __restrict__ q,
+    float* __restrict__ s,
+    const bf16_t* __restrict__ x,
+    uint32_t hidden,
+    int64_t x_row_stride) {
   using namespace device;
   using OutVec = AlignedVector<fp8_e4m3_t, kVec>;
 
@@ -168,9 +170,12 @@ struct SiluMulQuantKernel {
     if (rows == 0) return;
 
     LaunchKernel(static_cast<uint32_t>(rows), kThreads, device.unwrap())(
-        silu_mul_quant_kernel<kVecsPerThread>, static_cast<fp8_e4m3_t*>(q.data_ptr()),
-        static_cast<fp32_t*>(s.data_ptr()), static_cast<const bf16_t*>(x.data_ptr()),
-        static_cast<uint32_t>(hidden), x_row_stride);
+        silu_mul_quant_kernel<kVecsPerThread>,
+        static_cast<fp8_e4m3_t*>(q.data_ptr()),
+        static_cast<fp32_t*>(s.data_ptr()),
+        static_cast<const bf16_t*>(x.data_ptr()),
+        static_cast<uint32_t>(hidden),
+        x_row_stride);
   }
 };
 

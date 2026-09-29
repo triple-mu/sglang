@@ -1,0 +1,4 @@
+# Vendored Cake Sage block-sparse attention kernel; keep the source
+# byte-comparable with upstream so re-syncing stays a plain copy. See ../README.md.
+DisableFormat: true
+SortIncludes: Never

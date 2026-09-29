@@ -20,19 +20,19 @@
 // conversions are load-bearing for parity with the Sage quantiser and must be
 // compiled with `--use_fast_math` like the original.
 
+#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <type_traits>
 
 namespace sglang {
@@ -517,16 +517,20 @@ __global__ void UnpackForSageKernel(
   const uint32_t source = block_token_base / local_sequence;
   const uint32_t local_token = global_token - source * local_sequence;
   const uint64_t source_chunk = static_cast<uint64_t>(source) * chunk_bytes;
-  const uint64_t source_element = details::section_offset(local_token, batch_id, batch_size, local_head, local_heads, d_base);
+  const uint64_t source_element =
+      details::section_offset(local_token, batch_id, batch_size, local_head, local_heads, d_base);
   device::PDLWaitPrimary<kUsePDL>();
   const bool live = global_token < used_sequence;
   const uint4 zero = make_uint4(0, 0, 0, 0);
   const uint4 q_value = live ? *reinterpret_cast<const uint4*>(input + source_chunk + source_element) : zero;
-  const uint4 k_value = live ? *reinterpret_cast<const uint4*>(input + source_chunk + main_bytes + source_element) : zero;
-  const uint4 v_value = live ? *reinterpret_cast<const uint4*>(input + source_chunk + 2 * main_bytes + source_element) : zero;
+  const uint4 k_value =
+      live ? *reinterpret_cast<const uint4*>(input + source_chunk + main_bytes + source_element) : zero;
+  const uint4 v_value =
+      live ? *reinterpret_cast<const uint4*>(input + source_chunk + 2 * main_bytes + source_element) : zero;
 
   const uint64_t bhsd_element =
-      ((static_cast<uint64_t>(batch_id) * local_heads + local_head) * global_sequence + global_token) * kHeadDim + d_base;
+      ((static_cast<uint64_t>(batch_id) * local_heads + local_head) * global_sequence + global_token) * kHeadDim +
+      d_base;
   *reinterpret_cast<uint4*>(q + bhsd_element) = q_value;
   *reinterpret_cast<uint4*>(k + bhsd_element) = k_value;
 
@@ -548,7 +552,8 @@ __global__ void UnpackForSageKernel(
   const uint64_t v_output_offset =
       ((static_cast<uint64_t>(batch_id) * local_heads + local_head) * kHeadDim + output_d) * global_sequence +
       block_token_base + output_token_base;
-  *reinterpret_cast<uint4*>(v + v_output_offset) = *reinterpret_cast<uint4*>(&shared_store[output_d][output_token_base]);
+  *reinterpret_cast<uint4*>(v + v_output_offset) =
+      *reinterpret_cast<uint4*>(&shared_store[output_d][output_token_base]);
 
   if (blockIdx.x != 0) {
     device::PDLTriggerSecondary<kUsePDL>();
@@ -561,17 +566,20 @@ __global__ void UnpackForSageKernel(
   const uint32_t q_groups_per_source = local_sequence / kQGroup;
   const uint32_t k_groups_per_source = local_sequence / kKGroup;
   const uint64_t q_scale_section = 3 * main_bytes;
-  const uint64_t k_scale_section = q_scale_section + static_cast<uint64_t>(batch_size) * local_heads * q_groups_per_source * 4;
+  const uint64_t k_scale_section =
+      q_scale_section + static_cast<uint64_t>(batch_size) * local_heads * q_groups_per_source * 4;
   for (uint32_t g = thread_id; g < q_scale_alloc; g += blockDim.x) {
     const uint32_t owner = g / q_groups_per_source;
     const uint32_t owner_slot = g - owner * q_groups_per_source;
-    const float* q_scale_input = reinterpret_cast<const float*>(input + static_cast<uint64_t>(owner) * chunk_bytes + q_scale_section);
+    const float* q_scale_input =
+        reinterpret_cast<const float*>(input + static_cast<uint64_t>(owner) * chunk_bytes + q_scale_section);
     q_scale[scale_head * q_scale_alloc + g] = q_scale_input[scale_head * q_groups_per_source + owner_slot];
   }
   for (uint32_t g = thread_id; g < k_scale_alloc; g += blockDim.x) {
     const uint32_t owner = g / k_groups_per_source;
     const uint32_t owner_slot = g - owner * k_groups_per_source;
-    const float* k_scale_input = reinterpret_cast<const float*>(input + static_cast<uint64_t>(owner) * chunk_bytes + k_scale_section);
+    const float* k_scale_input =
+        reinterpret_cast<const float*>(input + static_cast<uint64_t>(owner) * chunk_bytes + k_scale_section);
     k_scale[scale_head * k_scale_alloc + g] = k_scale_input[scale_head * k_groups_per_source + owner_slot];
   }
   device::PDLTriggerSecondary<kUsePDL>();
@@ -607,9 +615,8 @@ struct Kernels {
         .template with_device<kDLCUDA>(device)
         .ensure_alignment(16)
         .verify(x);
-    CHECK_HOST(L.unwrap() % kShardAlignment == 0)
-        << name << ": the local sequence must be a whole number of " << kShardAlignment << "-token blocks, got "
-        << L.unwrap();
+    CHECK_HOST(L.unwrap() % kShardAlignment == 0) << name << ": the local sequence must be a whole number of "
+                                                  << kShardAlignment << "-token blocks, got " << L.unwrap();
     // Every kernel reads rows with 16-byte vector loads.
     CHECK_HOST(SB.unwrap() % 8 == 0 && ST.unwrap() % 8 == 0 && SH.unwrap() % 8 == 0)
         << name << ": strides must be multiples of 8 elements";
@@ -623,14 +630,18 @@ struct Kernels {
    *               tokens, the replicated all-gather payload
    * \param own    fp32 `[2, B, H, 128]`, the same record once more (this rank's row of the gathered result)
    */
-  static void k_sum_v_amax(tvm::ffi::TensorView k, tvm::ffi::TensorView v, tvm::ffi::TensorView stats, tvm::ffi::TensorView own) {
+  static void
+  k_sum_v_amax(tvm::ffi::TensorView k, tvm::ffi::TensorView v, tvm::ffi::TensorView stats, tvm::ffi::TensorView own) {
     using namespace host;
     SymbolicSize B{"batch"}, L{"local_sequence"}, H{"heads"}, R{"replicas"};
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
     const Shard ks = shard(k, "k", B, L, H, device);
     const Shard vs = shard(v, "v", B, L, H, device);
-    TensorMatcher({R, 2, B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(stats);
+    TensorMatcher({R, 2, B, H, kHeadDim})
+        .template with_dtype<fp32_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(stats);
     TensorMatcher({2, B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(own);
     const uint64_t half = static_cast<uint64_t>(ks.batch) * ks.num_heads * kHeadDim;
     const DLDevice dev = device.unwrap();
@@ -638,32 +649,34 @@ struct Kernels {
     const int64_t partial_elems = ks.batch * ks.num_heads * chunks * kHeadDim;
     auto k_partial = ffi::alloc_workspace_tensor(partial_elems * sizeof(float), dev);
     auto v_partial = ffi::alloc_workspace_tensor(partial_elems * sizeof(float), dev);
-    LaunchKernel(dim3(ks.num_heads, ks.batch, chunks), 16 * (kHeadDim / 8), dev).enable_pdl(kUsePDL)(
-        KSumVAmaxPartialKernel<T, kUsePDL>,
-        static_cast<const T*>(k.data_ptr()),
-        static_cast<const T*>(v.data_ptr()),
-        static_cast<float*>(k_partial.data_ptr()),
-        static_cast<float*>(v_partial.data_ptr()),
-        static_cast<uint32_t>(ks.local_sequence),
-        static_cast<uint32_t>(ks.num_heads),
-        static_cast<uint32_t>(chunks),
-        ks.stride_batch,
-        ks.stride_token,
-        ks.stride_head,
-        vs.stride_batch,
-        vs.stride_token,
-        vs.stride_head);
-    LaunchKernel(dim3(ks.num_heads, ks.batch), kHeadDim, dev).enable_pdl(kUsePDL)(
-        KSumVAmaxCombineKernel<kUsePDL>,
-        static_cast<const float*>(k_partial.data_ptr()),
-        static_cast<const float*>(v_partial.data_ptr()),
-        static_cast<float*>(stats.data_ptr()),
-        static_cast<float*>(own.data_ptr()),
-        static_cast<uint32_t>(ks.num_heads),
-        static_cast<uint32_t>(chunks),
-        static_cast<uint32_t>(R.unwrap()),
-        2 * half,
-        half);
+    LaunchKernel(dim3(ks.num_heads, ks.batch, chunks), 16 * (kHeadDim / 8), dev)
+        .enable_pdl(kUsePDL)(
+            KSumVAmaxPartialKernel<T, kUsePDL>,
+            static_cast<const T*>(k.data_ptr()),
+            static_cast<const T*>(v.data_ptr()),
+            static_cast<float*>(k_partial.data_ptr()),
+            static_cast<float*>(v_partial.data_ptr()),
+            static_cast<uint32_t>(ks.local_sequence),
+            static_cast<uint32_t>(ks.num_heads),
+            static_cast<uint32_t>(chunks),
+            ks.stride_batch,
+            ks.stride_token,
+            ks.stride_head,
+            vs.stride_batch,
+            vs.stride_token,
+            vs.stride_head);
+    LaunchKernel(dim3(ks.num_heads, ks.batch), kHeadDim, dev)
+        .enable_pdl(kUsePDL)(
+            KSumVAmaxCombineKernel<kUsePDL>,
+            static_cast<const float*>(k_partial.data_ptr()),
+            static_cast<const float*>(v_partial.data_ptr()),
+            static_cast<float*>(stats.data_ptr()),
+            static_cast<float*>(own.data_ptr()),
+            static_cast<uint32_t>(ks.num_heads),
+            static_cast<uint32_t>(chunks),
+            static_cast<uint32_t>(R.unwrap()),
+            2 * half,
+            half);
   }
 
   /**
@@ -685,10 +698,16 @@ struct Kernels {
     SymbolicSize W{"world_size"}, B{"batch"}, H{"heads"}, h{"local_heads"};
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
-    TensorMatcher({W, 2, B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(gathered);
+    TensorMatcher({W, 2, B, H, kHeadDim})
+        .template with_dtype<fp32_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(gathered);
     TensorMatcher({B, H, kHeadDim}).template with_dtype<T>().template with_device<kDLCUDA>(device).verify(k_mean);
     TensorMatcher({B, H, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(v_scale);
-    TensorMatcher({B, h, kHeadDim}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(v_scale_local);
+    TensorMatcher({B, h, kHeadDim})
+        .template with_dtype<fp32_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(v_scale_local);
     CHECK_HOST(H.unwrap() % h.unwrap() == 0 && rank >= 0 && (rank + 1) * h.unwrap() <= H.unwrap())
         << "local heads must tile the heads and rank must own a slice";
     CHECK_HOST(used_sequence > 0) << "used_sequence must be positive";
@@ -741,8 +760,14 @@ struct Kernels {
     CHECK_HOST(used_sequence > 0 && used_sequence <= global_sequence)
         << "used_sequence must lie in (0, " << global_sequence << "], got " << used_sequence;
     const ChunkSpec spec = chunk_spec(qs.batch, qs.local_sequence, local_heads);
-    TensorMatcher({world_size, spec.chunk_bytes}).template with_dtype<uint8_t>().template with_device<kDLCUDA>(device).verify(out);
-    TensorMatcher({spec.chunk_bytes}).template with_dtype<uint8_t>().template with_device<kDLCUDA>(device).verify(own_out);
+    TensorMatcher({world_size, spec.chunk_bytes})
+        .template with_dtype<uint8_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(out);
+    TensorMatcher({spec.chunk_bytes})
+        .template with_dtype<uint8_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(own_out);
     const DLDevice dev = device.unwrap();
     auto* payload = static_cast<uint8_t*>(out.data_ptr());
     auto* own_payload = static_cast<uint8_t*>(own_out.data_ptr());
@@ -836,7 +861,9 @@ struct Kernels {
     CHECK_HOST(local_sequence > 0 && local_sequence % kShardAlignment == 0)
         << "local_sequence must be a positive multiple of " << kShardAlignment;
     const int64_t global_sequence = local_sequence * world_size;
-    CHECK_HOST(scale_sequence > 0 && scale_sequence <= global_sequence && used_sequence > 0 && used_sequence <= global_sequence)
+    CHECK_HOST(
+        scale_sequence > 0 && scale_sequence <= global_sequence && used_sequence > 0 &&
+        used_sequence <= global_sequence)
         << "scale_sequence and used_sequence must lie in (0, " << global_sequence << "]";
     const int64_t q_scale_alloc = div_ceil(scale_sequence, int64_t{128}) * 4;
     const int64_t k_scale_alloc = div_ceil(scale_sequence, static_cast<int64_t>(kKGroup));
@@ -844,30 +871,47 @@ struct Kernels {
     SymbolicSize B{"batch"}, h{"local_heads"};
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
-    TensorMatcher({B, h, global_sequence, kHeadDim}).template with_dtype<int8_t>().template with_device<kDLCUDA>(device).verify(q).verify(k);
-    TensorMatcher({B, h, kHeadDim, global_sequence}).template with_dtype<fp8_e4m3_t>().template with_device<kDLCUDA>(device).verify(v);
-    TensorMatcher({B, h, q_scale_alloc}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(q_scale);
-    TensorMatcher({B, h, k_scale_alloc}).template with_dtype<fp32_t>().template with_device<kDLCUDA>(device).verify(k_scale);
+    TensorMatcher({B, h, global_sequence, kHeadDim})
+        .template with_dtype<int8_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(q)
+        .verify(k);
+    TensorMatcher({B, h, kHeadDim, global_sequence})
+        .template with_dtype<fp8_e4m3_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(v);
+    TensorMatcher({B, h, q_scale_alloc})
+        .template with_dtype<fp32_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(q_scale);
+    TensorMatcher({B, h, k_scale_alloc})
+        .template with_dtype<fp32_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(k_scale);
     const ChunkSpec spec = chunk_spec(B.unwrap(), local_sequence, h.unwrap());
-    TensorMatcher({world_size, spec.chunk_bytes}).template with_dtype<uint8_t>().template with_device<kDLCUDA>(device).verify(recv);
+    TensorMatcher({world_size, spec.chunk_bytes})
+        .template with_dtype<uint8_t>()
+        .template with_device<kDLCUDA>(device)
+        .verify(recv);
     const DLDevice dev = device.unwrap();
 
-    LaunchKernel(dim3(global_sequence / 64, h.unwrap(), B.unwrap()), 64 * kHeadDim / 16, dev).enable_pdl(kUsePDL)(
-        UnpackForSageKernel<kUsePDL>,
-        static_cast<const uint8_t*>(recv.data_ptr()),
-        static_cast<uint8_t*>(q.data_ptr()),
-        static_cast<uint8_t*>(k.data_ptr()),
-        static_cast<uint8_t*>(v.data_ptr()),
-        static_cast<float*>(q_scale.data_ptr()),
-        static_cast<float*>(k_scale.data_ptr()),
-        static_cast<uint64_t>(spec.main_bytes),
-        static_cast<uint64_t>(spec.chunk_bytes),
-        static_cast<uint32_t>(B.unwrap()),
-        static_cast<uint32_t>(local_sequence),
-        static_cast<uint32_t>(global_sequence),
-        static_cast<uint32_t>(used_sequence),
-        static_cast<uint32_t>(q_scale_alloc),
-        static_cast<uint32_t>(k_scale_alloc));
+    LaunchKernel(dim3(global_sequence / 64, h.unwrap(), B.unwrap()), 64 * kHeadDim / 16, dev)
+        .enable_pdl(kUsePDL)(
+            UnpackForSageKernel<kUsePDL>,
+            static_cast<const uint8_t*>(recv.data_ptr()),
+            static_cast<uint8_t*>(q.data_ptr()),
+            static_cast<uint8_t*>(k.data_ptr()),
+            static_cast<uint8_t*>(v.data_ptr()),
+            static_cast<float*>(q_scale.data_ptr()),
+            static_cast<float*>(k_scale.data_ptr()),
+            static_cast<uint64_t>(spec.main_bytes),
+            static_cast<uint64_t>(spec.chunk_bytes),
+            static_cast<uint32_t>(B.unwrap()),
+            static_cast<uint32_t>(local_sequence),
+            static_cast<uint32_t>(global_sequence),
+            static_cast<uint32_t>(used_sequence),
+            static_cast<uint32_t>(q_scale_alloc),
+            static_cast<uint32_t>(k_scale_alloc));
   }
 };
 
