@@ -545,6 +545,14 @@ them, all SM120-only and each proven active from the server log:
   `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_ADALN=0`,
   `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_MLP_QUANT=0`,
   `SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT=0`.
+- Per-token fp8 attention-output gather (RDMA transport with per-channel FP8
+  GEMMs): each rank quantises its heads of every token before the output
+  all-to-all and ships `[fp8 codes | scale]` rows, so the gather moves half the
+  bytes and `out_proj` takes the merged `(q, s)` pair directly instead of
+  quantising the bf16 rows again. This is the one lossy fusion in the stack: it
+  adds one fp8 rounding on the attention output. Log: `Ulysses gather carries
+  per-token fp8 attention output`. Kill switch:
+  `SGLANG_DIFFUSION_MINIMAX_H3_FP8_GATHER=0`.
 
 ```bash Command
 sglang serve \

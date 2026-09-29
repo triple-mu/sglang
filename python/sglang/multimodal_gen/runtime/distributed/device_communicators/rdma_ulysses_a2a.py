@@ -238,6 +238,32 @@ class RdmaUlyssesA2A:
         self._count()
         return out
 
+    def gather_row_landing(self, s_global: int, row_bytes: int) -> torch.Tensor:
+        """Where to build `[S_global, row_bytes]` uint8 rows before `gather_rows`."""
+        _, _, landing = self._slot("gather", s_global * row_bytes)
+        return landing[: s_global * row_bytes].view(s_global, row_bytes)
+
+    def gather_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """`[S_global, R]` uint8 rows -> `[S_local, W, R]`: destination d's row t collects
+        every source's row `d * S_local + t`, sources in rank order."""
+        if rows.ndim != 2 or rows.dtype is not torch.uint8:
+            raise ValueError("gather_rows takes uint8 [S_global, R]")
+        s_global, row_bytes = rows.shape
+        index, output, landing = self._slot("gather", rows.numel())
+        if rows.data_ptr() != landing.data_ptr() or not rows.is_contiguous():
+            staged = landing[: rows.numel()].view(rows.shape)
+            staged.copy_(rows)
+            rows = staged
+        out = output[: rows.numel()].view(
+            s_global // self.world_size, self.world_size, row_bytes
+        )
+        with maybe_nvtx_range("rdma_a2a_gather_rows"):
+            self._module.exchange(
+                self._handle, index, rows.view(s_global, 1, row_bytes), out, 0
+            )
+        self._count()
+        return out
+
     def _count(self) -> None:
         self.exchanges += 1
         if self.exchanges == 1:
