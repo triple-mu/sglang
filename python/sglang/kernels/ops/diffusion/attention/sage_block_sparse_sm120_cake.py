@@ -153,7 +153,9 @@ def sage_block_sparse_attn_sm120(
     return out
 
 
-_DENSE_TABLES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+# The most recent (key, tables): consecutive layers of one request share a shape,
+# and one entry cannot pile up a table set per sequence length seen.
+_DENSE_TABLES: tuple[tuple, tuple[torch.Tensor, torch.Tensor]] | None = None
 
 
 def sage_block_sparse_dense_block_index(
@@ -162,12 +164,12 @@ def sage_block_sparse_dense_block_index(
     """Full-density routing tables: every query block keeps every key block.
 
     Used for the dense warmup steps of a sparse schedule so that one kernel
-    serves both regimes. The tables are read-only and cached per shape.
+    serves both regimes. The tables are read-only; the last shape is cached.
     """
-    key = (batch, heads, seqlen_q, seqlen_k, str(device))
-    cached = _DENSE_TABLES.get(key)
-    if cached is not None:
-        return cached
+    global _DENSE_TABLES
+    key = (batch, heads, seqlen_q, seqlen_k, device.type, device.index)
+    if _DENSE_TABLES is not None and _DENSE_TABLES[0] == key:
+        return _DENSE_TABLES[1]
     q_blocks = -(-seqlen_q // _BLOCK)
     k_blocks = seqlen_k // _BLOCK
     index = (
@@ -179,7 +181,7 @@ def sage_block_sparse_dense_block_index(
     nums = torch.full(
         (batch, heads, q_blocks), k_blocks, device=device, dtype=torch.int32
     )
-    _DENSE_TABLES[key] = (index, nums)
+    _DENSE_TABLES = (key, (index, nums))
     return index, nums
 
 

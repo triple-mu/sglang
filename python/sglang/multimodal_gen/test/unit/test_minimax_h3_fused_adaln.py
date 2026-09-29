@@ -262,3 +262,36 @@ def test_patched_cache_dit_middle_range_returns_hidden_and_residual(monkeypatch)
     assert encoder is None
     assert torch.equal(hidden, want)
     assert torch.equal(residual, want - x)
+
+
+def test_static_activation_scale_blocks_the_per_token_fp8_hand_over():
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+        Fp8Config,
+        Fp8LinearMethod,
+    )
+
+    method = Fp8LinearMethod(
+        Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static")
+    )
+    linear = SimpleNamespace(
+        quant_method=method,
+        input_scale=torch.ones((), device="cuda"),
+        weight_scale=torch.ones(8, device="cuda"),
+        weight=torch.empty(4, 8, device="cuda"),
+    )
+    assert "static activation scale" in m._per_token_fp8_blockers(linear)
+    linear.input_scale = None
+    assert "static activation scale" not in m._per_token_fp8_blockers(linear)
+
+
+def test_lora_wrapped_linear_keeps_the_bf16_hand_over():
+    """A LoRA wrapper exposes only weight/bias (#41272); it must be declined, not crash."""
+
+    class _Wrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(4, 8), requires_grad=False)
+
+    wrapped = _Wrapped()
+    assert m._per_token_fp8_blockers(wrapped) == ["quant method NoneType"]
+    assert not m._fused_norm_feeds_fp8(wrapped)

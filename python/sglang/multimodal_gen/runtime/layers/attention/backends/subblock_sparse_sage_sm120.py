@@ -45,6 +45,10 @@ from sglang.kernels.ops.diffusion import (
     ulysses_lowp_finalize_stats_local,
     ulysses_lowp_k_sum_v_amax,
     ulysses_lowp_payload_spec,
+    can_use_ulysses_fp8_gather_group,
+    ulysses_fp8_gather_quant,
+    ulysses_fp8_gather_requant,
+    ulysses_fp8_gather_row_bytes,
     ulysses_lowp_quant_pack,
     ulysses_lowp_scale_widths,
     ulysses_lowp_unpack_for_sage,
@@ -364,6 +368,7 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         max_seqlen: int,
         ring_active: bool,
         sparse_query_block_mask: torch.Tensor | None,
+        fp8_output: bool = False,
     ) -> torch.Tensor | None:
         """Quantise this rank's shard, exchange INT8/FP8 bytes, attend for this rank's heads.
 
@@ -472,11 +477,22 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         )
         out = None
         if transport is not None:
-            # Cake writes token-major straight into the gather buffer; no relayout copy.
-            landing = transport.gather_landing(
-                (spec.global_sequence, h, HEAD_DIM), torch.bfloat16
-            )
-            out = landing.permute(1, 0, 2).unsqueeze(0)
+            # Cake writes token-major: straight into the gather buffer when the
+            # bf16 rows travel, into a staging buffer the fp8 rows are built from.
+            if fp8_output and can_use_ulysses_fp8_gather_group(h * HEAD_DIM):
+                from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
+
+                staging = _a2a_staging_buffer(
+                    "sage_lowp_out_rows",
+                    (spec.global_sequence, h, HEAD_DIM),
+                    torch.bfloat16,
+                    device,
+                )
+            else:
+                staging = transport.gather_landing(
+                    (spec.global_sequence, h, HEAD_DIM), torch.bfloat16
+                )
+            out = staging.permute(1, 0, 2).unsqueeze(0)
         return self._attend(
             operands,
             used=used,
@@ -485,8 +501,16 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
             out=out,
         )
 
-    def gather_output(self, out: torch.Tensor) -> torch.Tensor:
-        """Ulysses output all-to-all of `[S_global, H_local, D]` -> `[S_local, H, D]`."""
+    def gather_output(
+        self, out: torch.Tensor, *, per_token_fp8: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Ulysses output all-to-all of `[S_global, H_local, D]` -> `[S_local, H, D]`.
+
+        With `per_token_fp8` (RDMA transport only) each rank quantises its heads
+        per token before the exchange and the result is the `(q, s)` pair the
+        fp8 out_proj takes: half the bytes on the wire and no separate
+        per-token quantisation afterwards, for one extra fp8 rounding.
+        """
         from sglang.multimodal_gen.runtime.distributed.device_communicators.rdma_ulysses_a2a import (
             active_rdma_ulysses_a2a,
         )
@@ -498,7 +522,25 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         transport = active_rdma_ulysses_a2a(get_sp_group().ulysses_group)
         if transport is None:
             return _usp_output_all_to_all(out[None], head_dim=2)[0]
-        return transport.gather_heads(out)
+        s_global, h, d = out.shape
+        if not per_token_fp8 or not can_use_ulysses_fp8_gather_group(h * d):
+            if per_token_fp8:
+                logger.info_once(
+                    f"SubBlock Sage SM120: {h * d} output columns per rank exceed the "
+                    "fp8 gather kernels; the gather carries bf16"
+                )
+            return transport.gather_heads(out)
+        rows = out.reshape(s_global, h * d)
+        payload = transport.gather_row_landing(
+            s_global, ulysses_fp8_gather_row_bytes(h * d)
+        )
+        ulysses_fp8_gather_quant(rows, out=payload)
+        recv = transport.gather_rows(payload)
+        logger.info_once(
+            f"SubBlock Sage SM120: Ulysses gather carries per-token fp8 attention "
+            f"output ({payload.shape[1]} bytes per token and source rank)"
+        )
+        return ulysses_fp8_gather_requant(recv, group=h * d)
 
     def _attend(
         self,

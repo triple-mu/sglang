@@ -425,7 +425,9 @@ def _per_token_fp8_blockers(linear: nn.Module) -> list[str]:
     """Why `linear` cannot take a per-token pre-quantised fp8 activation; empty when it can."""
     from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 
-    method = linear.quant_method
+    # LoRA wrappers (BaseLayerWithLoRA) expose only weight/bias, not the base
+    # layer's quantisation; they take bf16 rows like any non-fp8 linear.
+    method = getattr(linear, "quant_method", None)
     if not isinstance(method, Fp8LinearMethod):
         return [f"quant method {type(method).__name__}"]
     blockers = []
@@ -433,6 +435,9 @@ def _per_token_fp8_blockers(linear: nn.Module) -> list[str]:
         blockers.append("block-quantised weights")
     if method.use_marlin:
         blockers.append("marlin")
+    # A calibrated static input scale must stay with the GEMM's own quantiser.
+    if linear.input_scale is not None:
+        blockers.append("static activation scale")
     if not method.cutlass_fp8_supported:
         blockers.append("no CUTLASS fp8 GEMM")
     weight_scale = linear.weight_scale
@@ -746,6 +751,10 @@ def _minimax_h3_attention_core_impl(
         ):
             # Quantised exchange: the shard is quantised before the all-to-all
             # and the heads come back attended. None means run the BF16 path.
+            fp8_gather = (
+                envs.SGLANG_DIFFUSION_MINIMAX_H3_FP8_GATHER
+                and _accepts_per_token_fp8_input(attention.out_proj)
+            )
             out = attention._attention_impl.forward_ulysses_lowp(
                 q,
                 k,
@@ -754,9 +763,12 @@ def _minimax_h3_attention_core_impl(
                 max_seqlen=max_seqlen,
                 ring_active=ring_active,
                 sparse_query_block_mask=subblock_sparse_query_block_mask,
+                fp8_output=fp8_gather,
             )
             if out is not None:
-                return attention._attention_impl.gather_output(out)
+                return attention._attention_impl.gather_output(
+                    out, per_token_fp8=fp8_gather
+                )
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
@@ -1281,6 +1293,10 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
+        # Per-token fp8 rows straight from the Ulysses gather.
+        if isinstance(out, tuple):
+            out, _ = self.out_proj(out)
+            return out
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
         return out
