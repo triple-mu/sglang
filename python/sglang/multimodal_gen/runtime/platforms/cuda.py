@@ -523,29 +523,41 @@ class _VedaAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     # Veda runs on the FlashAttention-4 CuTe block-sparse kernels through
     # Miowtion: natively on SM90 / SM100, and on SM8x / SM120 through
-    # Miowtion's vendored FA4 patch. Miowtion decides per device.
+    # Miowtion's vendored FA4 patch (pip flash_attn.cute, hash-pinned; sglang's
+    # own attention uses its vendored FA4 copy, so the two do not interact
+    # unless SGLANG_INKLING_FA4_USE_PIP=1).
+    supported_majors = (8, 9, 10, 12)
+
     @classmethod
     def resolve(cls, platform) -> str:
-        try:
-            from miowtion.kernels import fa4
-            from miowtion.veda import bundle  # noqa: F401
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            veda_runtime,
+        )
 
+        try:
+            veda_runtime.check_contract()
             from sglang.multimodal_gen.runtime.layers.attention.backends.veda_attn_h3 import (  # noqa: F401
                 VedaAttentionBackend,
             )
         except ImportError as e:
             logger.error("Failed to import the Veda attention backend: %s", str(e))
-            raise ImportError(
-                "Veda attention needs Miowtion (pip install -e <Miowtion checkout>) "
-                "with its pinned flash-attn-4 CuTe build."
-            ) from e
-        if torch.cuda.is_available() and not fa4.available(torch.device("cuda")):
-            capability = platform.get_device_capability()
-            found = capability.as_version_str() if capability else "unknown"
+            raise
+        capability = platform.get_device_capability()
+        if capability is not None and capability.major not in cls.supported_majors:
             raise ValueError(
-                "Veda attention needs FA4 block sparsity, which Miowtion does not "
-                f"provide on compute capability {found} in this install."
+                "Veda attention needs compute capability 8.x, 9.x, 10.x or 12.x; "
+                f"this device reports {capability.as_version_str()}."
             )
+        if torch.cuda.is_available():
+            ok, reason = veda_runtime.fa4_status(torch.device("cuda"))
+            if not ok:
+                found = capability.as_version_str() if capability else "unknown"
+                raise ValueError(
+                    "Veda attention needs FA4 block sparsity, which Miowtion does not "
+                    f"provide on compute capability {found} in this install"
+                    f"{f': {reason}' if reason else ''}. Install "
+                    f"{veda_runtime.FA4_INSTALL} and keep SGLANG_INKLING_FA4_USE_PIP unset."
+                )
         return "sglang.multimodal_gen.runtime.layers.attention.backends.veda_attn_h3.VedaAttentionBackend"
 
 

@@ -3,7 +3,8 @@
 
 The sparse path needs a GPU, Miowtion and a predictor bundle; here the
 runtime is faked so the dispatch, the dense fallbacks, the layout checks and
-the head mapping can be exercised without them.
+the head mapping can be exercised without them. The Miowtion-facing glue is
+covered by test_veda_runtime.py.
 """
 
 from types import SimpleNamespace
@@ -11,7 +12,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.layers.attention.backends import veda_attn_h3
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    veda_attn_h3,
+    veda_runtime,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionMetadata,
 )
@@ -114,28 +118,35 @@ def test_dense_fallback_for_foreign_metadata_and_refiner():
 
 
 class _FakeStudent:
+    """Stands in for Miowtion's SparseStudent: records the call, returns ones."""
+
     def __init__(self):
         self.calls = []
 
-    def forward_heads(self, q, k, v, layer_index, model_heads):
-        self.calls.append((q.shape, layer_index, model_heads.tolist()))
-        out = torch.zeros_like(q)
-        out[: q.shape[0]] = 1.0
-        return out
+    def __call__(self, q, k, v, layer_index):
+        self.calls.append((q.data_ptr(), q.shape, layer_index))
+        return torch.ones_like(q)
 
 
-def _fake_runtime(monkeypatch, dense_first_n_steps=0, dense_layers=()):
+def _fake_runtime(monkeypatch, dense_first_n_steps=0, dense_layers=(), num_layers=50):
     student = _FakeStudent()
     runtime = SimpleNamespace(
         dense_first_n_steps=dense_first_n_steps,
         dense_layers=frozenset(dense_layers),
+        num_layers=num_layers,
+        local=SimpleNamespace(heads=veda_runtime.HeadRange(42, 49)),
         _announced_sparse=True,
+        _announced_extra_layer=False,
         student=lambda metadata: student,
+        get_calls=[],
     )
-    monkeypatch.setattr(
-        veda_attn_h3._VedaRuntime, "get", classmethod(lambda cls, device: runtime)
-    )
-    return student
+
+    def get(cls, device, *, heads_per_tp, local_heads):
+        runtime.get_calls.append((heads_per_tp, local_heads))
+        return runtime
+
+    monkeypatch.setattr(veda_attn_h3._VedaRuntime, "get", classmethod(get))
+    return student, runtime
 
 
 def _veda_metadata(seq_len=192, used=170, grid=(2, 4, 4)):
@@ -149,12 +160,17 @@ def _veda_metadata(seq_len=192, used=170, grid=(2, 4, 4)):
     )
 
 
-def test_sparse_dispatch_maps_local_heads_to_model_heads(monkeypatch):
+def test_local_head_range_follows_tp_then_ulysses(monkeypatch):
     from sglang.multimodal_gen.runtime.distributed import parallel_state
 
     monkeypatch.setattr(parallel_state, "get_tp_rank", lambda: 1)
     monkeypatch.setattr(parallel_state, "get_ulysses_parallel_rank", lambda: 2)
-    student = _fake_runtime(monkeypatch)
+    # tp_rank * 28 + ulysses_rank * 7 + j
+    assert veda_attn_h3._local_head_range(28, 7) == veda_runtime.HeadRange(42, 49)
+
+
+def test_sparse_dispatch_calls_the_student_on_the_local_heads(monkeypatch):
+    student, runtime = _fake_runtime(monkeypatch)
     q, k, v, cu, used = _packed(heads=7)
     impl = _impl("blocks.5.attn")  # 28 heads per TP rank
     with set_forward_context(current_timestep=4, attn_metadata=_veda_metadata()):
@@ -162,15 +178,41 @@ def test_sparse_dispatch_maps_local_heads_to_model_heads(monkeypatch):
             q, k, v, cu_seqlens=cu, max_seqlen=used, cu_seqlens_host=tuple(cu.tolist())
         )
     assert impl.calls == {"sparse": 1, "dense": 0}
-    ((shape, layer, model_heads),) = student.calls
+    assert runtime.get_calls == [(28, 7)]
+    ((ptr, shape, layer),) = student.calls
     assert layer == 5 and shape == q.shape
-    # tp_rank * 28 + ulysses_rank * 7 + j
-    assert model_heads == [28 + 14 + j for j in range(7)]
+    # Unit stride along head_dim is all the tile gather needs: no copy.
+    assert ptr == q.data_ptr()
     assert out.shape == q.shape
 
 
+def test_strided_head_views_are_passed_without_copy(monkeypatch):
+    student, _ = _fake_runtime(monkeypatch)
+    q8, k8, v8, cu, used = _packed(heads=8)
+    q, k, v = q8[:, 2:9], k8[:, 2:9], v8[:, 2:9]
+    assert q.stride(-1) == 1 and not q.is_contiguous()
+    with set_forward_context(current_timestep=4, attn_metadata=_veda_metadata()):
+        _impl("blocks.5.attn").forward_varlen(q, k, v, cu_seqlens=cu, max_seqlen=used)
+    ((ptr, shape, _),) = student.calls
+    assert ptr == q.data_ptr() and shape == q.shape
+
+
+def test_layers_beyond_the_bundle_run_dense(monkeypatch):
+    student, _ = _fake_runtime(monkeypatch, num_layers=4)
+    q, k, v, cu, used = _packed()
+    dense = SDPAImpl(
+        num_heads=28, head_size=HEAD_DIM, causal=False, softmax_scale=SCALE
+    )
+    ref = dense.forward_varlen(q, k, v, cu_seqlens=cu, max_seqlen=used)
+    with set_forward_context(current_timestep=4, attn_metadata=_veda_metadata()):
+        out = _impl("blocks.4.attn").forward_varlen(
+            q, k, v, cu_seqlens=cu, max_seqlen=used
+        )
+    assert torch.equal(out, ref) and student.calls == []
+
+
 def test_dense_steps_and_dense_layers_take_the_sdpa_path(monkeypatch):
-    student = _fake_runtime(monkeypatch, dense_first_n_steps=2, dense_layers=(9,))
+    student, _ = _fake_runtime(monkeypatch, dense_first_n_steps=2, dense_layers=(9,))
     q, k, v, cu, used = _packed()
     metadata = _veda_metadata()
     dense = SDPAImpl(

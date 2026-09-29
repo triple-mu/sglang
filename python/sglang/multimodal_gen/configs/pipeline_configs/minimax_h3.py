@@ -383,10 +383,37 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "disable them or use --attention-backend fa."
                 )
             attention_config = server_args.attention_backend_config or {}
-            if not attention_config.get("veda_bundle"):
+            bundle = attention_config.get("veda_bundle")
+            if not bundle:
                 raise ValueError(
                     "Veda attention needs --attention-backend-config "
                     "veda_bundle=<predictor bundle .safetensors>"
+                )
+            if not os.path.isfile(str(bundle)):
+                raise ValueError(f"Veda attention: veda_bundle {bundle} is not a file")
+            keep_ratio = attention_config.get("veda_keep_ratio")
+            if keep_ratio is not None and not 0.0 < float(keep_ratio) <= 1.0:
+                raise ValueError(f"veda_keep_ratio must be in (0, 1], got {keep_ratio}")
+            if int(attention_config.get("veda_dense_first_n_steps", 0)) < 0:
+                raise ValueError("veda_dense_first_n_steps must be >= 0")
+            if int(attention_config.get("veda_collect_mib", 256)) <= 0:
+                raise ValueError("veda_collect_mib must be a positive number of MiB")
+            fallback = attention_config.get("veda_plan_fallback", "none")
+            if fallback not in ("none", "select"):
+                raise ValueError(
+                    f"veda_plan_fallback must be none or select, got {fallback!r}"
+                )
+            capability = current_platform.get_device_capability()
+            if (
+                os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1"
+                and capability is not None
+                and capability.major in (8, 12)
+            ):
+                # Miowtion patches the pip flash_attn.cute for block sparsity
+                # on these architectures and refuses once it was imported.
+                raise ValueError(
+                    "Veda attention on SM8x / SM120 cannot run with "
+                    "SGLANG_INKLING_FA4_USE_PIP=1; unset it."
                 )
         from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
             AttentionRequirements,
