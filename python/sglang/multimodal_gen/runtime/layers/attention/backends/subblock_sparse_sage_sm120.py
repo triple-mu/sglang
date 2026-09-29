@@ -45,6 +45,7 @@ from sglang.kernels.ops.diffusion import (
     ulysses_lowp_finalize_stats_local,
     ulysses_lowp_k_sum_v_amax,
     ulysses_lowp_payload_spec,
+    can_use_ulysses_fp8_gather_group,
     ulysses_fp8_gather_quant,
     ulysses_fp8_gather_requant,
     ulysses_fp8_gather_row_bytes,
@@ -478,7 +479,7 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         if transport is not None:
             # Cake writes token-major: straight into the gather buffer when the
             # bf16 rows travel, into a staging buffer the fp8 rows are built from.
-            if fp8_output:
+            if fp8_output and can_use_ulysses_fp8_gather_group(h * HEAD_DIM):
                 from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
 
                 staging = _a2a_staging_buffer(
@@ -521,9 +522,14 @@ class SubBlockSparseSageSM120Impl(SubBlockSparseAttentionImpl):
         transport = active_rdma_ulysses_a2a(get_sp_group().ulysses_group)
         if transport is None:
             return _usp_output_all_to_all(out[None], head_dim=2)[0]
-        if not per_token_fp8:
-            return transport.gather_heads(out)
         s_global, h, d = out.shape
+        if not per_token_fp8 or not can_use_ulysses_fp8_gather_group(h * d):
+            if per_token_fp8:
+                logger.info_once(
+                    f"SubBlock Sage SM120: {h * d} output columns per rank exceed the "
+                    "fp8 gather kernels; the gather carries bf16"
+                )
+            return transport.gather_heads(out)
         rows = out.reshape(s_global, h * d)
         payload = transport.gather_row_landing(
             s_global, ulysses_fp8_gather_row_bytes(h * d)

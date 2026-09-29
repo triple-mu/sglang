@@ -35,7 +35,7 @@ constexpr float kFp8Max = 448.0f;
 constexpr uint32_t kRowAlign = 16;
 constexpr uint32_t kLaneElems = 4;  // one 4-byte code word or 8-byte source word per lane
 constexpr uint32_t kWarpElems = 32 * kLaneElems;
-constexpr uint32_t kMaxIters = 16;  // groups up to 2048 columns stay in registers
+constexpr uint32_t kMaxIters = 32;  // groups up to 4096 columns stay in registers
 constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kMaxWorld = 32;
 
@@ -160,7 +160,7 @@ struct Kernels {
 
   /*!
    * \brief Per-token fp8 rows: `payload[t] = fp8(x[t] / s_t) | fp32 s_t | zero pad`, s_t = amax / 448.
-   * \param x        `[S, G]` activations; G a multiple of 128, at most 2048
+   * \param x        `[S, G]` activations; G a multiple of 128, at most 4096
    * \param payload  uint8 `[S, row_bytes(G)]`
    */
   static void quant(tvm::ffi::TensorView x, tvm::ffi::TensorView payload) {
