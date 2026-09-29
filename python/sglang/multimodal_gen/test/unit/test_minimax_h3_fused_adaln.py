@@ -282,3 +282,16 @@ def test_static_activation_scale_blocks_the_per_token_fp8_hand_over():
     assert "static activation scale" in m._per_token_fp8_blockers(linear)
     linear.input_scale = None
     assert "static activation scale" not in m._per_token_fp8_blockers(linear)
+
+
+def test_lora_wrapped_linear_keeps_the_bf16_hand_over():
+    """A LoRA wrapper exposes only weight/bias (#41272); it must be declined, not crash."""
+
+    class _Wrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(4, 8), requires_grad=False)
+
+    wrapped = _Wrapped()
+    assert m._per_token_fp8_blockers(wrapped) == ["quant method NoneType"]
+    assert not m._fused_norm_feeds_fp8(wrapped)

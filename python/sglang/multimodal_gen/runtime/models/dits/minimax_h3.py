@@ -422,7 +422,9 @@ def _per_token_fp8_blockers(linear: nn.Module) -> list[str]:
     """Why `linear` cannot take a per-token pre-quantised fp8 activation; empty when it can."""
     from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 
-    method = linear.quant_method
+    # LoRA wrappers (BaseLayerWithLoRA) expose only weight/bias, not the base
+    # layer's quantisation; they take bf16 rows like any non-fp8 linear.
+    method = getattr(linear, "quant_method", None)
     if not isinstance(method, Fp8LinearMethod):
         return [f"quant method {type(method).__name__}"]
     blockers = []
