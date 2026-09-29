@@ -18,17 +18,25 @@ warm-up steps, dense layers, calls outside the denoising loop) goes to the
 Torch SDPA backend, so the fallback is numerically the baseline path.
 
 Head parallelism: each rank holds ``H_local`` consecutive model heads,
-``tp_rank * heads_per_tp_rank + ulysses_rank * H_local + j``; the plan and the
-predictor are indexed by model head.
+``tp_rank * heads_per_tp_rank + ulysses_rank * H_local + j``. Upstream
+Miowtion attends all heads of a layer, so every process slices the bundle to
+its own heads at load time (``veda_runtime``) and runs the unchanged student
+on them; heads are independent throughout, so this is exact.
 
-``--attention-backend-config`` keys (``k=v`` or JSON):
+``--attention-backend-config`` keys (``k=v`` or JSON; lists need JSON, the
+``k=v`` parser splits on commas):
 
 * ``veda_bundle=<path>``: predictor bundle written by Miowtion's
   ``scripts/export_predictor.py`` (required).
 * ``veda_keep_ratio=<float>``: block budget; default is the bundle's own.
 * ``veda_dense_first_n_steps=<n>``: denoising steps that stay dense
   (0-based loop steps; default 0).
-* ``veda_dense_layers=a,b,...``: DiT blocks that stay dense (default none).
+* ``veda_dense_layers=[a, b]``: DiT blocks that stay dense (default none).
+* ``veda_collect_mib=<int>``: bound on one tile-ordered q / k / v / out copy
+  (default 256); larger runs more heads per kernel launch, same result.
+* ``veda_plan_fallback=none|select``: ``none`` (default) serves only token
+  grids the bundle has a plan for; ``select`` applies Miowtion's nearest
+  latent_t / mirrored-aspect rule.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.backends import veda_runtime
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -125,27 +134,49 @@ def _int_list(value: Any) -> list[int]:
     return [int(v) for v in value]
 
 
+def _local_head_range(heads_per_tp: int, local_heads: int) -> veda_runtime.HeadRange:
+    """Model heads of this process (see the module docstring)."""
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_tp_rank,
+        get_ulysses_parallel_rank,
+    )
+
+    return veda_runtime.head_range(
+        heads_per_tp=heads_per_tp,
+        local_heads=local_heads,
+        tp_rank=get_tp_rank(),
+        ulysses_rank=get_ulysses_parallel_rank(),
+    )
+
+
 class _VedaRuntime:
     """Bundle, config and per-layout students of one worker process.
 
-    One process drives one device, so the singleton is keyed by device.
+    One process drives one device and owns one head range, so the singleton
+    is keyed by device and the first caller fixes the heads.
     """
 
     _instances: dict[torch.device, _VedaRuntime] = {}
     _lock = threading.Lock()
 
     @classmethod
-    def get(cls, device: torch.device) -> _VedaRuntime:
+    def get(
+        cls, device: torch.device, *, heads_per_tp: int, local_heads: int
+    ) -> _VedaRuntime:
+        heads = _local_head_range(heads_per_tp, local_heads)
         with cls._lock:
             runtime = cls._instances.get(device)
             if runtime is None:
-                runtime = cls(device)
+                runtime = cls(device, heads)
                 cls._instances[device] = runtime
+            elif runtime.local.heads != heads:
+                raise ValueError(
+                    f"Veda attention loaded model heads {runtime.local.heads} on "
+                    f"{device}; a layer with {local_heads} local heads asks for {heads}"
+                )
             return runtime
 
-    def __init__(self, device: torch.device) -> None:
-        from miowtion.veda import bundle as veda_bundle
-
+    def __init__(self, device: torch.device, heads: veda_runtime.HeadRange) -> None:
         from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         config = get_global_server_args().attention_backend_config or {}
@@ -156,12 +187,17 @@ class _VedaRuntime:
                 "veda_bundle=<predictor bundle .safetensors>"
             )
         self.device = device
-        self.loaded = veda_bundle.load(str(path), device)
+        self.local = veda_runtime.load_local_bundle(
+            path=str(path), device=device, rng=heads
+        )
+        if self.local.head_dim != _HEAD_DIM:
+            raise ValueError(
+                f"bundle {path} was trained for head_dim {self.local.head_dim}, "
+                f"the DiT uses {_HEAD_DIM}"
+            )
         keep_ratio = config.get("veda_keep_ratio")
         self.keep_ratio = (
-            float(keep_ratio)
-            if keep_ratio is not None
-            else float(self.loaded.keep_ratio)
+            float(keep_ratio) if keep_ratio is not None else self.local.keep_ratio
         )
         if not 0.0 < self.keep_ratio <= 1.0:
             raise ValueError(
@@ -169,25 +205,44 @@ class _VedaRuntime:
             )
         self.dense_first_n_steps = int(config.get("veda_dense_first_n_steps", 0))
         self.dense_layers = frozenset(_int_list(config.get("veda_dense_layers")))
+        self.collect_mib = int(
+            config.get("veda_collect_mib", veda_runtime.DEFAULT_COLLECT_MIB)
+        )
+        self.plan_fallback = str(config.get("veda_plan_fallback", "none"))
+        if self.plan_fallback not in veda_runtime.PLAN_FALLBACKS:
+            raise ValueError(
+                f"veda_plan_fallback must be one of {veda_runtime.PLAN_FALLBACKS}, "
+                f"got {self.plan_fallback!r}"
+            )
         self._students: dict[tuple, Any] = {}
         self._announced_sparse = False
+        self._announced_extra_layer = False
+        metadata = self.local.metadata
         logger.info(
-            "Veda attention: bundle %s (source %s, step %s), keep ratio %.3f, "
-            "dense first %d steps, dense layers %s, plans %s",
+            "Veda attention: bundle %s (%s, source %s, step %s) sliced to model heads "
+            "[%d, %d) of %d, keep ratio %.3f, collect %d MiB, dense first %d steps, "
+            "dense layers %s, plan fallback %s, plans %s",
             path,
-            self.loaded.metadata.get("source", "?"),
-            self.loaded.metadata.get("step", "?"),
+            metadata.get("dtype", "?"),
+            metadata.get("source", "?"),
+            metadata.get("step", "?"),
+            heads.start,
+            heads.stop,
+            self.local.num_heads,
             self.keep_ratio,
+            self.collect_mib,
             self.dense_first_n_steps,
             sorted(self.dense_layers) or "none",
-            sorted(self.loaded.plans.plans),
+            self.plan_fallback,
+            sorted(self.local.plans.plans),
         )
+
+    @property
+    def num_layers(self) -> int:
+        return self.local.num_layers
 
     def student(self, metadata: VedaAttentionMetadata):
         """The SparseStudent of one packed layout (tile layouts are cached)."""
-        from miowtion.veda import attention as veda_attention
-        from miowtion.veda import mask as veda_mask
-
         grid = tuple(int(v) for v in metadata.grid)
         key = (
             int(metadata.video_start),
@@ -199,24 +254,31 @@ class _VedaRuntime:
         if student is None:
             if len(self._students) >= _MAX_CACHED_LAYOUTS:
                 self._students.clear()
-            plan = self.loaded.plans.select_grid(grid)
-            config = veda_attention.VedaConfig(
-                target_budget=veda_mask.Budget(ratio=self.keep_ratio)
+            plan, reason = veda_runtime.find_plan(
+                table=self.local.plans, grid=grid, fallback=self.plan_fallback
             )
-            clip = veda_attention.ClipTiling.for_target(
-                key[0], grid, key[2], key[3], config, self.device
+            student = veda_runtime.make_student(
+                self.local,
+                plan,
+                video_start=key[0],
+                grid=grid,
+                used=key[2],
+                seq_len=key[3],
+                keep_ratio=self.keep_ratio,
+                collect_mib=self.collect_mib,
+                device=self.device,
             )
-            student = veda_attention.SparseStudent(clip, plan, self.loaded.predictor)
             self._students[key] = student
             logger.info(
                 "Veda attention: video rows [%d, %d) on grid %s of %d real / %d "
-                "packed rows -> plan %s (%d shapes)",
+                "packed rows -> plan %s (%s, %d shapes)",
                 key[0],
                 key[0] + grid[0] * grid[1] * grid[2],
                 grid,
                 key[2],
                 key[3],
                 plan.geometry,
+                reason,
                 len(plan.shapes),
             )
         return student
@@ -265,25 +327,7 @@ class VedaAttentionImpl(AttentionImpl):
             prefix=prefix,
             **extra_impl_args,
         )
-        self._model_heads: torch.Tensor | None = None
         self.calls = {"sparse": 0, "dense": 0}
-
-    def _model_heads_for(self, local_heads: int, device: torch.device) -> torch.Tensor:
-        """Model head index of every local head (see module docstring)."""
-        if self._model_heads is None or self._model_heads.numel() != local_heads:
-            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-                get_tp_rank,
-                get_ulysses_parallel_rank,
-            )
-
-            start = (
-                get_tp_rank() * self.num_heads
-                + get_ulysses_parallel_rank() * local_heads
-            )
-            self._model_heads = torch.arange(
-                start, start + local_heads, device=device, dtype=torch.long
-            )
-        return self._model_heads
 
     def forward(
         self,
@@ -312,11 +356,25 @@ class VedaAttentionImpl(AttentionImpl):
             return self._dense_varlen(
                 query, key, value, cu_seqlens, max_seqlen, cu_seqlens_host
             )
-        runtime = _VedaRuntime.get(query.device)
+        runtime = _VedaRuntime.get(
+            query.device, heads_per_tp=self.num_heads, local_heads=query.shape[1]
+        )
         if (
             context.current_timestep < runtime.dense_first_n_steps
             or self.layer_index in runtime.dense_layers
         ):
+            return self._dense_varlen(
+                query, key, value, cu_seqlens, max_seqlen, cu_seqlens_host
+            )
+        if self.layer_index >= runtime.num_layers:
+            if not runtime._announced_extra_layer:
+                runtime._announced_extra_layer = True
+                logger.warning(
+                    "Veda attention: the bundle covers %d layers; %s and later "
+                    "blocks run dense",
+                    runtime.num_layers,
+                    self.prefix,
+                )
             return self._dense_varlen(
                 query, key, value, cu_seqlens, max_seqlen, cu_seqlens_host
             )
@@ -338,7 +396,6 @@ class VedaAttentionImpl(AttentionImpl):
                 f"max_seqlen {max_seqlen}, {query.shape[0]} rows"
             )
         student = runtime.student(metadata)
-        model_heads = self._model_heads_for(query.shape[1], query.device)
         if not runtime._announced_sparse:
             # Evidence that the sparse path ran (a silent dense fallback
             # would leave this line out of the log).
@@ -348,15 +405,19 @@ class VedaAttentionImpl(AttentionImpl):
                 self.prefix,
                 context.current_timestep,
                 query.shape[1],
-                int(model_heads[0]),
-                int(model_heads[-1]),
+                runtime.local.heads.start,
+                runtime.local.heads.stop - 1,
             )
         # The all-to-all leaves q / k / v as strided views on a staging buffer;
-        # the tile gather kernels want plain [S, H, D] tensors.
-        q, k, v = (t.contiguous() for t in (query, key, value))
+        # the tile gather kernels only need unit stride along head_dim.
+        q, k, v = (
+            t if t.stride(-1) == 1 else t.contiguous() for t in (query, key, value)
+        )
         self.calls["sparse"] += 1
         with torch.no_grad():
-            return student.forward_heads(q, k, v, self.layer_index, model_heads)
+            out = student(q, k, v, self.layer_index)
+        assert out.shape == query.shape, (out.shape, query.shape)
+        return out
 
     def _dense_varlen(self, query, key, value, cu_seqlens, max_seqlen, cu_seqlens_host):
         self.calls["dense"] += 1
