@@ -380,6 +380,23 @@ def _all_ranks_min(value: int, *, device: torch.device) -> int:
     return int(probe.item())
 
 
+def _same_lora_deltas(
+    left: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]],
+    right: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]],
+) -> bool:
+    """Same adapter tensors (by identity) at the same scales, so plans stay valid."""
+    if left.keys() != right.keys():
+        return False
+    for prefix, entries in left.items():
+        others = right[prefix]
+        if len(entries) != len(others):
+            return False
+        for (a, b, scale), (other_a, other_b, other_scale) in zip(entries, others):
+            if a is not other_a or b is not other_b or scale != other_scale:
+                return False
+    return True
+
+
 class MiniMaxH3AdalnCache(nn.Module):
     """Precomputed AdaLN outputs for fixed FP32 timestep plans."""
 
@@ -417,7 +434,8 @@ class MiniMaxH3AdalnCache(nn.Module):
         if precision not in ("match", "fp32"):
             raise ValueError(
                 "MiniMax H3 AdaLN cache precision must be 'match' (bit-exact "
-                f"with resident adaln_proj weights) or 'fp32', got {precision!r}"
+                "with resident adaln_proj weights when no LoRA delta applies) "
+                f"or 'fp32', got {precision!r}"
             )
         self.path = path
         self.model_variant = model_variant
@@ -426,8 +444,15 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.max_plan_width = max_plan_width
         self.num_layers = arch.num_layers
         self.hidden_size = arch.hidden_size
+        self.time_embed_dim = arch.time_embed_dim
         self.block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * arch.hidden_size
         self.final_width = 2 * arch.hidden_size
+        # Layer prefix -> (lora_A [r, in], lora_B [out, r], scale) per adapter,
+        # folded into every projection the rebuild pass runs.
+        self._lora_deltas: dict[
+            str, list[tuple[torch.Tensor, torch.Tensor, float]]
+        ] = {}
+        self._loaded = False
         # Plan bit pattern -> slot, tracked on the host in LRU order (oldest
         # first). The rebuild path evicts per plan; a sidecar never evicts.
         self._slots: OrderedDict[tuple[int, ...], int] = OrderedDict()
@@ -443,6 +468,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         self._step_block_params: tuple[tuple[torch.Tensor, ...], ...] | None = None
 
     def load(self, device: torch.device) -> None:
+        self._loaded = True
         if self.path is None:
             self._allocate(device)
             if self.host_cache_bytes > 0:
@@ -573,6 +599,12 @@ class MiniMaxH3AdalnCache(nn.Module):
         The pass reads all 50 adaln_proj layers regardless of how many plans are
         missing, so a request builds everything it needs before denoising rather
         than filling in step by step.
+
+        Without LoRA deltas a 'match' plan is bit-identical to resident
+        adaln_proj weights. With deltas (set_lora_deltas) each projection adds
+        the fp32 low-rank term before the bf16 store, which equals
+        F.linear(x, W + scale * B @ A) up to the bf16 rounding of the merged
+        weight that the resident-weight merge path would incur.
         """
         if keys is None:
             keys = [_plan_key(timesteps) for timesteps in step_timesteps]
@@ -635,8 +667,11 @@ class MiniMaxH3AdalnCache(nn.Module):
         tp_size = get_tp_world_size()
         tp_rank = get_tp_rank() if tp_size > 1 else 0
 
+        # The LoRA terms are fp32 GEMMs even in 'match' mode; TF32 there would
+        # perturb the delta while the bf16 base GEMM is unaffected by the guard.
+        full_fp32 = self.precision == "fp32" or bool(self._lora_deltas)
         try:
-            with _fp32_gemm_guard(enabled=self.precision == "fp32", device=device):
+            with _fp32_gemm_guard(enabled=full_fp32, device=device):
                 self._project_plans_from_checkpoint(
                     slots, tp_size=tp_size, tp_rank=tp_rank, device=device
                 )
@@ -746,6 +781,126 @@ class MiniMaxH3AdalnCache(nn.Module):
         self._free_slots = list(range(self.max_plans))
         self.plan_lengths.zero_()
 
+    def set_lora_deltas(
+        self,
+        deltas: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] | None,
+    ) -> None:
+        """Low-rank adaln_proj terms the next rebuild folds into every plan.
+
+        ``deltas`` maps a layer prefix (``blocks.N.adaln_proj.linear`` or
+        ``final_layer.adaln_proj.linear``) to (lora_A [r, in], lora_B [out, r],
+        scale) entries, one per adapter with the strength already folded into
+        ``scale``; None or {} clears. The tensors are kept as handed in, on
+        whatever device they live. Any change drops every cached plan; handing
+        in the same tensors at the same scales leaves resident plans alone.
+        """
+        if self.path is not None:
+            raise ValueError(
+                "MiniMax H3 AdaLN sidecar plans are prebuilt offline and cannot "
+                "take LoRA deltas on adaln_proj; serve this adapter with "
+                "--minimax-h3-adaln-online"
+            )
+        deltas = {
+            prefix: list(entries)
+            for prefix, entries in (deltas or {}).items()
+            if entries
+        }
+        self.validate_lora_deltas(deltas)
+        if _same_lora_deltas(deltas, self._lora_deltas):
+            return
+        self._lora_deltas = deltas
+        if self._loaded:
+            self.invalidate()
+        if not deltas:
+            logger.info(
+                "MiniMax H3 AdaLN cache: LoRA deltas cleared; cached plans dropped"
+            )
+            return
+        lora_a, _, scale = next(iter(deltas.values()))[0]
+        logger.info(
+            "MiniMax H3 AdaLN cache: LoRA deltas on %d adaln_proj layers "
+            "(%d adapter(s), rank %d, scale %.4g); cached plans dropped",
+            len(deltas),
+            max(len(entries) for entries in deltas.values()),
+            lora_a.shape[0],
+            scale,
+        )
+
+    def validate_lora_deltas(
+        self, deltas: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]]
+    ) -> None:
+        """Raise the ValueError set_lora_deltas would raise, without storing anything."""
+        for prefix, entries in deltas.items():
+            self._validate_lora_delta_shapes(prefix, entries)
+
+    def _validate_lora_delta_shapes(
+        self, prefix: str, entries: list[tuple[torch.Tensor, torch.Tensor, float]]
+    ) -> None:
+        if prefix == "final_layer.adaln_proj.linear":
+            out_features = self.final_width
+        elif prefix in {
+            f"blocks.{layer}.adaln_proj.linear" for layer in range(self.num_layers)
+        }:
+            out_features = self.block_width
+        else:
+            raise ValueError(
+                f"MiniMax H3 AdaLN cache has no adaln_proj layer {prefix!r}"
+            )
+        for lora_a, lora_b, _ in entries:
+            if (
+                lora_a.ndim != 2
+                or lora_b.ndim != 2
+                or lora_a.shape[-1] != self.time_embed_dim
+                or lora_b.shape[0] != out_features
+                or lora_a.shape[0] != lora_b.shape[1]
+            ):
+                raise ValueError(
+                    f"MiniMax H3 AdaLN LoRA delta on {prefix!r} must be lora_A "
+                    f"[r, {self.time_embed_dim}] and lora_B [{out_features}, r], "
+                    f"got {tuple(lora_a.shape)} and {tuple(lora_b.shape)}"
+                )
+
+    def _lora_shards(
+        self,
+        prefix: str,
+        out_features: int,
+        *,
+        tp_size: int,
+        tp_rank: int,
+        device: torch.device,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, float], ...]:
+        """This rank's fp32 (A, B rows, scale) for one layer, sliced like read_shard."""
+        entries = self._lora_deltas.get(prefix)
+        if not entries:
+            return ()
+        if tp_size == 1:
+            rows = slice(None)
+        else:
+            shard = out_features // tp_size
+            rows = slice(tp_rank * shard, (tp_rank + 1) * shard)
+        return tuple(
+            (
+                lora_a.to(device=device, dtype=_FP32_DTYPE),
+                lora_b[rows].to(device=device, dtype=_FP32_DTYPE),
+                scale,
+            )
+            for lora_a, lora_b, scale in entries
+        )
+
+    @staticmethod
+    def _add_lora_terms(
+        adaln_input: torch.Tensor,
+        out: torch.Tensor,
+        shards: tuple[tuple[torch.Tensor, torch.Tensor, float], ...],
+    ) -> torch.Tensor:
+        if not shards:
+            return out
+        x = adaln_input.float()
+        acc = out.float()
+        for lora_a, lora_b, scale in shards:
+            acc = acc + ((x @ lora_a.T) @ lora_b.T) * scale
+        return acc.to(out.dtype)
+
     def _project_plans_from_checkpoint(
         self,
         slots: list[tuple[int, int, torch.Tensor]],
@@ -772,25 +927,41 @@ class MiniMaxH3AdalnCache(nn.Module):
                     tensor = tensor.float()
                 return tensor
 
-            def project(adaln_input: torch.Tensor, weight, bias) -> torch.Tensor:
+            def lora_shards(prefix: str, out_features: int):
+                return self._lora_shards(
+                    prefix,
+                    out_features,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    device=device,
+                )
+
+            def project(
+                adaln_input: torch.Tensor, weight, bias, shards
+            ) -> torch.Tensor:
                 out = nn.functional.linear(adaln_input, weight, bias)
+                out = self._add_lora_terms(adaln_input, out, shards)
                 return tensor_model_parallel_all_gather(out) if tp_size > 1 else out
 
             for layer in range(self.num_layers):
                 prefix = f"blocks.{layer}.adaln_proj.linear"
                 weight = read_shard(f"{prefix}.weight", self.block_width)
                 bias = read_shard(f"{prefix}.bias", self.block_width)
+                shards = lora_shards(prefix, self.block_width)
                 for slot, length, adaln_input in slots:
                     self.block_params[slot, :length, layer] = project(
-                        adaln_input, weight, bias
+                        adaln_input, weight, bias, shards
                     )
-                del weight, bias
+                del weight, bias, shards
             prefix = "final_layer.adaln_proj.linear"
             weight = read_shard(f"{prefix}.weight", self.final_width)
             bias = read_shard(f"{prefix}.bias", self.final_width)
+            shards = lora_shards(prefix, self.final_width)
             for slot, length, adaln_input in slots:
-                self.final_params[slot, :length] = project(adaln_input, weight, bias)
-            del weight, bias
+                self.final_params[slot, :length] = project(
+                    adaln_input, weight, bias, shards
+                )
+            del weight, bias, shards
 
     def resolve_slots(
         self,

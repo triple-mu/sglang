@@ -57,6 +57,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = init_logger(__name__)
 
+# set_lora target names that differ from the pipeline module holding them.
+_LORA_TARGET_MODULE_KEYS = {"critic": "fake_score_transformer"}
+
 
 def _swap_peft_swiglu_fc1_lora_b(
     source_name: str, target_name: str, weight: torch.Tensor
@@ -346,7 +349,6 @@ class LoRAPipeline(ComposedPipelineBase):
         target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]],
         merge_weights_by_module: dict[str, bool],
     ) -> bool:
-
         for module_name, lora_layers_dict in target_modules:
             if merge_weights_by_module[module_name]:
                 return True
@@ -1220,6 +1222,12 @@ class LoRAPipeline(ComposedPipelineBase):
                                 {"module": module_name, "paths": tgt_paths}
                             )
                     adapted_count += count
+                    adapted_count += self._apply_lora_extra_targets(
+                        module_name,
+                        tgt_nicknames,
+                        tgt_strengths,
+                        merge=effective_merge_weights,
+                    )
                     self.cur_adapter_name[module_name] = merged_name
                     self.cur_adapter_path[module_name] = ",".join(
                         str(p or self.loaded_adapter_paths.get(n, ""))
@@ -1252,6 +1260,56 @@ class LoRAPipeline(ComposedPipelineBase):
             ),
             merge_mode,
         )
+
+    def _apply_lora_extra_targets(
+        self,
+        module_name: str,
+        nicknames: list[str],
+        strengths: list[float],
+        *,
+        merge: bool,
+    ) -> int:
+        """Hand the active adapters to a DiT hosting LoRA targets outside its layers."""
+        module = self.modules.get(
+            _LORA_TARGET_MODULE_KEYS.get(module_name, module_name)
+        )
+        if not isinstance(module, BaseDiT):
+            return 0
+        return module.apply_lora_extra_targets(
+            [
+                (
+                    nickname,
+                    self.lora_adapters[nickname],
+                    strength,
+                    self.loaded_adapter_alphas.get(nickname),
+                )
+                for nickname, strength in zip(nicknames, strengths)
+            ],
+            merge=merge,
+        )
+
+    def _reapply_lora_extra_targets(
+        self, module_name: str, strength: float, *, merge: bool
+    ) -> None:
+        """Keep the extra targets at the strength merge_lora_weights just applied.
+
+        The wrapped layers keep their adapter tensors across unmerge and are
+        re-enabled from them, so the adapters come from the last set_lora
+        config when it is still recorded, else from the set adapter name.
+        """
+        nicknames = self._reactivated_adapter_nicknames(module_name)
+        self._apply_lora_extra_targets(
+            module_name, nicknames, [strength] * len(nicknames), merge=merge
+        )
+
+    def _reactivated_adapter_nicknames(self, module_name: str) -> list[str]:
+        config = self.cur_adapter_config.get(module_name)
+        if config is not None:
+            return list(config[0])
+        merged_name = self.cur_adapter_name.get(module_name)
+        if not merged_name:
+            return []
+        return [n for n in merged_name.split(",") if n in self.lora_adapters]
 
     def _merge_via_cache(self, name, layer, merge_cache) -> None:
         """Merge one layer through the cache instead of in place.
@@ -1337,6 +1395,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         layer.unmerge_lora_weights()
                     if not layer.disable_lora:
                         layer.disable_lora = True
+                self._apply_lora_extra_targets(module_name, [], [], merge=False)
                 self.is_lora_merged[module_name] = False
                 self.cur_adapter_strength.pop(module_name, None)
                 self.cur_adapter_config.pop(module_name, None)
@@ -1372,6 +1431,7 @@ class LoRAPipeline(ComposedPipelineBase):
                             layer.unmerge_lora_weights()
                         layer.disable_lora = False
                         layer.strength = strength
+                    self._reapply_lora_extra_targets(module_name, strength, merge=False)
                     self.is_lora_merged[module_name] = False
                     self.cur_adapter_strength[module_name] = strength
                     logger.info(
@@ -1404,6 +1464,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     except Exception as e:
                         logger.warning("Could not merge layer %s: %s", name, e)
                         continue
+                self._reapply_lora_extra_targets(module_name, strength, merge=True)
                 self.is_lora_merged[module_name] = True
                 self.cur_adapter_strength[module_name] = strength
                 logger.info(
@@ -1441,6 +1502,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     for layer in lora_layers_dict.values():
                         if not layer.disable_lora:
                             layer.disable_lora = True
+                    self._apply_lora_extra_targets(module_name, [], [], merge=False)
                     self.cur_adapter_strength.pop(module_name, None)
                     self.cur_adapter_config.pop(module_name, None)
                     logger.info("Unmerged LoRA weights deactivated for %s", module_name)
@@ -1469,6 +1531,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         if hasattr(layer, "disable_lora"):
                             layer.disable_lora = True
                         continue
+                self._apply_lora_extra_targets(module_name, [], [], merge=False)
                 self.is_lora_merged[module_name] = False
                 self.cur_adapter_strength.pop(module_name, None)
                 self.cur_adapter_config.pop(module_name, None)
