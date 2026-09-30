@@ -33,12 +33,15 @@ tree; each has its own enum value and resolver and is selected per run by flag.
 
 The predictor was distilled against the Turbo LoRA 8-step trajectory, so serve it with that adapter, 9
 scheduler steps (8 forwards), no CFG, and one of the 12 geometries the bundle has plans for. The Turbo
-LoRA carries AdaLN deltas, which `--minimax-h3-adaln-online` cannot apply, hence tp2 x ul4 instead of
-the tp1 x ul8 recipes.
+LoRA carries `adaln_proj` deltas; `--minimax-h3-adaln-online` folds them into its per-request rebuild
+(fp32 low-rank term added before the bf16 store, so the plans match a merged-weight run up to bf16
+rounding), which is what lets the BF16 DiT run at tp1 x ul8 like the other recipes. Without the online
+cache the 24.2 GiB of resident `adaln_proj` weights only fit at tp2 x ul4.
 
 ```bash
 sglang serve --model-path /workspace/models/MiniMax-H3 --model-variant fl2va \
-  --num-gpus 8 --tp-size 2 --ulysses-degree 4 --ring-degree 1 \
+  --num-gpus 8 --tp-size 1 --ulysses-degree 8 --ring-degree 1 \
+  --minimax-h3-adaln-online true --minimax-h3-adaln-plan-width 3 \
   --lora-path /workspace/models/MiniMax-H3-Turbo-Lora \
   --lora-weight-name minimax_h3_turbo_v4_step600_ema.safetensors --lora-scale 1.0 --lora-merge-mode auto \
   --component-attention-backends transformer=veda_attn \

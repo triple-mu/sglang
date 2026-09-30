@@ -128,6 +128,22 @@ class BaseDiT(nn.Module, ABC):
         """
         return None
 
+    def apply_lora_extra_targets(
+        self,
+        adapters: list[tuple[str, dict[str, torch.Tensor], float, int | None]],
+        *,
+        merge: bool,
+    ) -> int:
+        """Apply LoRA tensors that target no wrapped layer of this model.
+
+        ``adapters`` lists (nickname, adapter tensors, strength, adapter-level
+        alpha or None) for the active adapters in application order; an empty
+        list means none is active. Returns the number of extra targets covered.
+        Default no-op; models that derive served values from pruned layers
+        override this.
+        """
+        return 0
+
     def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
         """Invalidate caches derived from weights after a weight update.
 

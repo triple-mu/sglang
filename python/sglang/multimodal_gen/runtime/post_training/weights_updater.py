@@ -782,6 +782,11 @@ class WeightsUpdater:
                 f"{f', e.g. {sample}' if sample else ''}); "
                 "check training-side layer name mapping",
             )
+        if isinstance(dit_module, BaseDiT):
+            # The payload replaced every wrapped layer's adapter; targets outside
+            # the layers (validate_lora_layers rejected them above) must not
+            # keep a --lora-path adapter's deltas alive.
+            dit_module.apply_lora_extra_targets([], merge=merge_weights)
 
         message = (
             f"Updated {updated} LoRA layers in {target_module} from IPC tensors "

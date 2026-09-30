@@ -1911,22 +1911,77 @@ class MiniMaxH3FinalLayer(nn.Module):
         return self._project(h)
 
 
-def _reject_adaln_lora(names: list[str]) -> None:
-    """Reject LoRA names touching adaln_proj; callers gate on cache mode.
+def _adaln_lora_names(names: Iterable[str]) -> list[str]:
+    return sorted(name for name in names if "adaln_proj" in name)
 
-    Cache modes prune the adaln_proj modules, so these deltas have nothing to
-    attach to: they would be dropped without a trace while the rebuild keeps
-    reading base weights from the checkpoint.
-    """
-    adaln_names = sorted(name for name in names if "adaln_proj" in name)
+
+def _reject_adaln_lora_for_sidecar(names: Iterable[str]) -> None:
+    """A sidecar's plans are built offline; adaln_proj deltas cannot reach them."""
+    adaln_names = _adaln_lora_names(names)
     if not adaln_names:
         return
     raise ValueError(
-        "MiniMax H3 AdaLN cache modes (--minimax-h3-adaln-online / "
-        "--minimax-h3-adaln-cache-path) cannot apply LoRA deltas on "
-        f"adaln_proj ({len(adaln_names)} name(s), e.g. {adaln_names[0]!r}); "
-        "serve this adapter with resident AdaLN weights"
+        "MiniMax H3 prebuilt AdaLN sidecar (--minimax-h3-adaln-cache-path) "
+        "cannot apply LoRA deltas on adaln_proj "
+        f"({len(adaln_names)} name(s), e.g. {adaln_names[0]!r}); serve this "
+        "adapter with --minimax-h3-adaln-online or resident AdaLN weights"
     )
+
+
+def _reject_adaln_lora_over_ipc(names: Iterable[str]) -> None:
+    """The LoRA IPC path only writes resident layers; cache modes prune adaln_proj."""
+    adaln_names = _adaln_lora_names(names)
+    if not adaln_names:
+        return
+    raise ValueError(
+        "MiniMax H3 AdaLN cache modes prune the adaln_proj modules and the "
+        "LoRA IPC path does not reach the AdaLN cache "
+        f"({len(adaln_names)} name(s), e.g. {adaln_names[0]!r}); load this "
+        "adapter with --lora-path, which folds adaln_proj deltas into the "
+        "--minimax-h3-adaln-online rebuild"
+    )
+
+
+def _adaln_lora_pairs(
+    adapter: dict[str, torch.Tensor],
+) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+    """(prefix, lora_A, lora_B) for every adaln_proj module the adapter covers."""
+    pairs = []
+    for a_key in sorted(adapter):
+        if not a_key.endswith(".lora_A") or "adaln_proj" not in a_key:
+            continue
+        prefix = a_key[: -len(".lora_A")]
+        b_key = f"{prefix}.lora_B"
+        if b_key not in adapter:
+            raise ValueError(f"MiniMax H3 AdaLN LoRA is missing {b_key!r}.")
+        if f"{prefix}.lora_output_offset" in adapter:
+            raise ValueError(
+                "MiniMax H3 pruned-AdaLN LoRA (projected onto a curve "
+                "checkpoint) is not supported by the online AdaLN cache; serve "
+                f"it with resident AdaLN weights ({prefix!r})"
+            )
+        pairs.append((prefix, adapter[a_key], adapter[b_key]))
+    return pairs
+
+
+def _lora_scale(
+    adapter: dict[str, torch.Tensor],
+    prefix: str,
+    lora_a: torch.Tensor,
+    *,
+    strength: float,
+    adapter_alpha: int | None,
+) -> float:
+    """The same alpha/rank resolution BaseLayerWithLoRA applies to wrapped layers."""
+    rank = int(lora_a.shape[-2])
+    alpha_key = f"{prefix}.alpha"
+    if alpha_key in adapter:
+        alpha = int(adapter[alpha_key].item())
+    elif adapter_alpha is not None:
+        alpha = adapter_alpha
+    else:
+        alpha = rank
+    return strength * (alpha / rank) if alpha != rank else strength
 
 
 def _adaln_incompatible_quantization(quant_config: QuantizationConfig | None) -> bool:
@@ -1976,10 +2031,18 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     def prepare_lora_adapter(
         self, adapter: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        """Project released-checkpoint AdaLN LoRAs onto pruned coordinates.
+
+        The online AdaLN cache leaves adaln_proj keys in place for
+        apply_lora_extra_targets and validates them here, before any wrapped
+        layer is touched; only a prebuilt sidecar rejects them.
+        """
         _reject_non_lora_delta_tensors(adapter)
         if self._adaln_precomputed:
-            _reject_adaln_lora(list(adapter))
+            if self.adaln_cache.weight_files is None:
+                _reject_adaln_lora_for_sidecar(adapter)
+            else:
+                self._validate_online_adaln_lora(adapter)
         full_width = self.arch.adaln_affine_input_dim
         if full_width is None:
             return adapter
@@ -2035,6 +2098,29 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         )
         return projected
 
+    def _validate_online_adaln_lora(self, adapter: dict[str, torch.Tensor]) -> None:
+        """Raise at load time whatever the online AdaLN cache would reject later.
+
+        The pipeline calls apply_lora_extra_targets after the wrapped layers are
+        already merged, so every rejection has to surface here instead.
+        """
+        pairs = _adaln_lora_pairs(adapter)
+        if not pairs:
+            return
+        full_width = self.arch.adaln_affine_input_dim
+        if full_width is not None and any(
+            lora_a.shape[-1] == full_width for _, lora_a, _ in pairs
+        ):
+            raise ValueError(
+                "MiniMax H3 released-checkpoint AdaLN LoRA (adaln_proj inputs "
+                f"{full_width} wide) would be projected onto pruned coordinates, "
+                "which the online AdaLN cache does not support; serve it with "
+                "resident AdaLN weights"
+            )
+        self.adaln_cache.validate_lora_deltas(
+            {prefix: [(lora_a, lora_b, 1.0)] for prefix, lora_a, lora_b in pairs}
+        )
+
     def prepare_adaln_plans(
         self, step_timesteps: list[torch.Tensor]
     ) -> torch.Tensor | None:
@@ -2045,7 +2131,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         match timesteps on device. A prebuilt sidecar only resolves slots; the
         rebuild path needs the model's own timestep embedding so a filled plan
         is bit-identical to what resident adaln_proj weights would have
-        produced.
+        produced (without LoRA deltas; with them, equal up to the bf16
+        rounding of the merged weight the resident merge path incurs).
         """
         cache = self.adaln_cache
         if cache is None:
@@ -2068,7 +2155,38 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
 
     def validate_lora_layers(self, layer_names: list[str]) -> None:
         if self._adaln_precomputed:
-            _reject_adaln_lora(layer_names)
+            _reject_adaln_lora_over_ipc(layer_names)
+
+    def apply_lora_extra_targets(
+        self,
+        adapters: list[tuple[str, dict[str, torch.Tensor], float, int | None]],
+        *,
+        merge: bool,
+    ) -> int:
+        """Fold adaln_proj LoRA deltas into the online AdaLN cache.
+
+        Cache modes prune adaln_proj, so no wrapped layer receives those keys;
+        LoraPipeline hands every active adapter here after the layer pass. The
+        cache applies the deltas at rebuild time in both merge modes, so
+        ``merge`` carries no behaviour here. Returns the number of adaln_proj
+        layers covered; an empty adapter list clears the deltas.
+        """
+        cache = self.adaln_cache
+        if cache is None or cache.weight_files is None:
+            return 0
+        deltas: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+        for _, adapter, strength, adapter_alpha in adapters:
+            for prefix, lora_a, lora_b in _adaln_lora_pairs(adapter):
+                scale = _lora_scale(
+                    adapter,
+                    prefix,
+                    lora_a,
+                    strength=strength,
+                    adapter_alpha=adapter_alpha,
+                )
+                deltas.setdefault(prefix, []).append((lora_a, lora_b, scale))
+        cache.set_lora_deltas(deltas)
+        return len(deltas)
 
     def validate_weight_update_source(self, *, weights_path: str | None) -> None:
         """Reject a weight update the AdaLN cache cannot follow.
