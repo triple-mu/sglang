@@ -406,9 +406,10 @@ only.
 `--minimax-h3-adaln-online true` needs no prebuilt artifact: the server drops
 the 24.2 GiB of `adaln_proj` weights from the GPU and computes each request's
 AdaLN outputs from the checkpoint on demand, bit-exact with the resident-weight
-path. Because a rebuild pass streams the whole 24.2 GiB, the first request of
-every new `(task shape, num_inference_steps, flow_shift, audio_flow_shift)`
-combination pays several seconds; after that the plans are served from a
+path when no LoRA touches `adaln_proj`. Because a rebuild pass streams the
+whole 24.2 GiB, the first request of every new
+`(task shape, num_inference_steps, flow_shift, audio_flow_shift)` combination
+pays several seconds; after that the plans are served from a
 64-slot GPU slab (LRU per plan) backed by a pinned host cache
 (`--minimax-h3-adaln-host-cache-gb`, LRU per schedule, default 8 GB per
 rank), so mixed-schedule serving does not re-read the checkpoint. Plan sets
@@ -417,9 +418,12 @@ Expert escape hatches live in environment variables:
 `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS` resizes the GPU slab (needed
 only beyond 65 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
 computes the one-time projections in fp32 (experimental; not bit-comparable
-to resident weights, validate end-to-end before production). LoRA adapters
-that modify `adaln_proj` are rejected in both cache modes rather than
-silently ignored.
+to resident weights, validate end-to-end before production). A `--lora-path`
+adapter that modifies `adaln_proj` (the Turbo LoRA does) is folded into the
+online rebuild: each projection adds the fp32 low-rank term before the bf16
+store, which matches a merged-weight run up to bf16 rounding of the merged
+weight. The prebuilt sidecar still rejects such adapters, and so does the LoRA
+IPC update path in both cache modes, rather than silently ignoring them.
 
 Both cache modes hold values derived from `adaln_proj`, so a runtime weight
 update is only accepted when the cache can follow it: online mode takes a disk
