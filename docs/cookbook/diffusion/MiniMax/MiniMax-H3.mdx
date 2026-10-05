@@ -598,6 +598,11 @@ sglang serve \
 ```
 
 Requests then add `"quality": "extra-high"` for the FP8 video VAE fast path.
+Swapping `--component-quantizations.video_vae fp8` for `nvfp4` keeps the same
+deployment gates and takes the decode from 1.16 s to 0.97 s on this host (last
+table row below); it adds one more lossy step in the VAE only, 40.3 dB (worst
+frame 39.5 dB) against the FP8 decoder's output, and the FP8 row's byte-exact
+reproduction after the rebase onto `main` shows the DiT stack is unchanged.
 `--warmup-steps` equal to the serving step count lets the online AdaLN rebuild
 prepare the serving plans during warmup; a shorter warmup pushes a 4 s rebuild
 into the first request. Transport overrides: `SGLANG_DIFFUSION_RDMA_ULYSSES_NICS`
@@ -636,6 +641,7 @@ attention for the first ten steps and route with sparsity 0.75 afterwards:
 | PDD 8-step, sparse Sage + RDMA + fusions, Cache-DiT caching steps 4 and 6 (default dynamic settings or the static mask below), lossless VAE | 9 | 8.10 | 841 | 2.25x over the anchor | 20.2 / 18.6 against the PDD anchor, 32.0 / 29.8 against the uncached row |
 | same with Cache-DiT and the FP8 video VAE in one request (`extra-high` plus `enable_cache_dit: true`) | 9 | 7.22 | 812 | 2.53x over the anchor | denoise 5.96 s, decode 1.16 s |
 | same plus fp8 rows out of the fused norms and an fp8 attention-output gather (default) | 9 | 6.98 | 772 | 2.61x over the anchor | 21.1 / 19.8 against the PDD anchor |
+| same with the video VAE decoder's FFN in NVFP4 (`--component-quantizations.video_vae nvfp4`); anchor and this row re-measured on the branch rebased onto main `57826a62ea`, medians of three interleaved runs | 9 | 6.79 | 773 | 2.67x over the same-day anchor (18.11 s) | 21.0 / 19.7 against the PDD anchor, 40.3 / 39.5 against the FP8-VAE row; decode 1.16 s to 0.97 s |
 
 The fl2va task moves the same way: 126.6 s to 61.0 s end to end (2434 to
 1017 ms per step) at 25.6 dB (worst frame 22.6 dB) against the dense run.
@@ -675,8 +681,9 @@ SGLANG_CACHE_DIT_WARMUP=0 SGLANG_CACHE_DIT_FN=1 SGLANG_CACHE_DIT_BN=0
 ```
 
 Runs and logs behind these numbers live under
-`h3-experiments/minimax-h3-sm120-all/2026-09-26/` in the maintainer's
-experiment tree.
+`h3-experiments/minimax-h3-sm120-all/2026-09-26/` and, for the rebased
+anchor and NVFP4 rows, `exps/model/2026-10-05-minimax-h3-all-opt-sm120/` in
+the maintainer's experiment tree.
 
 ### Serve MiniMax-H3 on Ascend NPUs
 
