@@ -67,6 +67,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_FUSED_NORM_QUANT: bool = True
     SGLANG_DIFFUSION_MINIMAX_H3_FP8_GATHER: bool = True
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND: str = "cudnn"
+    SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_LAYERS: str = ""
+    SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_FROM_STEP: int = 0
+    SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_BACKEND: str = "cutlass"
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -407,6 +410,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # flashinfer.mm_fp4 backend of the online NVFP4 FFN linears: cudnn | cutlass.
     "SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND", "cudnn"
+    ),
+    # Experiment: W4A4 NVFP4 overlay on the MiniMax-H3 DiT linears loaded through
+    # online FP8 ("--quantization fp8"). "" keeps FP8; "mlp" = fc1/fc2; "all" adds
+    # qkv_proj/out_proj. Weights get an NVFP4 copy at load, activations are
+    # quantised per call with their own amax, the GEMM is flashinfer.mm_fp4.
+    "SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_LAYERS": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_LAYERS", ""
+    ),
+    # Denoise steps below this index keep the FP8 GEMMs (0 = NVFP4 on every step).
+    "SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_FROM_STEP": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_FROM_STEP", 0
+    ),
+    # flashinfer.mm_fp4 backend of the DiT overlay: cutlass | cudnn.
+    "SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_BACKEND", "cutlass"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

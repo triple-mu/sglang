@@ -2813,6 +2813,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             )
         if self.adaln_cache is not None:
             self.adaln_cache.load(self.video_patch_proj.weight.device)
+        # Experiment surface: W4A4 NVFP4 copies of selected linears (env-gated, no-op by default).
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3_nvfp4 import (
+            install_minimax_h3_dit_nvfp4,
+        )
+
+        install_minimax_h3_dit_nvfp4(self)
 
     def _time_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
         if self.adaln_t_table is None:
