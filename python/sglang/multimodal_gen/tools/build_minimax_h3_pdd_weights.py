@@ -37,6 +37,19 @@ def _interleave_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
     ).reshape(-1, in_dim)
 
 
+def _native_delta(target: str, delta: torch.Tensor) -> torch.Tensor:
+    """Reorder a Diffusers-layout delta to the native layout of ``target``.
+
+    Diffusers' SwiGLU ``ff.net.0.proj`` stores its output as [value, gate]; the
+    native fused ``mlp.fc1`` consumes [gate, value] (see ``_diffusers_h3_checkpoint``
+    in the model loader), so the two output halves swap. Everything else maps 1:1.
+    """
+    if target.endswith(".mlp.fc1"):
+        value, gate = delta.chunk(2, dim=0)
+        return torch.cat((gate, value), dim=0)
+    return delta
+
+
 def _target_of(lora_key: str) -> str | None:
     """LoRA module name -> official weight name. None means "not handled here"."""
     k = lora_key
@@ -104,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
                 qkv.setdefault(target[: -len(f".attn.{role}")], {})[role[-1]] = delta
                 break
         else:
-            deltas[target + ".weight"] = delta
+            deltas[target + ".weight"] = _native_delta(target, delta)
 
     for prefix, parts in qkv.items():
         if set(parts) != {"q", "k", "v"}:

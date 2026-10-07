@@ -12,7 +12,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -121,6 +121,11 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_hyperflow import (
+        MiniMaxH3HyperFlowConfig,
+    )
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 
@@ -232,6 +237,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_position_ids",
         "rope_cache",
         "unique_timesteps",
+        "unique_endpoints",
         "adaln_cache_slot",
         "inverse_indices",
         "update_mask",
@@ -2139,7 +2145,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         )
 
     def prepare_adaln_plans(
-        self, step_timesteps: list[torch.Tensor]
+        self,
+        step_timesteps: list[torch.Tensor],
+        step_endpoints: list[torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """Fill the AdaLN cache for this request before denoising starts.
 
@@ -2157,10 +2165,21 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         # Keying costs one D2H sync per plan; compute the keys once and share
         # them between build and resolve.
         keys = [_adaln_plan_key(timesteps) for timesteps in step_timesteps]
+        if self.hyperflow is not None and step_endpoints is None:
+            raise ValueError("MiniMax-H3 HyperFlow AdaLN plans need the step endpoints")
+        # HyperFlow: the plan key is the step's timestep vector, which a fixed grid
+        # makes distinct per step; the endpoints ride along by key.
+        endpoints_by_key = (
+            {} if step_endpoints is None else dict(zip(keys, step_endpoints))
+        )
         if cache.weight_files is not None:
 
             def embed(timesteps: torch.Tensor) -> torch.Tensor:
-                out = nn.functional.silu(self.time_embedder(timesteps))
+                out = nn.functional.silu(
+                    self._time_embedding(
+                        timesteps, endpoints_by_key.get(_adaln_plan_key(timesteps))
+                    )
+                )
                 # 'match' replicates forward's bf16 cast bit-exactly; 'fp32'
                 # keeps the embedding in fp32 for the one-time projection.
                 if cache.precision == "match":
@@ -2579,6 +2598,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             quant_config=quant_config,
             prefix="condition_proj",
         )
+        # HyperFlow (install_minimax_h3_hyperflow) fills these after the weights load.
+        self.hyperflow: MiniMaxH3HyperFlowConfig | None = None
+        self.hyperflow_endpoint_embedder: MiniMaxH3TimeEmbedder | None = None
         if arch.adaln_curve_grid is None:
             self.time_embedder = MiniMaxH3TimeEmbedder(
                 arch,
@@ -2836,11 +2858,31 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         )
 
         install_minimax_h3_dit_nvfp4(self)
+        # HyperFlow 8-step sampler: endpoint time embedder + sigma grid (env-gated, no-op by default).
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3_hyperflow import (
+            install_minimax_h3_hyperflow,
+        )
 
-    def _time_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
+        install_minimax_h3_hyperflow(self)
+
+    def _time_embedding(
+        self, timesteps: torch.Tensor, endpoints: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if self.adaln_t_table is None:
             assert self.time_embedder is not None
-            return self.time_embedder(timesteps)
+            t_emb = self.time_embedder(timesteps)
+            hyperflow = self.hyperflow
+            if hyperflow is None:
+                return t_emb
+            # HyperFlow two-time conditioning: the interval (t, r) instead of the
+            # point t, blended with the gate stored in the weights file.
+            if endpoints is None:
+                raise ValueError(
+                    "MiniMax-H3 HyperFlow needs the step endpoints but the forward "
+                    "received no unique_endpoints"
+                )
+            r_emb = self.hyperflow_endpoint_embedder(endpoints)
+            return t_emb + hyperflow.gate * (r_emb - t_emb)
 
         grid = self.adaln_t_table.shape[0]
         position = timesteps.to(_FP32_DTYPE).clamp(0, 1) * (grid - 1)
@@ -2975,6 +3017,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         device: torch.device,
         refined_prompt_embeds_length: int | torch.Tensor | None = None,
         local_embedding_layout: dict[str, torch.Tensor | int] | None = None,
+        unique_endpoints: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build embeddings for one contiguous block-stack row shard.
 
@@ -3105,7 +3148,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 audio_embed.to(_BF16_DTYPE),
             )
 
-        t_emb = self._time_embedding(unique_timesteps)
+        t_emb = self._time_embedding(unique_timesteps, unique_endpoints)
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3129,6 +3172,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         audio_x = _required_kwarg(kwargs, "audio_x")
         img_position_ids = _required_kwarg(kwargs, "img_position_ids")
         unique_timesteps = _required_kwarg(kwargs, "unique_timesteps")
+        unique_endpoints = kwargs.get("unique_endpoints")
         inverse_indices = (
             _required_kwarg(kwargs, "inverse_indices").view(-1).to(torch.long)
         )
@@ -3269,6 +3313,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             device=device,
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
+            unique_endpoints=(
+                None
+                if unique_endpoints is None
+                else unique_endpoints.view(-1).to(device)
+            ),
         )
         self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         # request-step AdaLN input shared by all blocks

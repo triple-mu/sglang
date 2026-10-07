@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
+    SGLANG_DIFFUSION_MINIMAX_H3_HYPERFLOW: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_DISABLE_MINIMAX_H3_VAE_FAST_PATH: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_VAE_ENCODER_TILE_BATCH: int = 8
@@ -443,6 +444,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PDD-distilled checkpoint; an ordinary run leaves the projection alone.
     "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
         "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
+    ),
+    # Directory written by build_minimax_h3_hyperflow_weights.py (hyperflow_config.json +
+    # hyperflow_endpoint_embedder.safetensors): the fixed 9-point sigma grid and the two-time
+    # (t, r) embedding of Video Rebirth's HyperFlow 8-step LoRA. Mutually exclusive with PDD heads.
+    "SGLANG_DIFFUSION_MINIMAX_H3_HYPERFLOW": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_HYPERFLOW"
     ),
     # NATTEN backend of the FLUX 3 video VAE (blackwell-fna, hopper-fna,
     # cutlass-fna or flex-fna); probed per GPU when unset.

@@ -38,6 +38,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         self.sigma_shift_scales = sigma_shift_scales
         self.dmd_denoising_steps = dmd_denoising_steps
         self._pdd_config = None
+        self._hyperflow_config = None
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
             from safetensors import safe_open
@@ -63,6 +64,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             )
         self._generate_sigmas_from_plan(batch, plan)
         self._apply_pdd_schedule(batch)
+        self._apply_hyperflow_schedule(batch)
         self._publish_native_timestep_state(batch)
         return batch
 
@@ -116,6 +118,34 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                     f"{config['num_inference_steps']} and {modality} shift="
                     f"{config[f'{modality}_shift']} to match the fused heads"
                 )
+
+    def _apply_hyperflow_schedule(self, batch: Req) -> None:
+        """HyperFlow: the fixed raw sigma grid from the weights file, shifted per modality."""
+        path = envs.SGLANG_DIFFUSION_MINIMAX_H3_HYPERFLOW
+        if not path:
+            return
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3_hyperflow import (
+            hyperflow_shift_sigmas,
+            load_minimax_h3_hyperflow_config,
+        )
+
+        if self._hyperflow_config is None:
+            self._hyperflow_config = load_minimax_h3_hyperflow_config(path)
+        config = self._hyperflow_config
+        sigmas = batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
+        for modality, shift in (("video", config.video_shift), ("audio", config.audio_shift)):
+            expected = hyperflow_shift_sigmas(config.sigmas, shift)
+            if batch.is_warmup:
+                # Warmup may run fewer steps, but must use the same grid prefix as
+                # serving rather than rescaling a shorter grid to [1, 0].
+                sigmas[modality] = expected[: max(2, batch.num_inference_steps)]
+                continue
+            if batch.num_inference_steps != len(expected):
+                raise ValueError(
+                    f"MiniMax-H3 HyperFlow runs a fixed {len(expected) - 1}-step grid; "
+                    f"use --num-inference-steps {len(expected)} (H3 counts sigma grid points)"
+                )
+            sigmas[modality] = expected
 
     @staticmethod
     def _publish_native_timestep_state(batch: Req) -> None:
