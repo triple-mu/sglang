@@ -1744,10 +1744,10 @@ def test_minimax_h3_paired_qk_engages_and_matches_eager_chain(dtype):
     # The decoder's own rotary tables: 48 rotary dims of 64, 3-D coordinates.
     pos_embed = RotaryEmbeddingND(48, 100.0, n_dim=3, use_angle=True).cuda()
     ids = create_token_ids((frames, height, width), "cuda", dtype).expand(batch, -1, -1)
-    rope = prepare_rotary_pos_emb(
-        pos_embed(ids), dtype=dtype, allow_batched_native=True
-    )
-    assert len(rope) == 4 and rope[2].shape == (batch * tokens, 48)
+    # Stacked tiles share one rotary table; positions cover every (tile, token) row.
+    rope = prepare_rotary_pos_emb(pos_embed(ids[:1]), dtype=dtype, batch=batch)
+    assert len(rope) == 4 and rope[2].shape == (tokens, 48)
+    assert rope[3].shape == (batch * tokens,)
 
     # Gate off: the eager path stays in charge and nothing is counted.
     assert attention._paired_qk(qkv, rope) is None

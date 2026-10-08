@@ -153,18 +153,25 @@ def _attn_fast_compatible(attn: nn.Module) -> bool:
     )
 
 
-def _install_fast_attention(decoder: nn.Module, gate: VaeFastPathGate) -> int:
-    """Bind the fused QK norm+RoPE / cuDNN forward on every decoder attention block.
+def _install_fast_attention(
+    attn_modules: list[nn.Module], gate: VaeFastPathGate
+) -> None:
+    for attn in attn_modules:
+        attn._sgl_gate = gate
+        attn._sgl_unit_weight = None
+        attn._sgl_cudnn_failed = False
+        attn.forward = MethodType(_attn_fast_forward, attn)
 
-    Returns the number of blocks rebound; 0 when any block is non-standard or the
-    fp32 QK norm is disabled, because a partial install would change numerics
-    between blocks.
-    """
+
+def _fast_attention_modules(decoder: nn.Module) -> list[nn.Module]:
+    """The decoder attention blocks to rebind; empty when any block is
+    non-standard or the fp32 QK norm is disabled, since a partial install would
+    change numerics between blocks."""
     if type(decoder) is not ViT3DDecoder:
-        return 0
+        return []
     if not _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
         logger.info("MiniMax-H3 VAE: fp32 QK norm disabled; skipping attention fast path.")
-        return 0
+        return []
     attn_modules = [block.attn for block in decoder.transformer_blocks]
     eligible = [attn for attn in attn_modules if _attn_fast_compatible(attn)]
     if len(eligible) != len(attn_modules):
@@ -174,13 +181,8 @@ def _install_fast_attention(decoder: nn.Module, gate: VaeFastPathGate) -> int:
             len(attn_modules) - len(eligible),
             len(attn_modules),
         )
-        return 0
-    for attn in eligible:
-        attn._sgl_gate = gate
-        attn._sgl_unit_weight = None
-        attn._sgl_cudnn_failed = False
-        attn.forward = MethodType(_attn_fast_forward, attn)
-    return len(eligible)
+        return []
+    return eligible
 
 
 def _install_fast_path_slots(
@@ -244,15 +246,16 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
     if not isinstance(vae, MiniMaxH3VideoVAE):
         return vae
     gate = VaeFastPathGate()
-    attention_blocks = _install_fast_attention(vae.decoder, gate)
+    attention_modules = _fast_attention_modules(vae.decoder)
+    _install_fast_attention(attention_modules, gate)
     jit_installed = _install_jit_fast_path(vae, gate)
-    if attention_blocks == 0 and not jit_installed:
+    if not attention_modules and not jit_installed:
         return vae
     register_vae_fast_path_gate(vae, gate)
-    if attention_blocks:
+    if attention_modules:
         logger.info(
             "MiniMax-H3 VAE: installed quality-gated attention fast path (%d QK "
             "RMSNorm+RoPE fusions, cuDNN SDPA).",
-            attention_blocks,
+            len(attention_modules),
         )
     return vae

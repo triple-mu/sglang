@@ -146,8 +146,9 @@ def test_two_real_decoder_blocks(backend, stub_server_args, record_property):
     state = _mount_fast_path(decoder)
     value = torch.randn(2, 65, 2048, device="cuda")
     token_ids = torch.randn(2, 65, 3, device="cuda")
+    # Stacked tiles share one rotary table; positions cover both batch rows.
     rope = prepare_rotary_pos_emb(
-        decoder.pos_embed(token_ids), dtype=torch.float16, allow_batched_native=True
+        decoder.pos_embed(token_ids[:1]), dtype=torch.float16, batch=2
     )
 
     with set_forward_context(0, None), torch.autocast("cuda", dtype=torch.float16):
@@ -216,8 +217,9 @@ def test_two_real_decoder_blocks_nvfp4_ffn(stub_server_args, record_property):
     state = _mount_fast_path(decoder)
     value = torch.randn(2, 65, 2048, device="cuda")
     token_ids = torch.randn(2, 65, 3, device="cuda")
+    # Stacked tiles share one rotary table; positions cover both batch rows.
     rope = prepare_rotary_pos_emb(
-        decoder.pos_embed(token_ids), dtype=torch.float16, allow_batched_native=True
+        decoder.pos_embed(token_ids[:1]), dtype=torch.float16, batch=2
     )
 
     def eager(model):
