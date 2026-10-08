@@ -511,7 +511,7 @@ scale, fp16 outputs through `flashinfer.mm_fp4`
 (`SGLANG_DIFFUSION_MINIMAX_H3_VAE_NVFP4_BACKEND`, `cudnn` or `cutlass`). The
 activation scales are calibrated on the first decode after load, which runs
 the eager decoder blocks and is slower than the following decodes;
-`"extra-high"` and `"high"` requests after that run fused producers that
+`"lossless"` and `"high"` requests after that run fused producers that
 quantize the residual RMSNorm and the SiLU-gated activation straight to NVFP4
 and fold the FFN biases in (the FP4 GEMM has no bias epilogue). The
 deployment gates are those of the FP8 decoder. NVFP4 is coarser than FP8;
@@ -596,7 +596,7 @@ sglang serve \
   --port 30010
 ```
 
-Requests then add `"quality": "extra-high"` for the FP8 video VAE fast path.
+The default `"quality": "lossless"` mounts the FP8 video VAE fast path.
 Swapping `--component-quantizations.video_vae fp8` for `nvfp4` keeps the same
 deployment gates and takes the decode from 1.16 s to 0.97 s on this host (last
 table row below); it adds one more lossy step in the VAE only, 40.3 dB (worst
@@ -634,11 +634,11 @@ attention for the first ten steps and route with sparsity 0.75 afterwards:
 | `subblock_sparse_sage_sm120`, quantised exchange, NCCL | 50 | 58.7 | 931 | 2.21x | 22.7 / 22.1 |
 | same over `--minimax-h3-ulysses-transport rdma` | 50 | 52.3 | 863 | 2.38x | bit-identical to the NCCL row |
 | same plus the fused adaLN chain and fused SwiGLU quantisation (default) | 50 | 51.5 | 846 | 2.43x | bit-identical to the RDMA row |
-| PDD 8-step, dense `torch_sdpa`, NCCL, lossless VAE | 9 | 18.25 | 2015 | | PDD anchor |
-| PDD 8-step, sparse Sage from step 2 + RDMA + fusions, lossless VAE | 9 | 9.73 | 838 | 1.88x over the anchor | 20.2 / 18.7 against the PDD anchor |
-| same plus the FP8 video VAE (`extra-high`) | 9 | 8.87 | 840 | 2.06x over the anchor | decode 2.01 s to 1.14 s |
-| PDD 8-step, sparse Sage + RDMA + fusions, Cache-DiT caching steps 4 and 6 (default dynamic settings or the static mask below), lossless VAE | 9 | 8.10 | 841 | 2.25x over the anchor | 20.2 / 18.6 against the PDD anchor, 32.0 / 29.8 against the uncached row |
-| same with Cache-DiT and the FP8 video VAE in one request (`extra-high` plus `enable_cache_dit: true`) | 9 | 7.22 | 812 | 2.53x over the anchor | denoise 5.96 s, decode 1.16 s |
+| PDD 8-step, dense `torch_sdpa`, NCCL, exact VAE | 9 | 18.25 | 2015 | | PDD anchor |
+| PDD 8-step, sparse Sage from step 2 + RDMA + fusions, exact VAE | 9 | 9.73 | 838 | 1.88x over the anchor | 20.2 / 18.7 against the PDD anchor |
+| same plus the FP8 video VAE (`lossless`) | 9 | 8.87 | 840 | 2.06x over the anchor | decode 2.01 s to 1.14 s |
+| PDD 8-step, sparse Sage + RDMA + fusions, Cache-DiT caching steps 4 and 6 (default dynamic settings or the static mask below), exact VAE | 9 | 8.10 | 841 | 2.25x over the anchor | 20.2 / 18.6 against the PDD anchor, 32.0 / 29.8 against the uncached row |
+| same with Cache-DiT and the FP8 video VAE in one request (`lossless` plus `enable_cache_dit: true`) | 9 | 7.22 | 812 | 2.53x over the anchor | denoise 5.96 s, decode 1.16 s |
 | same plus fp8 rows out of the fused norms and an fp8 attention-output gather (default) | 9 | 6.98 | 772 | 2.61x over the anchor | 21.1 / 19.8 against the PDD anchor |
 | same with the video VAE decoder's FFN in NVFP4 (`--component-quantizations.video_vae nvfp4`); anchor and this row re-measured on the branch rebased onto main `57826a62ea`, medians of three interleaved runs | 9 | 6.79 | 773 | 2.67x over the same-day anchor (18.11 s) | 21.0 / 19.7 against the PDD anchor, 40.3 / 39.5 against the FP8-VAE row; decode 1.16 s to 0.97 s |
 
@@ -663,7 +663,7 @@ prompts before serving it.
 
 Cache-DiT mounts on this deployment for requests that leave `quality` unset
 or that send `enable_cache_dit: true` explicitly; the explicit flag is how it
-combines with the `extra-high` the FP8 VAE fast path needs. `quality: "high"`
+combines with the `lossless` tier the FP8 VAE fast path needs. `quality: "high"`
 is refused outside the 4xH200 fingerprint. On the eight-step PDD schedule the default
 DBCache settings (`SGLANG_CACHE_DIT_ENABLED=true` with Fn=1, Bn=0, four
 warmup steps, residual threshold 0.24, at most three consecutive cached steps)

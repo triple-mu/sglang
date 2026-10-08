@@ -21,10 +21,10 @@ import torch
 
 VARIANTS = {
     # name: (quantization override, request quality)
-    "lossless-fp16": (None, "lossless"),
-    "extra-high-fp16": (None, "extra-high"),
-    "extra-high-fp8": ("fp8", "extra-high"),
-    "extra-high-nvfp4": ("nvfp4", "extra-high"),
+    "lossless-fp16": (None, "exact"),
+    "extra-high-fp16": (None, "lossless"),
+    "extra-high-fp8": ("fp8", "lossless"),
+    "extra-high-nvfp4": ("nvfp4", "lossless"),
 }
 
 

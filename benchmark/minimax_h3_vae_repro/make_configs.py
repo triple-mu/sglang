@@ -69,8 +69,8 @@ def nvtx_on(a):
 
 
 CONFIGS = {
-    "baseline-lossless": dict(quality=None, env={}, argv=argv("torch_sdpa", [])),
-    "fast-path-extra-high-fp8": dict(quality="extra-high", env=FAST_ENV, argv=argv("torch_cudnn_sdpa", FAST_ARGS)),
+    "baseline-lossless": dict(quality="exact", env={}, argv=argv("torch_sdpa", [])),
+    "fast-path-extra-high-fp8": dict(quality="lossless", env=FAST_ENV, argv=argv("torch_cudnn_sdpa", FAST_ARGS)),
     "fast-path-high-fp8": dict(quality="high", env=FAST_ENV, argv=argv("torch_cudnn_sdpa", FAST_ARGS)),
     # nsys capture of the second request only; layerwise NVTX ranges needed for stage attribution
     "profile-fast-path-high-fp8": dict(quality="high", env={**FAST_ENV, "SGLANG_DIFFUSION_SYNC_STAGE_PROFILING": "0"},

@@ -322,12 +322,12 @@ framework-specific optimization workflow.
   `runtime/models/vaes/minimax_h3_video_vae/fast_path.py` (gate, batch caps,
   per-scope counters), `batching.py`, `klvae.py`, `vae_cnn.py`,
   `attention.py`, and `processor.py` in the same package.
-- Behavior: installed at load on CUDA SM100+. `quality=extra-high` batches
+- Behavior: installed at load on CUDA SM100+. `quality=lossless` batches
   adjacent equal-shaped decoder tiles and temporal windows and dispatches the
   decoder-side fused kernels; `quality=high` additionally batches encoder tiles
   and fuses the encoder GroupNorm+SiLU (caps
   `SGLANG_DIFFUSION_MINIMAX_H3_VAE_{ENCODER_TILE,DECODER_TILE,WINDOW}_BATCH`,
-  defaults 8/64/1); `lossless` runs the reference operators. The encoder side
+  defaults 8/64/1); `exact` runs the reference operators. The encoder side
   sits in the approximate tier because the denoiser amplifies conditioning
   latent rounding changes (fl2va worst frame 28-38 dB vs 50 dB decode-only). `SGLANG_DIFFUSION_DISABLE_MINIMAX_H3_VAE_FAST_PATH=1`
   skips the install.
@@ -342,7 +342,7 @@ framework-specific optimization workflow.
 - Validation: `test/registered/kernels/ops/diffusion/test_group_norm_silu_ncthw.py`,
   `test_minimax_h3_vae_output.py`, `test_qknorm_rope_out_of_place.py`, and
   `multimodal_gen/test/unit/test_minimax_h3_vae_fast_path.py`.
-- Workflow rule: if an H3 decode trace at `extra-high` still shows separate
+- Workflow rule: if an H3 decode trace at `lossless` still shows separate
   `group_norm` + `silu` or `rms_norm` + `rotary_embedding` launches, check the
   mount log line, the SM gate, and the fallback count before proposing another
   kernel.
