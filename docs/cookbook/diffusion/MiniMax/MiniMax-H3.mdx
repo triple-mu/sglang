@@ -684,6 +684,66 @@ Runs and logs behind these numbers live under
 anchor and NVFP4 rows, `exps/model/2026-10-05-minimax-h3-all-opt-sm120/` in
 the maintainer's experiment tree.
 
+### 4x B200 (SM100) with NVLink: PDD and HyperFlow 8-step
+
+Measured on one computelab B200 node (4 of 8 GPUs, 183 GB each, NVLink),
+Ulysses 4, t2va 1344x768 at 24 fps for 5 s with audio, seed 1101, three
+prompts, one warmup and six timed `/v1/videos` requests per configuration
+(median). The full ledger is `exps/model/2026-10-08-pdd8-vs-hyperflow-b200/`
+in the maintainer's experiment tree.
+
+Two things carry over from SM120 unchanged: the fused adaLN chain and the
+video VAE fast path are lossless and always on at `quality: "lossless"`, and
+every 8-step adapter runs as a runtime LoRA (`--lora-merge-mode dynamic`)
+whenever the DiT is quantized. Two things differ: the RDMA Ulysses transport
+and the Cake SM120 Sage kernel do not apply (NVLink, SM100), so sparse
+attention is upstream's `subblock_sparse_attn` with its SM100 BF16 kernel;
+and dense attention must be `fa`: `torch_sdpa` runs the same request at
+1.6-1.7 s per step against 0.74-0.85 s with `fa`.
+
+```bash 4xB200 bf16 baseline, dense fa (PDD runtime LoRA; swap the adapter for HyperFlow)
+sglang serve --model-type diffusion --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --num-gpus 4 --tp-size 1 --ulysses-degree 4 --ring-degree 1 \
+  --attention-backend fa --component-attention-backends video_vae=torch_sdpa,audio_vae=torch_sdpa \
+  --component-residency video_vae=resident \
+  --lora-path "$PDD_DIR/loras/MiniMax-H3-FL2VA-Acc-8Step.peft.safetensors" --lora-merge-mode dynamic --lora-alpha 64
+# plus SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS=$PDD_DIR/pdd_fused_heads.safetensors; requests use num_inference_steps 9
+```
+
+| Configuration (bf16, dense `fa`) | Forwards | E2E (s) | Per step (ms) |
+| --- | ---: | ---: | ---: |
+| Base, 50 sigma points | 49 | 37.4 | 741 |
+| PDD 8-step, merged weights + fused heads | 8 | 6.9 | 738 |
+| PDD 8-step, runtime LoRA + fused heads | 8 | 7.9 | 840 |
+| HyperFlow 8-step, runtime LoRA + endpoint embedder | 8 | 7.9 | 850 |
+| PDD 8-step, runtime LoRA, `--quantization fp8` | 8 | 7.2 | 761 |
+| HyperFlow 8-step, runtime LoRA, `--quantization fp8` | 8 | 7.2 | 773 |
+
+PDD's merged weights are fine in bf16 (its deltas are 0.3-4% of the base
+weights); HyperFlow's deltas sit below bf16 resolution, so it is served only
+as a runtime LoRA (see [HyperFlow 8-step LoRA](#hyperflow-8-step-lora)).
+
+The lossy ladder below was measured with `torch_sdpa` for the dense steps,
+so its first two rows are slow for that reason alone; the sparse backend
+runs its own kernels from step 3 on. Each row adds to the previous one and
+every row keeps the runtime LoRA.
+
+| Added optimization (PDD line / HyperFlow line) | PDD E2E (s) | HyperFlow E2E (s) |
+| --- | ---: | ---: |
+| runtime LoRA, bf16, `torch_sdpa` | 14.9 | 15.2 |
+| `--quantization fp8` | 14.2 | 14.4 |
+| `--attention-backend subblock_sparse_attn` (sparsity 0.75, first 2 steps dense) | 6.6 | 6.8 |
+| Cache-DiT (`SGLANG_CACHE_DIT_*` Fn1 Bn0, warmup 4, RDT 0.24, MC 3; `enable_cache_dit: true`) | 5.4 | 6.2 |
+| `--component-quantizations.video_vae nvfp4` | 5.2 | 5.9 |
+| `SGLANG_DIFFUSION_MINIMAX_H3_DIT_NVFP4_LAYERS=all` (W4A4 DiT) | 4.6 | 6.1 |
+
+Against the `fa` baseline the sparse step is worth about 8% (7.2 to 6.6 s on
+the PDD line), Cache-DiT 19%, the NVFP4 VAE 19% of the decode, and the NVFP4
+DiT 11% on PDD and nothing on HyperFlow (not yet explained). PSNR between any
+two of these configurations is 12-25 dB on an 8-step trajectory, which only
+says the trajectories differ; validate a configuration by comparing its first
+DiT forward, not its video.
+
 ### Serve MiniMax-H3 on Ascend NPUs
 
 For Ascend NPU, follow the
@@ -1101,6 +1161,36 @@ with `num_inference_steps: 9`, `flow_shift: 12.0`, and `audio_flow_shift: 3.0`.
 The nine sigma grid points give eight denoiser evaluations. These settings
 must match the fused heads; the server rejects a different step count or
 shift. Use `quality: "lossless"` in requests.
+
+### HyperFlow 8-step LoRA
+
+[Video Rebirth's HyperFlow](https://huggingface.co/videorebirth/hyperflow) is
+a rank-256 PEFT LoRA on the DiT blocks, the token refiner and the time
+embedder, plus a second "endpoint" time embedder and a fixed nine-point sigma
+grid; every row is conditioned on the interval `(t, r)` it integrates with a
+gate of 0.25. One file serves `t2va`, `fl2va` and `ref2va`. Its deltas are
+1e-4 to 1e-3 of the base weights, below bf16 resolution: merging them keeps
+about half of the adapter (measured 2026-10-07, step-0 LoRA effect 0.14
+merged against 0.29 unmerged), so the block LoRA is served unmerged and only
+the fp32 time embedders are merged.
+
+```bash
+python3 -m sglang.multimodal_gen.tools.build_minimax_h3_hyperflow_weights \
+  "$BASE_DIR/FL2VA/transformer" minimax_h3_hyperflow_8step_v1.0.safetensors "$HF_DIR"
+# writes $HF_DIR/transformer (symlinked shards, fp32 time embedder merged),
+# hyperflow_lora.safetensors, hyperflow_endpoint_embedder.safetensors, hyperflow_config.json
+
+SGLANG_DIFFUSION_MINIMAX_H3_HYPERFLOW=$HF_DIR sglang serve --model-type diffusion \
+  --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va --num-gpus 4 --ulysses-degree 4 \
+  --attention-backend fa --transformer-weights-path "$HF_DIR/transformer" \
+  --lora-path "$HF_DIR/hyperflow_lora.safetensors" --lora-merge-mode dynamic --lora-alpha 256
+```
+
+Requests use `num_inference_steps: 9` (the grid is fixed; another count is
+rejected) with the usual shifts. `--lora-merge-mode auto` would merge the
+adapter into bf16 weights, which is exactly the lossy path; the server warns
+once per request when the block LoRA is missing or merged. The adapter is
+licensed under the MiniMax H3 Community License (derivative weights).
 
 ## 6. FastH3: 8-step distilled
 
