@@ -181,6 +181,7 @@ def _fake_server_args(cfg=None):
         enable_breakable_cuda_graph=False,
         attention_backend="torch_sdpa",
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
         model_loaded={"transformer": True},
         model_paths={},
         disable_autocast=False,

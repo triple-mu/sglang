@@ -256,6 +256,7 @@ def make_group_executor(
         component_precisions={},
         comfyui_mode=True,
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
         use_fsdp_inference=fsdp,
         disable_conditioning_cache=capacity == 0,
         conditioning_cache_max_size_mb=capacity / 1024**2,
@@ -682,6 +683,7 @@ def test_cache_hit_skips_encoder_residency_and_input_preparation(encoder_count):
         pipeline_config=config,
         component_precisions={},
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
     )
     with patch(_GLOBAL_ARGS_PATCH, return_value=args):
         stage = TextEncodingStage(encoders, [object()] * encoder_count)
@@ -905,6 +907,7 @@ def test_cache_hit_releases_weights_retained_after_warmup(monkeypatch):
         pipeline_config=config,
         component_precisions={},
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
     )
     with patch(_GLOBAL_ARGS_PATCH, return_value=args):
         stage = TextEncodingStage([encoder], [object()])

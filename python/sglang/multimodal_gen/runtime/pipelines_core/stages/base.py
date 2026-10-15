@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    nvtx_markers_enabled,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
@@ -293,11 +296,13 @@ class PipelineStage(StageDedupMixin, ABC):
     def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
         """Resolve the per-request NVTX gate for explicit stage ranges.
 
-        Layerwise module hooks are registered at component use-sites by
+        ``--enable-nvtx-marker`` turns the explicit ranges on, as does
+        ``--enable-layerwise-nvtx-marker``, which implies it. Layerwise module
+        hooks are registered at component use-sites by
         ``ComponentResidencyManager``. Stages use this value only for
         explicit ``maybe_nvtx_range`` blocks.
         """
-        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
+        use_nvtx = nvtx_markers_enabled(self.server_args) and not is_warmup
         self._current_use_nvtx = use_nvtx
         return use_nvtx
 

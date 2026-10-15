@@ -27,7 +27,9 @@ class CountingDedupStage(PipelineStage):
 
     def __init__(self):
         self.server_args = SimpleNamespace(
-            comfyui_mode=True, enable_layerwise_nvtx_marker=False
+            comfyui_mode=True,
+            enable_layerwise_nvtx_marker=False,
+            enable_nvtx_marker=False,
         )
         self.forward_calls = 0
 
@@ -48,7 +50,9 @@ class CountingDedupStage(PipelineStage):
 class CountingLatentStage(LatentPreparationStage):
     def __init__(self):
         self.server_args = SimpleNamespace(
-            comfyui_mode=True, enable_layerwise_nvtx_marker=False
+            comfyui_mode=True,
+            enable_layerwise_nvtx_marker=False,
+            enable_nvtx_marker=False,
         )
         self.prepare_group_calls = 0
         self.forward_calls = 0

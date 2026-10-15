@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Callable, Iterator, List, Union
@@ -106,6 +106,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.numerics_policy import apply_numerics_policy
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    maybe_nvtx_range,
+    nvtx_markers_enabled,
+    request_nvtx_marker,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -325,6 +330,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+        # non-warmup forwards this worker ran; names their request#<n> ranges
+        self._nvtx_request_ordinal = 0
         self._update_lora_metrics()
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
@@ -773,6 +780,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
+                stack.enter_context(self._request_nvtx_range(req, log_reqs))
                 try:
                     result = forward_fn()
                 except Exception:
@@ -857,6 +865,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
                 )
         return output_batch
+
+    def _request_nvtx_range(self, req: Req, log_reqs: list[Req]):
+        """One NVTX range per non-warmup forward, named request#<n> by this
+        worker's request count so an nsys NVTX capture range can pick the
+        steady-state request; warmups neither emit nor count."""
+        if req.is_warmup or not nvtx_markers_enabled(self.server_args):
+            return nullcontext()
+        self._nvtx_request_ordinal += 1
+        marker = request_nvtx_marker(self._nvtx_request_ordinal)
+        if self.is_output_rank:
+            logger.info(
+                "NVTX %s covers request(s) %s",
+                marker,
+                ", ".join(str(item.request_id) for item in log_reqs),
+            )
+        return maybe_nvtx_range(marker)
 
     def _finalize_output_batch(
         self,

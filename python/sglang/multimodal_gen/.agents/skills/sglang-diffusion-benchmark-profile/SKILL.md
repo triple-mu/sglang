@@ -12,10 +12,11 @@ This skill is diagnosis-first. It owns:
 - same-GPU quality/BCG applicability checks with repeated exact, lossless, and high rows
 - perf dump collection and before/after comparison
 - `torch.profiler` trace capture and quick hotspot ranking
+- serving-mode Nsight Systems capture of one steady-state request across every rank
 - mapping hot kernels back to known fast paths and fusion families
 - packaging confirmed kernel work with enough evidence for the appropriate kernel, Nsight, or framework-specific optimization workflow
 
-This skill does not own low-level kernel authoring or standalone Nsight workflows.
+This skill does not own low-level kernel authoring or Nsight Compute kernel analysis; the one Nsight Systems flow it carries is the serving-mode steady-state capture in `benchmark-and-profile.md`.
 
 ## Preflight
 
@@ -50,10 +51,11 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 
 ## Main Reference
 
-- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat image/edit, Qwen base edit/layered, SD3.5, SANA-Video/SANA-WM, LingBot Video/World, Cosmos3 Edge/Super I2V/distilled and the explicit Super TP2 x CFG2 comparator, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.1/2.2, the Blackwell-only Wan2.2 NVFP4 comparator, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, Hunyuan3D shape, and a separate Pi0.5 action-policy lane
+- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, `torch.profiler` and serving-mode `nsys` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat image/edit, Qwen base edit/layered, SD3.5, SANA-Video/SANA-WM, LingBot Video/World, Cosmos3 Edge/Super I2V/distilled and the explicit Super TP2 x CFG2 comparator, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.1/2.2, the Blackwell-only Wan2.2 NVFP4 comparator, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, Hunyuan3D shape, and a separate Pi0.5 action-policy lane
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, MoE routing, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery from the skill's owning checkout before falling back to `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU applicability matrix, rejects invalid BCG capture/fallback logs and late high-quality DiT fusion mounts, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
+- [scripts/nsys_serving_capture.py](scripts/nsys_serving_capture.py) — serving-mode Nsight Systems capture: runs `sglang serve` under `nsys launch`, warms up through `/v1/videos`, then brackets one steady-state request with `nsys start` / `nsys stop` so the report holds every rank's kernels under one `request#<n>` range; a `sglang generate` config supplies both the serve flags and the request body
 
 ## Opportunity Discovery Rule
 

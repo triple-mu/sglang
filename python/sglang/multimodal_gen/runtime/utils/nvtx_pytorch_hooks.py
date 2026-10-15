@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.cuda.nvtx as nvtx
 from torch.utils.hooks import RemovableHandle
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 logger = init_logger(__name__)
 
@@ -44,6 +47,28 @@ _DEFAULT_SKIP_TYPES: tuple[type, ...] = (
     torch.nn.Dropout2d,
     torch.nn.Dropout3d,
 )
+
+
+REQUEST_NVTX_PREFIX = "request#"
+
+
+def request_nvtx_marker(ordinal: int) -> str:
+    """Range name of the ordinal-th non-warmup request a worker runs; nsys users
+    pass it to --nvtx-capture to select the steady-state request."""
+    return f"{REQUEST_NVTX_PREFIX}{ordinal}"
+
+
+def nvtx_markers_enabled(server_args: ServerArgs) -> bool:
+    """Whether the explicit NVTX ranges (request, pipeline stage, denoising loop
+    and step, model hot-path segments) are on.
+
+    ``--enable-layerwise-nvtx-marker`` implies them: the per-module ranges it
+    adds are only readable nested inside the coarse set, so either flag turns
+    the coarse set on and every gate reads this one function.
+    """
+    return bool(
+        server_args.enable_nvtx_marker or server_args.enable_layerwise_nvtx_marker
+    )
 
 
 @contextlib.contextmanager

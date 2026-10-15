@@ -1304,6 +1304,8 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
         disable_conditioning_cache=False,
         conditioning_cache_max_size_mb=512,
         use_fsdp_inference=False,
+        enable_nvtx_marker=False,
+        enable_layerwise_nvtx_marker=False,
     )
     pipeline = _SequentialTestPipeline(
         server_args, fail=fail, fail_request_ids=fail_request_ids

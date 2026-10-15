@@ -522,6 +522,9 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
+    # Request, pipeline-stage and denoising-loop ranges only (no module
+    # hooks); enable_layerwise_nvtx_marker implies it.
+    enable_nvtx_marker: bool = False
 
     # Warmup is controlled by the canonical `warmup_mode` knob: one of WARMUP_MODES.
     #   - "off":     no warmup.
@@ -2618,7 +2621,21 @@ class ServerArgs(DisaggServerArgsMixin):
             "Adds NVTX ranges around each pipeline stage, the denoising loop, "
             "every denoising step, the predict_noise / scheduler_step "
             "sub-operations, and every transformer submodule forward (recursive). "
-            "Warmup steps are excluded to keep captured traces clean.",
+            "Warmup steps are excluded to keep captured traces clean. Implies "
+            "--enable-nvtx-marker.",
+        )
+        parser.add_argument(
+            "--enable-nvtx-marker",
+            action=StoreBoolean,
+            default=ServerArgs.enable_nvtx_marker,
+            help="Enable request-level NVTX markers for Nsight Systems: one "
+            "`request#<n>` range per non-warmup request (n counts the requests "
+            "each worker has run) plus the pipeline-stage, denoising-loop and "
+            "per-step ranges, without the per-module hooks of "
+            "--enable-layerwise-nvtx-marker (which implies this flag). Target "
+            "the steady-state request with `nsys ... --capture-range=nvtx "
+            "--nvtx-capture=request#2` or bracket it with `nsys start` / "
+            "`nsys stop` in serving mode.",
         )
 
         # warmup

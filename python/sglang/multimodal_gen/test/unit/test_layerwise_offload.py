@@ -535,6 +535,7 @@ def test_explicit_layerwise_offload_disables_request_end_preload(
             {"layerwise_offload_components"} if explicit == "legacy" else set()
         ),
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
         pipeline_config=SimpleNamespace(supports_auto_residency=False),
     )
     module = _NestedDummyModel()

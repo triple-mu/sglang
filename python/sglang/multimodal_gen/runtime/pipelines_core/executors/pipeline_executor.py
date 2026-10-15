@@ -21,7 +21,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    maybe_nvtx_range,
+    nvtx_markers_enabled,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import (
     SGLDiffusionProfiler,
@@ -113,7 +116,7 @@ class PipelineExecutor(ABC):
         return getattr(payload, "is_warmup", False)
 
     def _should_use_stage_nvtx(self, payload: Any, server_args: ServerArgs) -> bool:
-        return server_args.enable_layerwise_nvtx_marker and not self._is_warmup_payload(
+        return nvtx_markers_enabled(server_args) and not self._is_warmup_payload(
             payload
         )
 

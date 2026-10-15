@@ -1499,6 +1499,7 @@ def _server_args(input_save_path: str) -> SimpleNamespace:
         pipeline_config=Wan_Animate_2_14B_Config(),
         component_precisions={},
         enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
         comfyui_mode=False,
         warmup_steps=1,
         warmup_num_frames=None,

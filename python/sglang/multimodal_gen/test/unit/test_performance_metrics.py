@@ -74,7 +74,11 @@ def test_worker_perf_dump_has_one_writer_per_replica(
 ):
     worker = GPUWorker.__new__(GPUWorker)
     worker.is_output_rank = is_output_rank
-    worker.server_args = SimpleNamespace(model_path="test-model")
+    worker.server_args = SimpleNamespace(
+        model_path="test-model",
+        enable_nvtx_marker=False,
+        enable_layerwise_nvtx_marker=False,
+    )
     worker._realtime_sessions = SimpleNamespace(attach=Mock())
     worker._release_warmup_pool = Mock()
     worker._materialize_output_transport = Mock()
@@ -161,7 +165,9 @@ def test_stage_role_reaches_performance_guard(
     # call boundary, profiler, log writer/reader and threshold validator
     stage = stage_class.__new__(stage_class)
     stage.server_args = SimpleNamespace(
-        enable_layerwise_nvtx_marker=False, comfyui_mode=False
+        enable_layerwise_nvtx_marker=False,
+        enable_nvtx_marker=False,
+        comfyui_mode=False,
     )
     stage.set_profile_stage_name(profile_name)
     monkeypatch.setattr(stage, "forward", lambda batch, args: batch)
