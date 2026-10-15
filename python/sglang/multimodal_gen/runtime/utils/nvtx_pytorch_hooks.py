@@ -23,6 +23,7 @@ that emits a richer per-layer parameter dict.
 from __future__ import annotations
 
 import contextlib
+import functools
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +70,20 @@ def nvtx_markers_enabled(server_args: ServerArgs) -> bool:
     return bool(
         server_args.enable_nvtx_marker or server_args.enable_layerwise_nvtx_marker
     )
+
+
+@functools.cache
+def ulysses_nvtx_enabled() -> bool:
+    """Whether to emit NVTX ranges around the Ulysses exchange.
+
+    Gated by SGLANG_DIFFUSION_ENABLE_ULYSSES_NVTX, an opt-in on top of
+    ``--enable-nvtx-marker``: one range pair per exchange is ~100 per denoising
+    step per rank, more than a coarse capture wants. Cached -- an env lookup on
+    that path would show up in the very profile it exists to produce.
+    """
+    from sglang.multimodal_gen import envs
+
+    return envs.SGLANG_DIFFUSION_ENABLE_ULYSSES_NVTX
 
 
 @contextlib.contextmanager

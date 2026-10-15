@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
+    SGLANG_DIFFUSION_ENABLE_ULYSSES_NVTX: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -412,6 +413,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compute thread spent their time (populate, memcpy, H2D, waits).
     "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING": _lazy_bool(
         "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING"
+    ),
+    # Profiling opt-in on top of --enable-nvtx-marker: NVTX ranges around the
+    # Ulysses all-to-all (NCCL or copy-engine IPC) and the pack/merge layout
+    # transforms feeding it. The collective has a ncclDevKernel_ for nsys to
+    # attribute, but the transforms are plain elementwise kernels that land in
+    # the report unnamed -- without these ranges an exchange and the reshape it
+    # waits on are indistinguishable. One range pair per exchange (~100 per
+    # denoising step per rank), hence a separate switch from the coarse flag.
+    "SGLANG_DIFFUSION_ENABLE_ULYSSES_NVTX": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_ULYSSES_NVTX"
     ),
     # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
     # of the file-backed LoRA merge cache.

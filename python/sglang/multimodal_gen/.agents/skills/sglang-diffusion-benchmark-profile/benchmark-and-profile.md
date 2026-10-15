@@ -857,6 +857,13 @@ report so a rank missing from the capture is visible immediately.
   implies it and adds a range per module forward, which costs about 8% on a
   batched H3 VAE decode and 30% on the per-tile path; keep it off when the
   timing itself matters.
+- `SGLANG_DIFFUSION_ENABLE_ULYSSES_NVTX=1` in the server environment (pass it
+  with `--env`) adds `usp_a2a_*` ranges around each Ulysses all-to-all and
+  `usp_layout_*` ranges around the qkv pack and head merge feeding it, so the
+  collective and the reshape it waits on stay apart in the report. One range
+  pair per exchange, about 100 per denoising step per rank. MiniMax-H3's
+  pipelined head-group exchange (`SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS`)
+  interleaves its copies with attention and is not ranged.
 - The warmup request absorbs first-request costs; with
   `--minimax-h3-adaln-online` it rebuilds the AdaLN plans from the 24 GB
   checkpoint, which took 10 minutes when other jobs had evicted the page cache

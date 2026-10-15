@@ -17,6 +17,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
+    maybe_nvtx_range,
+    ulysses_nvtx_enabled,
+)
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -120,7 +124,10 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
 
         if ipc_a2a_multi_ready(ulysses_pg):
             world_size = torch.distributed.get_world_size(group=ulysses_pg)
-            received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
+            with maybe_nvtx_range(
+                f"usp_a2a_ipc_{role or 'anon'}", ulysses_nvtx_enabled()
+            ):
+                received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
             if received is not None:
                 return received.view(x_shape)
     if role is None:
@@ -132,15 +139,16 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     handle = sp_group.ulysses_shm_handle
     input_bytes = x.numel() * x.element_size()
-    if (
-        current_platform.is_cpu()
-        and handle is not None
-        and handle >= 0
-        and input_bytes <= SHM_ALLTOALL_MAX_BYTES
-    ):
-        torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
-    else:
-        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    with maybe_nvtx_range(f"usp_a2a_{role or 'anon'}", ulysses_nvtx_enabled()):
+        if (
+            current_platform.is_cpu()
+            and handle is not None
+            and handle >= 0
+            and input_bytes <= SHM_ALLTOALL_MAX_BYTES
+        ):
+            torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
+        else:
+            torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
 
     return output.reshape(x_shape)
 
@@ -168,13 +176,14 @@ def _usp_all_to_all_single_varlen(
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x = x.flatten().contiguous()
     output = torch.empty(sum(output_split_sizes), dtype=x.dtype, device=x.device)
-    dist.all_to_all_single(
-        output,
-        x,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-        group=ulysses_pg,
-    )
+    with maybe_nvtx_range("usp_a2a_varlen", ulysses_nvtx_enabled()):
+        dist.all_to_all_single(
+            output,
+            x,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=ulysses_pg,
+        )
     return output
 
 
@@ -423,18 +432,19 @@ def _usp_input_all_to_all_packed_qkv(
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
         and not torch.compiler.is_compiling()
     ):
-        packed = pack_qkv_destination_major(
-            q,
-            k,
-            v,
-            world_size,
-            out=_a2a_staging_buffer(
-                "usp_packed_qkv_src",
-                (world_size, s_local, h_local, 3 * head_size),
-                q.dtype,
-                q.device,
-            ),
-        )
+        with maybe_nvtx_range("usp_layout_pack_qkv", ulysses_nvtx_enabled()):
+            packed = pack_qkv_destination_major(
+                q,
+                k,
+                v,
+                world_size,
+                out=_a2a_staging_buffer(
+                    "usp_packed_qkv_src",
+                    (world_size, s_local, h_local, 3 * head_size),
+                    q.dtype,
+                    q.device,
+                ),
+            )
     else:
         packed = torch.empty(
             (world_size, s_local, h_local, 3 * head_size),
@@ -675,7 +685,8 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
-        x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
+        with maybe_nvtx_range("usp_layout_merge_heads", ulysses_nvtx_enabled()):
+            x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
 
     return x
 
