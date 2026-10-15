@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context,
     autocast_enabled_for_device,
@@ -375,7 +376,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
         audio_payload = None
         if is_audio_owner:
             try:
-                audio_payload = self._decode_audio(audio_latent, server_args)
+                with maybe_nvtx_range("h3_vae_decode_audio", self.current_use_nvtx):
+                    audio_payload = self._decode_audio(audio_latent, server_args)
             except Exception as exc:
                 owner_exception = exc
                 owner_error = f"{type(exc).__name__}: {exc}"
@@ -499,6 +501,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     decode_kwargs["on_frames"] = stream
                 try:
                     with (
+                        maybe_nvtx_range("h3_vae_decode_video", self.current_use_nvtx),
                         use_vae_fast_path(
                             selected_video_vae,
                             quality_allows(batch.sampling_params.quality, "lossless"),
