@@ -40,6 +40,9 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a impo
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
     IPC_A2A_MULTI,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.symm_a2a import (
+    SYMM_A2A,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -1173,6 +1176,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         IPC_A2A.drop_staging()
         IPC_A2A_MULTI.drop_staging()
+        SYMM_A2A.drop_staging()
         drop_a2a_staging_buffers()
         torch.get_device_module().empty_cache()
 

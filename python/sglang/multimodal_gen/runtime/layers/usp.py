@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -196,6 +197,29 @@ def _ipc_ready_group():
         return None
     group = get_sp_group().ulysses_group
     return group if ipc_a2a_ready(group) else None
+
+
+def _symm_a2a():
+    """The symmetric-memory copy-engine transport when it may serve this call, else None."""
+    # the opt-in gate comes first so the default path never touches the
+    # transport or the process groups (unit tests emulate ranks without them);
+    # the pipelined attention's first-sight reference wants plain per-call NCCL
+    # tensors, and the transport's slot views cannot be traced
+    if (
+        not envs.SGLANG_DIFFUSION_SYMM_A2A
+        or _UNCACHED_STAGING
+        or torch.compiler.is_compiling()
+    ):
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.symm_a2a import (
+        SYMM_A2A,
+        symm_a2a_ready,
+    )
+
+    group = get_sp_group().ulysses_group
+    if group is None or not symm_a2a_ready(group):
+        return None
+    return SYMM_A2A
 
 
 def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
@@ -422,6 +446,13 @@ def _usp_input_all_to_all_packed_qkv(
     assert h_global % world_size == 0
     h_local = h_global // world_size
 
+    if q.is_cuda and (symm := _symm_a2a()) is not None:
+        # [s_global, h_local, D] views of the transport's q/k/v slots, valid
+        # until the next input exchange, like the staging views below
+        outs = symm.exchange((q[None], k[None], v[None]), (0, 1, 2), split_dim=2)
+        if outs is not None:
+            return outs[0][0], outs[1][0], outs[2][0]
+
     if (
         q.device.type in _A2A_DEVICE_TYPES
         and q.dtype in (torch.float16, torch.bfloat16)
@@ -506,6 +537,12 @@ def _usp_input_all_to_all_qkv(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return q, k, v
+    if q.is_cuda and (symm := _symm_a2a()) is not None:
+        outs = symm.exchange((q, k, v), (0, 1, 2), split_dim=2)
+        if outs is not None:
+            # owned results: callers keep them past the next exchange
+            # (wan_animate_2_block caches k/v across blocks)
+            return tuple(t.clone() for t in outs)
     if not _can_use_packed_qkv_a2a_4d(q, k, v, world_size):
         return (
             _usp_input_all_to_all(q, head_dim=2),
@@ -641,10 +678,17 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     Returns:
         Tensor with the same dim order as input, with heads gathered and sequence sharded.
+        Over the symmetric-memory transport it is a view of that transport's
+        output slot, valid until the next output all-to-all.
     """
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if head_dim == 2 and x.is_cuda and (symm := _symm_a2a()) is not None:
+        out = symm.exchange((x,), (3,), split_dim=1)
+        if out is not None:
+            return out[0]
 
     if world_size == 2 and head_dim == 2 and x.shape[1] % 2 == 0:
         half_len = x.shape[1] // 2

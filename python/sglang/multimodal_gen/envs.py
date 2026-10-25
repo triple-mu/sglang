@@ -57,6 +57,9 @@ if TYPE_CHECKING:
     # copy-engine all-to-all for Ulysses groups of any size on one host; off by
     # default while it is validated. Falls back to NCCL when unavailable.
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # opt-in: the sequential Ulysses exchange over symmetric memory on the copy
+    # engine, any group size on one host; falls back to NCCL when unavailable
+    SGLANG_DIFFUSION_SYMM_A2A: bool = False
     # head groups for pipelining the Ulysses exchange against dense attention
     # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
     # -1 picks the most groups that divide the heads per rank while each group's
@@ -381,6 +384,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
         "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
     ),
+    "SGLANG_DIFFUSION_SYMM_A2A": _lazy_bool("SGLANG_DIFFUSION_SYMM_A2A", "false"),
     "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
         "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
     ),

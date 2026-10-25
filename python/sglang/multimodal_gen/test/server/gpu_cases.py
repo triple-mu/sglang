@@ -1668,6 +1668,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
         "../single_test_file/test_ipc_a2a_multi_gpu.py",
+        "../single_test_file/test_symm_a2a_multi_gpu.py",
         "../single_test_file/test_usp_pipelined_attention_multi_gpu.py",
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
         "../single_test_file/test_encoder_fold_srt_2_gpu.py",
@@ -1719,6 +1720,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ipc_a2a_2_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~50 s on H200 with warm JIT
         "../single_test_file/test_ipc_a2a_multi_gpu.py": 30.0,
+        # 2 ranks here (4 ranks skip below four GPUs); no model load, no JIT build
+        "../single_test_file/test_symm_a2a_multi_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~45 s on B300 with warm JIT
         "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 40.0,
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 30.0,

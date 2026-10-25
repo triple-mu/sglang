@@ -940,10 +940,12 @@ def destroy_model_parallel() -> None:
     # Ulysses group. Drop them before tearing down the process groups.
     from .device_communicators.ipc_a2a import IPC_A2A
     from .device_communicators.ipc_a2a_multi import IPC_A2A_MULTI
+    from .device_communicators.symm_a2a import SYMM_A2A
     from .parallel_groups import PROCESS_GROUP
 
     IPC_A2A.reset()
     IPC_A2A_MULTI.reset()
+    SYMM_A2A.reset()
 
     destroyed_groups = []
     for group in (
